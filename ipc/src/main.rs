@@ -14,6 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 
 /// CLI tool for IPC communication with leash sandbox
 #[derive(Parser)]
@@ -26,6 +27,23 @@ struct Cli {
     /// Arguments forwarded to the IPC command
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CommandPayload {
+    Text { content: String },
+    Json { value: serde_json::Value },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandEnvelope {
+    ok: bool,
+    #[serde(default)]
+    payload: Option<CommandPayload>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -52,7 +70,9 @@ fn main() -> ExitCode {
     // Connect and send request
     match send_request(&socket_path, &cli.command, &payload) {
         Ok(response) => {
-            println!("{response}");
+            if !response.is_empty() {
+                print!("{response}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -157,14 +177,134 @@ fn send_request_with_stream<S: Read + Write>(
 
     if success {
         // Deserialize MessagePack to JSON value
-        let value: serde_json::Value = rmp_serde::from_slice(payload)
+        let envelope: CommandEnvelope = rmp_serde::from_slice(payload)
             .map_err(|e| format!("failed to decode response: {e}"))?;
-        // Output as pretty JSON
-        serde_json::to_string_pretty(&value).map_err(|e| format!("JSON encoding failed: {e}"))
+        render_success_response(envelope)
     } else {
         // Error message is in payload
         let error: String = rmp_serde::from_slice(payload)
             .unwrap_or_else(|_| String::from_utf8_lossy(payload).to_string());
         Err(error)
+    }
+}
+
+fn render_success_response(envelope: CommandEnvelope) -> Result<String, String> {
+    if !envelope.ok {
+        return Err(envelope
+            .error
+            .unwrap_or_else(|| "IPC command failed".to_string()));
+    }
+
+    match envelope.payload {
+        None => Ok(String::new()),
+        Some(CommandPayload::Text { content }) => Ok(content),
+        Some(CommandPayload::Json { value }) => {
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON encoding failed: {e}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use super::{CommandEnvelope, CommandPayload, render_success_response, send_request};
+
+    fn start_mock_tcp_server(response: CommandEnvelope) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("read listener address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test client");
+
+            let mut len_buf = [0u8; 4];
+            stream
+                .read_exact(&mut len_buf)
+                .expect("read request length");
+            let request_len = u32::from_be_bytes(len_buf) as usize;
+            let mut request_body = vec![0u8; request_len];
+            stream
+                .read_exact(&mut request_body)
+                .expect("read request body");
+
+            let method_len = request_body[0] as usize;
+            let method = std::str::from_utf8(&request_body[1..1 + method_len])
+                .expect("decode request method");
+            assert_eq!(method, "webfetch");
+
+            let payload = rmp_serde::to_vec(&response).expect("encode response envelope");
+            let mut body = Vec::with_capacity(payload.len() + 1);
+            body.push(1);
+            body.extend_from_slice(&payload);
+            stream
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .expect("write response length");
+            stream.write_all(&body).expect("write response body");
+        });
+        format!("tcp://{address}")
+    }
+
+    #[test]
+    fn raw_text_payload_is_not_json_quoted() {
+        let rendered = render_success_response(CommandEnvelope {
+            ok: true,
+            payload: Some(CommandPayload::Text {
+                content: "plain text".to_string(),
+            }),
+            error: None,
+        })
+        .expect("text payload should render");
+        assert_eq!(rendered, "plain text");
+    }
+
+    #[test]
+    fn json_payload_is_pretty_rendered() {
+        let rendered = render_success_response(CommandEnvelope {
+            ok: true,
+            payload: Some(CommandPayload::Json {
+                value: serde_json::json!({ "ok": true }),
+            }),
+            error: None,
+        })
+        .expect("json payload should render");
+        assert!(rendered.contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn command_error_becomes_process_error() {
+        let error = render_success_response(CommandEnvelope {
+            ok: false,
+            payload: None,
+            error: Some("boom".to_string()),
+        })
+        .expect_err("error envelope must fail");
+        assert_eq!(error, "boom");
+    }
+
+    #[test]
+    fn tcp_transport_renders_raw_text_without_quotes() {
+        let address = start_mock_tcp_server(CommandEnvelope {
+            ok: true,
+            payload: Some(CommandPayload::Text {
+                content: "plain tcp text".to_string(),
+            }),
+            error: None,
+        });
+        let rendered = send_request(address.as_str(), "webfetch", &[])
+            .expect("tcp success response should render");
+        assert_eq!(rendered, "plain tcp text");
+    }
+
+    #[test]
+    fn tcp_transport_surfaces_command_failures() {
+        let address = start_mock_tcp_server(CommandEnvelope {
+            ok: false,
+            payload: None,
+            error: Some("tcp boom".to_string()),
+        });
+        let error = send_request(address.as_str(), "webfetch", &[])
+            .expect_err("tcp error response should fail");
+        assert_eq!(error, "tcp boom");
     }
 }
