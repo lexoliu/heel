@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ipc", "cli", "nodejs"]
+members = [".", "cli", "nodejs"]
 
 [package]
 name = "leash"
@@ -7,6 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform native sandboxing library for running untrusted code"
+repository = "https://github.com/lexoliu/leash"
 keywords = ["sandbox", "security", "isolation", "python", "venv"]
 categories = ["os", "development-tools"]
 
@@ -28,7 +29,7 @@ tracing = "0.1"
 # HTTP proxy
 hyper = { version = "1", features = ["http1", "server", "client"] }
 http-body-util = "0.1"
-bytes = "1"
+bytes = "1.11.1"
 
 # Runtime-agnostic async (smol-based by default)
 executor-core = { version = "0.7", features = ["async-executor", "std"] }
@@ -39,6 +40,7 @@ blocking = "1"
 
 # Compile-time templates
 askama = "0.12"
+shell-escape = "0.1"
 
 # PTY support for interactive shells
 pty-process = "0.5"
