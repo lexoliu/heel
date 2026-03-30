@@ -11,12 +11,12 @@ use crate::error::IntoNapiResult;
 /// A spawned child process in the sandbox
 #[napi]
 pub struct ChildProcessJs {
-    inner: Arc<Mutex<leash::Child>>,
+    inner: Arc<Mutex<heel::Child>>,
     pid: u32,
 }
 
 impl ChildProcessJs {
-    pub(crate) fn new(child: leash::Child) -> Self {
+    pub(crate) fn new(child: heel::Child) -> Self {
         let pid = child.id();
         Self {
             inner: Arc::new(Mutex::new(child)),

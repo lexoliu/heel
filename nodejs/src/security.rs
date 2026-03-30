@@ -28,8 +28,8 @@ pub struct SecurityConfigJs {
 
 impl SecurityConfigJs {
     /// Convert to Rust SecurityConfig, starting from strict preset
-    pub fn into_rust(self) -> leash::SecurityConfig {
-        let mut builder = leash::SecurityConfig::builder();
+    pub fn into_rust(self) -> heel::SecurityConfig {
+        let mut builder = heel::SecurityConfig::builder();
 
         if let Some(v) = self.protect_user_home {
             builder = builder.protect_user_home(v);
@@ -69,7 +69,7 @@ impl SecurityConfigJs {
 /// Get strict security preset
 #[napi]
 pub fn security_config_strict() -> SecurityConfigJs {
-    let rust = leash::SecurityConfig::strict();
+    let rust = heel::SecurityConfig::strict();
     SecurityConfigJs {
         protect_user_home: Some(rust.protect_user_home),
         protect_credentials: Some(rust.protect_credentials),
@@ -87,7 +87,7 @@ pub fn security_config_strict() -> SecurityConfigJs {
 /// Get permissive security preset
 #[napi]
 pub fn security_config_permissive() -> SecurityConfigJs {
-    let rust = leash::SecurityConfig::permissive();
+    let rust = heel::SecurityConfig::permissive();
     SecurityConfigJs {
         protect_user_home: Some(rust.protect_user_home),
         protect_credentials: Some(rust.protect_credentials),

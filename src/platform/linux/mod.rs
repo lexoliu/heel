@@ -309,14 +309,14 @@ impl LinuxBackend {
         unsafe {
             cmd.pre_exec(move || {
                 #[cfg(debug_assertions)]
-                pre_exec_write(b"leash: pre_exec start\n");
+                pre_exec_write(b"heel: pre_exec start\n");
 
                 let ruleset = landlock_ruleset.take().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::Other, "Landlock ruleset already used")
                 })?;
 
                 if let Err(err) = ruleset.restrict_self() {
-                    pre_exec_write(b"leash: landlock restrict_self failed\n");
+                    pre_exec_write(b"heel: landlock restrict_self failed\n");
                     let errno = err
                         .raw_os_error()
                         .map(|code| format!(" (errno {code})"))
@@ -328,14 +328,14 @@ impl LinuxBackend {
                 }
 
                 #[cfg(debug_assertions)]
-                pre_exec_write(b"leash: landlock applied\n");
+                pre_exec_write(b"heel: landlock applied\n");
 
                 let filter = seccomp_filter.take().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::Other, "Seccomp filter already used")
                 })?;
 
                 if let Err(err) = filter.apply() {
-                    pre_exec_write(b"leash: seccomp apply failed\n");
+                    pre_exec_write(b"heel: seccomp apply failed\n");
                     let errno = err
                         .raw_os_error()
                         .map(|code| format!(" (errno {code})"))
@@ -347,7 +347,7 @@ impl LinuxBackend {
                 }
 
                 #[cfg(debug_assertions)]
-                pre_exec_write(b"leash: seccomp applied\n");
+                pre_exec_write(b"heel: seccomp applied\n");
 
                 Ok(())
             });

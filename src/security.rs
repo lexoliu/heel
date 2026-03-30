@@ -11,7 +11,7 @@
 //! # Custom Configuration
 //!
 //! ```rust,ignore
-//! use leash::SecurityConfig;
+//! use heel::SecurityConfig;
 //!
 //! let config = SecurityConfig::builder()
 //!     .protect_credentials(true)

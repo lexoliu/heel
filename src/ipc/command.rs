@@ -15,7 +15,7 @@ use serde::{Serialize, de::DeserializeOwned};
 /// ```rust,ignore
 /// use std::borrow::Cow;
 /// use serde::{Serialize, Deserialize};
-/// use leash::ipc::IpcCommand;
+/// use heel::ipc::IpcCommand;
 ///
 /// #[derive(Clone, Serialize, Deserialize)]
 /// struct SearchCommand {
@@ -73,7 +73,7 @@ pub trait IpcCommand: Serialize + Send + 'static {
     /// Stdin argument name for piped input.
     ///
     /// When set, the wrapper script will capture stdin and pass it as this argument:
-    /// `cat file | command "prompt"` → `leash ipc command --<stdin_arg> "<stdin>" --<primary_arg> "prompt"`
+    /// `cat file | command "prompt"` → `heel ipc command --<stdin_arg> "<stdin>" --<primary_arg> "prompt"`
     ///
     /// Returns `None` by default (stdin is ignored).
     fn stdin_arg(&self) -> Option<Cow<'static, str>> {

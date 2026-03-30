@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use leash::{StdioConfig, VenvConfig, VenvManager};
+use heel::{StdioConfig, VenvConfig, VenvManager};
 
 use crate::cli::PythonArgs;
 use crate::config::{MergedConfig, merge_python_args};

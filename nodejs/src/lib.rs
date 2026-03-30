@@ -1,6 +1,6 @@
-//! Node.js bindings for leash sandbox library
+//! Node.js bindings for heel sandbox library
 //!
-//! This crate provides NAPI-RS bindings to expose leash's sandboxing
+//! This crate provides NAPI-RS bindings to expose heel's sandboxing
 //! capabilities to Node.js/TypeScript applications.
 
 #![deny(clippy::all)]

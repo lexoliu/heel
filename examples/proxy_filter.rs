@@ -3,7 +3,7 @@
 //! This example demonstrates how to create a sandbox with network filtering
 //! that only allows access to specific domains.
 
-use leash::{AllowList, Result, Sandbox, SandboxConfig};
+use heel::{AllowList, Result, Sandbox, SandboxConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {

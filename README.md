@@ -1,15 +1,15 @@
-# leash
+# heel
 
 A cross-platform Rust library for running LLM-generated code in secure sandboxes with native OS-level isolation.
 
-## Why leash
+## Why heel
 Docker is a great tool for running containers, with isolation provided by the Linux kernel. However, it has to rely on virtualization to provide isolation on non-Linux platforms, which blocks it to provide GPU and NPU access.
 
-Leash is built at the top of native OS-level isolation mechanisms, such as `sandbox-exec` on macOS, `landlock` on Linux, and `AppContainer` on Windows. It reduces some security, but more lightweight and powerful.
+Heel is built at the top of native OS-level isolation mechanisms, such as `sandbox-exec` on macOS, `landlock` on Linux, and `AppContainer` on Windows. It reduces some security, but more lightweight and powerful.
 
-## Leash is not designed to be a general sandbox for running untrusted code.
+## Heel is not designed to be a general sandbox for running untrusted code.
 
-Leash is designed to be a sandbox for running LLM-generated code in a secure environment. It is not designed to be a general sandbox for running untrusted code.
+Heel is designed to be a sandbox for running LLM-generated code in a secure environment. It is not designed to be a general sandbox for running untrusted code.
 
 We provide three tier isolation level
 
@@ -43,22 +43,22 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-leash = "0.1"
+heel = "0.1"
 ```
 
 Install the CLI from the same crate:
 
 ```bash
-cargo install leash
+cargo install heel
 ```
 
 ## Quick Start
 
 ```rust
-use leash::Sandbox;
+use heel::Sandbox;
 
 #[tokio::main]
-async fn main() -> leash::Result<()> {
+async fn main() -> heel::Result<()> {
     // Create a sandbox with default configuration (network denied)
     let sandbox = Sandbox::new().await?;
 
@@ -79,7 +79,7 @@ async fn main() -> leash::Result<()> {
 By default, all network access is denied. Configure access using built-in policies:
 
 ```rust
-use leash::{AllowList, AllowAll, Sandbox, SandboxConfig};
+use heel::{AllowList, AllowAll, Sandbox, SandboxConfig};
 
 // Allow specific domains (supports wildcards)
 let policy = AllowList::new(["api.example.com", "*.github.com"]);
@@ -102,7 +102,7 @@ Available policies:
 Fine-grained control over what the sandbox can access:
 
 ```rust
-use leash::{SandboxConfig, SecurityConfig};
+use heel::{SandboxConfig, SecurityConfig};
 
 let security = SecurityConfig::builder()
     .protect_user_home(true)      // Block ~/
@@ -121,7 +121,7 @@ let config = SandboxConfig::builder()
 Enable sandboxed processes to call host-registered commands:
 
 ```rust
-use leash::{IpcCommand, IpcRouter, Sandbox, SandboxConfig};
+use heel::{IpcCommand, IpcRouter, Sandbox, SandboxConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -141,8 +141,8 @@ impl IpcCommand for WebSearch {
         "web_search".to_string()
     }
 
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
-        *self = leash::rmp_serde::from_slice(params)?;
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
+        *self = heel::rmp_serde::from_slice(params)?;
         Ok(())
     }
 
@@ -158,14 +158,14 @@ let config = SandboxConfig::builder().ipc(router).build()?;
 let sandbox = Sandbox::with_config(config).await?;
 ```
 
-Sandboxed processes use the `leash ipc` subcommand to call registered commands.
+Sandboxed processes use the `heel ipc` subcommand to call registered commands.
 
 ## Python Support
 
 Built-in virtual environment management:
 
 ```rust
-use leash::{PythonConfig, Sandbox, SandboxConfig, VenvConfig, VenvManager};
+use heel::{PythonConfig, Sandbox, SandboxConfig, VenvConfig, VenvManager};
 
 // Create a venv with packages
 let venv_config = VenvConfig::builder()
@@ -190,17 +190,17 @@ let output = sandbox
 
 ## CLI
 
-The `leash` crate also ships the `leash` CLI:
+The `heel` crate also ships the `heel` CLI:
 
 ```bash
 # Run a command in sandbox
-leash run echo hello
+heel run echo hello
 
 # Interactive shell in sandbox
-leash shell
+heel shell
 
 # Run Python script with venv
-leash python script.py
+heel python script.py
 ```
 
 ## License

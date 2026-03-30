@@ -19,8 +19,8 @@ pub struct VenvConfigJs {
 }
 
 impl VenvConfigJs {
-    pub fn into_rust(self) -> leash::VenvConfig {
-        let mut builder = leash::VenvConfig::builder();
+    pub fn into_rust(self) -> heel::VenvConfig {
+        let mut builder = heel::VenvConfig::builder();
 
         if let Some(path) = self.path {
             builder = builder.path(PathBuf::from(path));
@@ -53,8 +53,8 @@ pub struct PythonConfigJs {
 }
 
 impl PythonConfigJs {
-    pub fn into_rust(self) -> leash::PythonConfig {
-        let mut builder = leash::PythonConfig::builder();
+    pub fn into_rust(self) -> heel::PythonConfig {
+        let mut builder = heel::PythonConfig::builder();
 
         if let Some(venv) = self.venv {
             builder = builder.venv(venv.into_rust());

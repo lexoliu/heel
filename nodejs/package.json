@@ -1,5 +1,5 @@
 {
-  "name": "leash-sandbox",
+  "name": "heel-sandbox",
   "version": "0.1.0",
   "description": "Native sandbox for running untrusted code with OS-level isolation",
   "main": "index.js",
@@ -10,7 +10,7 @@
     "*.node"
   ],
   "napi": {
-    "name": "leash",
+    "name": "heel",
     "triples": {
       "defaults": false,
       "additional": [
@@ -40,7 +40,7 @@
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lexoliu/leash"
+    "url": "https://github.com/lexoliu/heel"
   },
   "keywords": [
     "sandbox",

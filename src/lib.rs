@@ -9,9 +9,9 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use leash::Sandbox;
+//! use heel::Sandbox;
 //!
-//! async fn run_sandboxed() -> leash::Result<()> {
+//! async fn run_sandboxed() -> heel::Result<()> {
 //!     // Create a sandbox with default configuration (network denied)
 //!     let sandbox = Sandbox::new()?;
 //!
@@ -41,9 +41,9 @@
 //! The library has built-in support for Python virtual environments:
 //!
 //! ```rust,ignore
-//! use leash::{Sandbox, SandboxConfig, PythonConfig, VenvConfig};
+//! use heel::{Sandbox, SandboxConfig, PythonConfig, VenvConfig};
 //!
-//! async fn run_python() -> leash::Result<()> {
+//! async fn run_python() -> heel::Result<()> {
 //!     let venv_config = VenvConfig::builder()
 //!         .packages(["requests", "numpy"])
 //!         .build();

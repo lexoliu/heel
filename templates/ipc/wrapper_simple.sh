@@ -1,3 +1,3 @@
 #!/bin/sh
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-exec "$SELF_DIR/leash" ipc {{ command }} -- "$@"
+exec "$SELF_DIR/heel" ipc {{ command }} -- "$@"

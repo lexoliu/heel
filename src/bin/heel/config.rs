@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use leash::{ResourceLimits, SecurityConfig, SecurityConfigBuilder};
+use heel::{ResourceLimits, SecurityConfig, SecurityConfigBuilder};
 
 use crate::cli::{CommonArgs, NetworkMode, PythonArgs};
 use crate::error::{CliError, CliResult};

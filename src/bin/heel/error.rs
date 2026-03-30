@@ -11,7 +11,7 @@ pub enum CliError {
     #[error("{source}")]
     Sandbox {
         #[from]
-        source: leash::Error,
+        source: heel::Error,
     },
 
     #[error("I/O error: {source}")]
@@ -38,7 +38,7 @@ pub enum CliError {
     #[error("--network allow-list requires at least one --allow-domain")]
     MissingAllowDomains,
 
-    #[error("LEASH_IPC_ENDPOINT environment variable not set")]
+    #[error("HEEL_IPC_ENDPOINT environment variable not set")]
     MissingIpcEndpoint,
 
     #[error("IPC request serialization failed: {source}")]

@@ -5,7 +5,7 @@
 //! 2. Network access (UDP/raw sockets blocked, TCP only through proxy)
 //! 3. Dangerous syscalls (ptrace blocked)
 
-use leash::{DenyAll, Sandbox};
+use heel::{DenyAll, Sandbox};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging

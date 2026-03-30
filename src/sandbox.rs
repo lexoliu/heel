@@ -47,16 +47,16 @@ struct StdinWrapperTemplate<'a> {
     stdin_arg: &'a str,
 }
 
-/// Template for the `leash` launcher placed inside `.leash/bin`.
+/// Template for the `heel` launcher placed inside `.heel/bin`.
 #[derive(Template)]
-#[template(path = "ipc/leash_launcher.sh", escape = "none")]
-struct LeashLauncherTemplate<'a> {
+#[template(path = "ipc/heel_launcher.sh", escape = "none")]
+struct HeelLauncherTemplate<'a> {
     binary: &'a str,
 }
 
 /// Create a wrapper script for an IPC command.
 ///
-/// The wrapper script calls `leash ipc <command> -- "$@"` to forward arguments
+/// The wrapper script calls `heel ipc <command> -- "$@"` to forward arguments
 /// to the IPC handler running on the host.
 ///
 /// If `positional_args` is provided, positional arguments are converted to named args:
@@ -142,11 +142,11 @@ fn search_path_for_binary(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn bundled_leash_path() -> PathBuf {
+fn bundled_heel_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target");
     path.push("debug");
-    let mut binary_name = String::from("leash");
+    let mut binary_name = String::from("heel");
     binary_name.push_str(std::env::consts::EXE_SUFFIX);
     path.push(binary_name);
     path
@@ -200,7 +200,7 @@ fn newest_modified_time(path: &Path) -> Result<std::time::SystemTime> {
     Ok(newest)
 }
 
-fn bundled_leash_is_fresh(binary: &Path) -> Result<bool> {
+fn bundled_heel_is_fresh(binary: &Path) -> Result<bool> {
     if !binary.is_file() {
         return Ok(false);
     }
@@ -225,9 +225,9 @@ fn bundled_leash_is_fresh(binary: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn ensure_bundled_leash_binary() -> Result<PathBuf> {
-    let bundled = bundled_leash_path();
-    if bundled_leash_is_fresh(&bundled)? {
+fn ensure_bundled_heel_binary() -> Result<PathBuf> {
+    let bundled = bundled_heel_path();
+    if bundled_heel_is_fresh(&bundled)? {
         return Ok(bundled);
     }
 
@@ -235,25 +235,25 @@ fn ensure_bundled_leash_binary() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| search_path_for_binary("cargo"))
         .ok_or_else(|| {
-            Error::InitFailed("failed to resolve cargo while preparing leash".to_string())
+            Error::InitFailed("failed to resolve cargo while preparing heel".to_string())
         })?;
 
     let status = ProcessCommand::new(&cargo)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .arg("build")
         .arg("--bin")
-        .arg("leash")
+        .arg("heel")
         .status()
         .map_err(|error| {
             Error::InitFailed(format!(
-                "failed to start cargo build for leash using '{}': {error}",
+                "failed to start cargo build for heel using '{}': {error}",
                 cargo.display()
             ))
         })?;
 
     if !status.success() {
         return Err(Error::InitFailed(format!(
-            "cargo build --bin leash exited with status {status}"
+            "cargo build --bin heel exited with status {status}"
         )));
     }
 
@@ -261,40 +261,40 @@ fn ensure_bundled_leash_binary() -> Result<PathBuf> {
         Ok(bundled)
     } else {
         Err(Error::InitFailed(format!(
-            "cargo reported success but leash binary is missing at {}",
+            "cargo reported success but heel binary is missing at {}",
             bundled.display()
         )))
     }
 }
 
-fn resolve_leash_binary() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("LEASH_BIN") {
+fn resolve_heel_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("HEEL_BIN") {
         let resolved = PathBuf::from(path);
         if resolved.is_file() {
             return Ok(resolved);
         }
         return Err(Error::InitFailed(format!(
-            "LEASH_BIN points to a missing file: {}",
+            "HEEL_BIN points to a missing file: {}",
             resolved.display()
         )));
     }
 
-    if let Ok(bundled) = ensure_bundled_leash_binary() {
+    if let Ok(bundled) = ensure_bundled_heel_binary() {
         return Ok(bundled);
     }
 
-    search_path_for_binary(&format!("leash{}", std::env::consts::EXE_SUFFIX))
-        .ok_or_else(|| Error::InitFailed("failed to resolve leash binary".to_string()))
+    search_path_for_binary(&format!("heel{}", std::env::consts::EXE_SUFFIX))
+        .ok_or_else(|| Error::InitFailed("failed to resolve heel binary".to_string()))
 }
 
-fn create_leash_launcher(bin_dir: &Path, binary: &Path) -> Result<()> {
+fn create_heel_launcher(bin_dir: &Path, binary: &Path) -> Result<()> {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    let launcher_path = bin_dir.join("leash");
+    let launcher_path = bin_dir.join("heel");
     let escaped = shell_escape::unix::escape(binary.to_string_lossy());
-    let launcher = LeashLauncherTemplate { binary: &escaped }
+    let launcher = HeelLauncherTemplate { binary: &escaped }
         .render()
         .map_err(|error| Error::IoError(format!("template render failed: {error}")))?;
 
@@ -475,12 +475,12 @@ impl<N: NetworkPolicy + 'static> Sandbox<N> {
 
         // Start IPC server if configured
         let ipc_server = if let Some(router) = config_data.ipc.take() {
-            let leash_dir = working_dir_path.join(".leash");
-            let leash_binary = resolve_leash_binary()?;
-            let leash_binary_for_launcher = leash_binary.clone();
+            let heel_dir = working_dir_path.join(".heel");
+            let heel_binary = resolve_heel_binary()?;
+            let heel_binary_for_launcher = heel_binary.clone();
 
             // Create wrapper scripts for each IPC command
-            let bin_dir = leash_dir.join("bin");
+            let bin_dir = heel_dir.join("bin");
             let bin_dir_for_log = bin_dir.clone();
             let method_metadata: Vec<(String, Vec<String>, Option<String>)> = router
                 .methods()
@@ -494,7 +494,7 @@ impl<N: NetworkPolicy + 'static> Sandbox<N> {
                 .collect();
             unblock(move || -> crate::error::Result<()> {
                 std::fs::create_dir_all(&bin_dir)?;
-                create_leash_launcher(&bin_dir, &leash_binary_for_launcher)?;
+                create_heel_launcher(&bin_dir, &heel_binary_for_launcher)?;
                 for (method, positional_args, stdin_arg) in method_metadata {
                     create_ipc_wrapper(&bin_dir, &method, &positional_args, stdin_arg.as_deref())?;
                 }
@@ -504,9 +504,9 @@ impl<N: NetworkPolicy + 'static> Sandbox<N> {
             if !config_data
                 .executable_paths
                 .iter()
-                .any(|path| path == &leash_binary)
+                .any(|path| path == &heel_binary)
             {
-                config_data.executable_paths.push(leash_binary.clone());
+                config_data.executable_paths.push(heel_binary.clone());
             }
             tracing::debug!(bin_dir = %bin_dir_for_log.display(), "created IPC wrapper scripts");
 
@@ -571,7 +571,7 @@ impl<N: NetworkPolicy + 'static> Sandbox<N> {
     ///
     /// The command will automatically have HTTP_PROXY and HTTPS_PROXY
     /// environment variables set to route traffic through the sandbox's proxy.
-    /// If IPC is configured, LEASH_IPC_ENDPOINT will also be set.
+    /// If IPC is configured, HEEL_IPC_ENDPOINT will also be set.
     pub fn command(&self, program: impl Into<String>) -> Command<'_> {
         let ipc_endpoint = self.ipc_server.as_ref().map(|s| s.endpoint().to_string());
         Command::new(
@@ -624,7 +624,7 @@ impl<N: NetworkPolicy + 'static> Sandbox<N> {
     ///
     /// This method spawns the command with a proper pseudo-terminal, enabling
     /// interactive shell sessions with line editing, job control, and proper
-    /// terminal handling. Use this for `leash shell` or any interactive command.
+    /// terminal handling. Use this for `heel shell` or any interactive command.
     ///
     /// # Arguments
     /// * `program` - The program to run

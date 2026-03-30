@@ -195,7 +195,7 @@
 ; =============================================================================
 (deny network*)
 {% if let Some(ipc_port) = ipc_port %}
-; Allow IPC endpoint only (sandbox-local leash IPC server)
+; Allow IPC endpoint only (sandbox-local heel IPC server)
 (allow network-outbound (remote ip "localhost:{{ ipc_port }}"))
 {% endif %}
 {% if !network_deny_all %}

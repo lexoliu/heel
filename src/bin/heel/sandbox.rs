@@ -1,9 +1,9 @@
-use leash::{
-    AllowAll, AllowList, Command, DenyAll, PythonConfig, Sandbox, SandboxConfig,
-    SandboxConfigBuilder, StdioConfig, VenvConfig,
-};
 #[cfg(target_os = "macos")]
-use leash::PtyExitStatus;
+use heel::PtyExitStatus;
+use heel::{
+    AllowAll, AllowList, Command, DenyAll, PythonConfig, Sandbox, SandboxConfig,
+    SandboxConfigBuilder, VenvConfig,
+};
 
 use crate::cli::NetworkMode;
 use crate::config::MergedConfig;
@@ -50,7 +50,7 @@ impl SandboxHandle {
         program: &str,
         args: &[String],
         envs: &[(String, String)],
-    ) -> leash::Result<std::process::ExitStatus> {
+    ) -> heel::Result<std::process::ExitStatus> {
         let mut command = self.command(program);
         command = command.args(args);
         for (key, value) in envs {
@@ -71,7 +71,7 @@ impl SandboxHandle {
         program: &str,
         args: &[String],
         envs: &[(String, String)],
-    ) -> leash::Result<PtyExitStatus> {
+    ) -> heel::Result<PtyExitStatus> {
         match self {
             Self::DenyAll(s) => s.run_interactive(program, args, envs),
             Self::AllowAll(s) => s.run_interactive(program, args, envs),
@@ -108,7 +108,7 @@ pub async fn create_sandbox(config: &MergedConfig) -> CliResult<SandboxHandle> {
 }
 
 /// Build a SandboxConfig from merged CLI/file configuration
-fn build_config<N: leash::NetworkPolicy>(
+fn build_config<N: heel::NetworkPolicy>(
     builder: SandboxConfigBuilder<N>,
     config: &MergedConfig,
 ) -> CliResult<SandboxConfig<N>> {

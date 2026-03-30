@@ -615,6 +615,58 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "heel"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "async-io",
+ "async-net",
+ "blocking",
+ "bytes",
+ "clap",
+ "crossterm",
+ "executor-core",
+ "futures-lite",
+ "http-body-util",
+ "hyper",
+ "landlock",
+ "libc",
+ "nix",
+ "polling",
+ "pty-process",
+ "rand",
+ "remove_dir_all",
+ "rmp-serde",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "shell-escape",
+ "smol",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "which",
+ "windows",
+]
+
+[[package]]
+name = "heel-nodejs"
+version = "0.1.0"
+dependencies = [
+ "executor-core",
+ "heel",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -734,58 +786,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
-name = "leash"
-version = "0.1.0"
-dependencies = [
- "askama",
- "async-io",
- "async-net",
- "blocking",
- "bytes",
- "clap",
- "crossterm",
- "executor-core",
- "futures-lite",
- "http-body-util",
- "hyper",
- "landlock",
- "libc",
- "nix",
- "polling",
- "pty-process",
- "rand",
- "remove_dir_all",
- "rmp-serde",
- "seccompiler",
- "serde",
- "serde_json",
- "shell-escape",
- "smol",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "which",
- "windows",
-]
-
-[[package]]
-name = "leash-nodejs"
-version = "0.1.0"
-dependencies = [
- "executor-core",
- "leash",
- "napi",
- "napi-build",
- "napi-derive",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
 
 [[package]]
 name = "libc"

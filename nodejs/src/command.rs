@@ -19,12 +19,12 @@ pub enum StdioConfigJs {
     Null,
 }
 
-impl From<StdioConfigJs> for leash::StdioConfig {
+impl From<StdioConfigJs> for heel::StdioConfig {
     fn from(config: StdioConfigJs) -> Self {
         match config {
-            StdioConfigJs::Inherit => leash::StdioConfig::Inherit,
-            StdioConfigJs::Piped => leash::StdioConfig::Piped,
-            StdioConfigJs::Null => leash::StdioConfig::Null,
+            StdioConfigJs::Inherit => heel::StdioConfig::Inherit,
+            StdioConfigJs::Piped => heel::StdioConfig::Piped,
+            StdioConfigJs::Null => heel::StdioConfig::Null,
         }
     }
 }
@@ -170,8 +170,8 @@ impl Command {
         }
         cmd = cmd
             .stdin(self.stdin.into())
-            .stdout(leash::StdioConfig::Piped) // Always pipe for output()
-            .stderr(leash::StdioConfig::Piped);
+            .stdout(heel::StdioConfig::Piped) // Always pipe for output()
+            .stderr(heel::StdioConfig::Piped);
 
         let output = cmd.output().await.into_napi()?;
         Ok(ProcessOutputJs::from(output))
