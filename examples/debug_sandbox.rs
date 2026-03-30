@@ -1,6 +1,6 @@
 //! Debug sandbox to identify the issue
 
-use leash::{AllowAll, Sandbox, SandboxConfig};
+use heel::{AllowAll, Sandbox, SandboxConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -15,9 +15,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(output) => output,
         Err(e) => {
             match &e {
-                leash::Error::UnsupportedPlatformVersion { .. }
-                | leash::Error::NotEnforced(_)
-                | leash::Error::InitFailed(_) => {
+                heel::Error::UnsupportedPlatformVersion { .. }
+                | heel::Error::NotEnforced(_)
+                | heel::Error::InitFailed(_) => {
                     eprintln!("Skipping test due to environment limitations: {}", e);
                     return Ok(());
                 }

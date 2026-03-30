@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  upload-leash-assets:
+  upload-heel-assets:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -36,14 +36,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build leash
-        run: cargo build --locked --bin leash --target "${{ matrix.target }}"
+      - name: Build heel
+        run: cargo build --locked --bin heel --target "${{ matrix.target }}"
 
       - name: Prepare release asset
         id: asset
         run: |
-          asset_name="leash-${{ matrix.target }}"
-          binary_path="target/${{ matrix.target }}/debug/leash"
+          asset_name="heel-${{ matrix.target }}"
+          binary_path="target/${{ matrix.target }}/debug/heel"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             asset_name="${asset_name}.exe"
             binary_path="${binary_path}.exe"

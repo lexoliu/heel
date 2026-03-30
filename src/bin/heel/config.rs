@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use leash::{ResourceLimits, SecurityConfig, SecurityConfigBuilder};
+use heel::{ResourceLimits, SecurityConfig, SecurityConfigBuilder};
 
 use crate::cli::{CommonArgs, NetworkMode, PythonArgs};
 use crate::error::{CliError, CliResult};
@@ -406,10 +406,7 @@ fn build_security_and_preset(
     };
 
     // Determine writable_file_system based on preset (only Permissive allows global write)
-    let writable_file_system = match preset {
-        Preset::Permissive => true,
-        _ => false,
-    };
+    let writable_file_system = matches!(preset, Preset::Permissive);
 
     (config, filesystem_strict, writable_file_system)
 }

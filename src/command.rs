@@ -42,7 +42,7 @@ impl From<StdioConfig> for Stdio {
 ///
 /// All network traffic from the command is routed through the sandbox's proxy.
 /// HTTP_PROXY and HTTPS_PROXY environment variables are automatically injected.
-/// If IPC is configured, LEASH_IPC_ENDPOINT is also injected.
+/// If IPC is configured, HEEL_IPC_ENDPOINT is also injected.
 pub struct Command<'a> {
     config: &'a SandboxConfigData,
     backend: &'a NativeBackend,
@@ -171,14 +171,14 @@ impl<'a> Command<'a> {
 
         // Inject IPC endpoint and update PATH if configured
         if let Some(ref endpoint) = self.ipc_endpoint {
-            if !envs.iter().any(|(k, _)| k == "LEASH_IPC_ENDPOINT") {
-                envs.push(("LEASH_IPC_ENDPOINT".to_string(), endpoint.clone()));
+            if !envs.iter().any(|(k, _)| k == "HEEL_IPC_ENDPOINT") {
+                envs.push(("HEEL_IPC_ENDPOINT".to_string(), endpoint.clone()));
             }
 
-            // Add .leash/bin to PATH for IPC wrapper scripts
-            let leash_bin = self.config.working_dir().join(".leash").join("bin");
+            // Add .heel/bin to PATH for IPC wrapper scripts
+            let heel_bin = self.config.working_dir().join(".heel").join("bin");
             let current_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{}:{}", leash_bin.display(), current_path);
+            let new_path = format!("{}:{}", heel_bin.display(), current_path);
             // Remove any existing PATH entry and add the new one
             envs.retain(|(k, _)| k != "PATH");
             envs.push(("PATH".to_string(), new_path));

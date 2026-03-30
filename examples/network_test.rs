@@ -1,9 +1,9 @@
 //! Test that network is blocked in the sandbox
 
-use leash::Sandbox;
+use heel::Sandbox;
 
 #[tokio::main]
-async fn main() -> leash::Result<()> {
+async fn main() -> heel::Result<()> {
     tracing_subscriber::fmt::init();
 
     let sandbox = Sandbox::new().await?;

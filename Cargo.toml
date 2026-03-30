@@ -2,18 +2,18 @@
 members = [".", "nodejs"]
 
 [package]
-name = "leash"
+name = "heel"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform native sandboxing library for running untrusted code"
-repository = "https://github.com/lexoliu/leash"
+repository = "https://github.com/lexoliu/heel"
 keywords = ["sandbox", "security", "isolation", "python", "venv"]
 categories = ["os", "development-tools"]
 
 [[bin]]
-name = "leash"
-path = "src/bin/leash/main.rs"
+name = "heel"
+path = "src/bin/heel/main.rs"
 
 [features]
 default = ["python"]
@@ -51,9 +51,6 @@ smol = "2"
 askama = "0.12"
 shell-escape = "0.1"
 
-# PTY support for interactive shells
-pty-process = "0.5"
-
 # Terminal raw mode
 crossterm = "0.29"
 
@@ -69,6 +66,10 @@ remove_dir_all = "0.8"
 # Unix process management
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# PTY support for interactive shells
+[target.'cfg(target_os = "macos")'.dependencies]
+pty-process = "0.5"
 
 # Python executable detection (optional)
 [dependencies.which]

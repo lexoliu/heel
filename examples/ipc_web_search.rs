@@ -8,7 +8,7 @@
 //!
 //! Run with: cargo run --example ipc_web_search
 
-use leash::{IpcCommand, IpcRouter, Sandbox, SandboxConfig};
+use heel::{IpcCommand, IpcRouter, Sandbox, SandboxConfig};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -60,8 +60,8 @@ impl IpcCommand for WebSearch {
         Cow::Borrowed(&[Cow::Borrowed("query")])
     }
 
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
-        let payload: CliArgsPayload = leash::rmp_serde::from_slice(params)?;
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
+        let payload: CliArgsPayload = heel::rmp_serde::from_slice(params)?;
         let mut args = payload.args.into_iter();
         while let Some(arg) = args.next() {
             if arg == "--query" {
@@ -103,7 +103,7 @@ impl IpcCommand for WebSearch {
 }
 
 #[tokio::main]
-async fn main() -> leash::Result<()> {
+async fn main() -> heel::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Create router and register WebSearch command

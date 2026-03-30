@@ -1,9 +1,9 @@
 //! Test Python execution in sandbox with venv
 
-use leash::{PythonConfig, Sandbox, SandboxConfigBuilder, VenvConfig, VenvManager};
+use heel::{PythonConfig, Sandbox, SandboxConfigBuilder, VenvConfig, VenvManager};
 
 #[tokio::main]
-async fn main() -> leash::Result<()> {
+async fn main() -> heel::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Create a venv config

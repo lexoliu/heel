@@ -32,10 +32,7 @@ fn seccomp_error_to_io(error: seccompiler::Error) -> std::io::Error {
         seccompiler::Error::Prctl(source) | seccompiler::Error::Seccomp(source) => source,
         seccompiler::Error::EmptyFilter => std::io::Error::from_raw_os_error(libc::EINVAL),
         seccompiler::Error::ThreadSync(_) => std::io::Error::from_raw_os_error(libc::EIO),
-        other => std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Seccomp apply_filter failed: {other}"),
-        ),
+        other => std::io::Error::other(format!("Seccomp apply_filter failed: {other}")),
     }
 }
 
@@ -396,6 +393,7 @@ fn add_hardware_restrictions(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::SecurityConfig;
 
     #[test]
     fn test_arch_detection() {
@@ -404,5 +402,11 @@ mod tests {
         {
             assert!(detect_arch().is_ok());
         }
+    }
+
+    #[test]
+    fn test_filter_program_is_not_empty() {
+        let filter = build_filter(&SecurityConfig::strict(), false, false).unwrap();
+        assert!(!filter.program.is_empty());
     }
 }

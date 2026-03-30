@@ -1,4 +1,4 @@
-use leash::{AllowAll, AllowList, ConnectionDirection, DenyAll, DomainRequest, NetworkPolicy};
+use heel::{AllowAll, AllowList, ConnectionDirection, DenyAll, DomainRequest, NetworkPolicy};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 

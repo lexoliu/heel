@@ -11,7 +11,7 @@ use crate::network::NetworkPolicyWrapper;
 
 /// Internal sandbox wrapper that owns the Rust sandbox
 pub(crate) struct SandboxInner {
-    pub sandbox: leash::Sandbox<NetworkPolicyWrapper>,
+    pub sandbox: heel::Sandbox<NetworkPolicyWrapper>,
 }
 
 /// A sandbox for running untrusted code with restricted permissions
@@ -39,19 +39,17 @@ impl Sandbox {
         // Build the Rust config - do this before any await points
         let rust_config = match config {
             Some(cfg) => cfg.into_rust_config()?,
-            None => leash::SandboxConfig::builder()
+            None => heel::SandboxConfig::builder()
                 .network(NetworkPolicyWrapper::deny_all())
                 .build()
                 .into_napi()?,
         };
 
         // Create the sandbox with tokio executor
-        let sandbox = leash::Sandbox::with_config_and_executor(
-            rust_config,
-            executor_core::tokio::TokioGlobal,
-        )
-        .await
-        .into_napi()?;
+        let sandbox =
+            heel::Sandbox::with_config_and_executor(rust_config, executor_core::tokio::TokioGlobal)
+                .await
+                .into_napi()?;
 
         let working_dir = sandbox.working_dir().to_string_lossy().to_string();
         let proxy_url = sandbox.proxy_url();
@@ -128,7 +126,7 @@ impl Sandbox {
 ///
 /// @example
 /// ```typescript
-/// import { createSandbox } from 'leash-sandbox';
+/// import { createSandbox } from 'heel-sandbox';
 ///
 /// const sandbox = await createSandbox();
 /// const output = await sandbox.command('echo').arg('hello').output();

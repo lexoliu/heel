@@ -18,7 +18,11 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Initialize tracing based on verbosity
-    let filter = if cli.verbose { "leash=debug" } else { "leash=warn" };
+    let filter = if cli.verbose {
+        "heel=debug"
+    } else {
+        "heel=warn"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

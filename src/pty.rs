@@ -95,12 +95,10 @@ pub fn run_with_pty<N: NetworkPolicy>(
 
     // Inject IPC endpoint and wrappers path for interactive IPC commands
     if let Some(endpoint) = ipc_endpoint {
-        let leash_bin = config.working_dir().join(".leash").join("bin");
+        let heel_bin = config.working_dir().join(".heel").join("bin");
         let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{}", leash_bin.display(), current_path);
-        cmd = cmd
-            .env("LEASH_IPC_ENDPOINT", endpoint)
-            .env("PATH", new_path);
+        let new_path = format!("{}:{}", heel_bin.display(), current_path);
+        cmd = cmd.env("HEEL_IPC_ENDPOINT", endpoint).env("PATH", new_path);
     }
 
     // Spawn the child process

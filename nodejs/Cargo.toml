@@ -1,17 +1,17 @@
 [package]
-name = "leash-nodejs"
+name = "heel-nodejs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Node.js bindings for leash sandbox library"
+description = "Node.js bindings for heel sandbox library"
 publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-# Core leash library
-leash = { path = ".." }
+# Core heel library
+heel = { path = ".." }
 
 # NAPI-RS for Node.js bindings
 napi = { version = "2", default-features = false, features = [

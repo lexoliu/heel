@@ -1,4 +1,4 @@
-use leash::StdioConfig;
+use heel::StdioConfig;
 
 use crate::cli::RunArgs;
 use crate::config::MergedConfig;

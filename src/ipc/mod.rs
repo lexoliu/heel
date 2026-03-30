@@ -7,7 +7,7 @@
 //!
 //! ```rust,ignore
 //! use serde::{Serialize, Deserialize};
-//! use leash::ipc::{IpcCommand, IpcRouter};
+//! use heel::ipc::{IpcCommand, IpcRouter};
 //!
 //! #[derive(Serialize, Deserialize, Default)]
 //! struct WebSearch { query: String }

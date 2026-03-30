@@ -23,8 +23,8 @@ pub struct ResourceLimitsJs {
 }
 
 impl ResourceLimitsJs {
-    pub fn into_rust(self) -> leash::ResourceLimits {
-        let mut builder = leash::ResourceLimits::builder();
+    pub fn into_rust(self) -> heel::ResourceLimits {
+        let mut builder = heel::ResourceLimits::builder();
 
         if let Some(v) = self.max_memory_bytes
             && v > 0
@@ -77,7 +77,7 @@ pub struct SandboxConfigJs {
 
 impl SandboxConfigJs {
     /// Convert to Rust SandboxConfig with NetworkPolicyWrapper
-    pub fn into_rust_config(self) -> Result<leash::SandboxConfig<NetworkPolicyWrapper>> {
+    pub fn into_rust_config(self) -> Result<heel::SandboxConfig<NetworkPolicyWrapper>> {
         // Parse network policy
         let network_policy = match self.network {
             Some(config) => NetworkPolicyWrapper::from_config(config)?,
@@ -85,7 +85,7 @@ impl SandboxConfigJs {
         };
 
         // Start building the config
-        let mut builder = leash::SandboxConfig::builder().network(network_policy);
+        let mut builder = heel::SandboxConfig::builder().network(network_policy);
 
         // Security config
         if let Some(security) = self.security {

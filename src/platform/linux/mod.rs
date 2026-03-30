@@ -30,6 +30,16 @@ pub struct LinuxBackend {
     _private: (),
 }
 
+struct CommandLaunch<'a> {
+    program: &'a str,
+    args: &'a [String],
+    envs: &'a [(String, String)],
+    current_dir: Option<&'a std::path::Path>,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+}
+
 /// Parsed kernel version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct KernelVersion {
@@ -256,13 +266,7 @@ impl LinuxBackend {
         &self,
         config: &SandboxConfigData,
         proxy_port: u16,
-        program: &str,
-        args: &[String],
-        envs: &[(String, String)],
-        current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        launch: CommandLaunch<'_>,
     ) -> Result<Command> {
         // Build Landlock ruleset (validated at creation time)
         let landlock_config = LandlockConfig::from_config(config);
@@ -276,11 +280,11 @@ impl LinuxBackend {
             config.ipc_port().is_some(),
         )?;
 
-        let mut cmd = Command::new(program);
-        cmd.args(args);
+        let mut cmd = Command::new(launch.program);
+        cmd.args(launch.args);
 
         // Set working directory
-        let work_dir = current_dir.unwrap_or(config.working_dir());
+        let work_dir = launch.current_dir.unwrap_or(config.working_dir());
         cmd.current_dir(work_dir);
 
         // Clear environment and set allowed vars
@@ -292,14 +296,14 @@ impl LinuxBackend {
         }
 
         // Add custom environment variables (includes proxy vars from Command)
-        for (key, val) in envs {
+        for (key, val) in launch.envs {
             cmd.env(key, val);
         }
 
         // Set stdio
-        cmd.stdin(stdin);
-        cmd.stdout(stdout);
-        cmd.stderr(stderr);
+        cmd.stdin(launch.stdin);
+        cmd.stdout(launch.stdout);
+        cmd.stderr(launch.stderr);
 
         // CRITICAL: Apply sandbox restrictions after fork, before exec
         // Keep pre_exec minimal and async-signal-safe: only apply pre-built rulesets/filters.
@@ -309,14 +313,14 @@ impl LinuxBackend {
         unsafe {
             cmd.pre_exec(move || {
                 #[cfg(debug_assertions)]
-                pre_exec_write(b"leash: pre_exec start\n");
+                pre_exec_write(b"heel: pre_exec start\n");
 
-                let ruleset = landlock_ruleset.take().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "Landlock ruleset already used")
-                })?;
+                let ruleset = landlock_ruleset
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("Landlock ruleset already used"))?;
 
                 if let Err(err) = ruleset.restrict_self() {
-                    pre_exec_write(b"leash: landlock restrict_self failed\n");
+                    pre_exec_write(b"heel: landlock restrict_self failed\n");
                     let errno = err
                         .raw_os_error()
                         .map(|code| format!(" (errno {code})"))
@@ -328,14 +332,14 @@ impl LinuxBackend {
                 }
 
                 #[cfg(debug_assertions)]
-                pre_exec_write(b"leash: landlock applied\n");
+                pre_exec_write(b"heel: landlock applied\n");
 
-                let filter = seccomp_filter.take().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "Seccomp filter already used")
-                })?;
+                let filter = seccomp_filter
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("Seccomp filter already used"))?;
 
                 if let Err(err) = filter.apply() {
-                    pre_exec_write(b"leash: seccomp apply failed\n");
+                    pre_exec_write(b"heel: seccomp apply failed\n");
                     let errno = err
                         .raw_os_error()
                         .map(|code| format!(" (errno {code})"))
@@ -347,7 +351,7 @@ impl LinuxBackend {
                 }
 
                 #[cfg(debug_assertions)]
-                pre_exec_write(b"leash: seccomp applied\n");
+                pre_exec_write(b"heel: seccomp applied\n");
 
                 Ok(())
             });
@@ -375,13 +379,15 @@ impl Backend for LinuxBackend {
         let mut cmd = self.build_command(
             config,
             proxy_port,
-            program,
-            args,
-            envs,
-            current_dir,
-            stdin,
-            stdout,
-            stderr,
+            CommandLaunch {
+                program,
+                args,
+                envs,
+                current_dir,
+                stdin,
+                stdout,
+                stderr,
+            },
         )?;
 
         // DEBUG: Print command details before spawn
@@ -422,13 +428,15 @@ impl Backend for LinuxBackend {
         let mut cmd = self.build_command(
             config,
             proxy_port,
-            program,
-            args,
-            envs,
-            current_dir,
-            stdin,
-            stdout,
-            stderr,
+            CommandLaunch {
+                program,
+                args,
+                envs,
+                current_dir,
+                stdin,
+                stdout,
+                stderr,
+            },
         )?;
 
         let child = cmd.spawn()?;

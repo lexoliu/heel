@@ -1,10 +1,10 @@
 //! Test general hardware access in sandbox with Python
 
-use leash::{Sandbox, SandboxConfigBuilder, SecurityConfig};
+use heel::{Sandbox, SandboxConfigBuilder, SecurityConfig};
 use std::path::Path;
 
 #[tokio::main]
-async fn main() -> leash::Result<()> {
+async fn main() -> heel::Result<()> {
     tracing_subscriber::fmt::init();
 
     let scripts_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scripts");

@@ -106,7 +106,7 @@ export interface PythonConfigJs {
  *
  * @example
  * ```typescript
- * import { createSandbox } from 'leash-sandbox';
+ * import { createSandbox } from 'heel-sandbox';
  *
  * const sandbox = await createSandbox();
  * const output = await sandbox.command('echo').arg('hello').output();

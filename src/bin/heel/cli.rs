@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "leash")]
+#[command(name = "heel")]
 #[command(version)]
 #[command(about = "Native sandbox for running untrusted code")]
 pub struct Cli {
@@ -29,7 +29,7 @@ pub enum Commands {
     /// Run Python in the sandbox (REPL if no script)
     Python(PythonArgs),
 
-    /// Invoke an IPC command inside a leash environment
+    /// Invoke an IPC command inside a heel environment
     Ipc(IpcArgs),
 }
 

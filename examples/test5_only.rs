@@ -24,20 +24,14 @@ fn main() {
 
             let ruleset = Ruleset::default()
                 .handle_access(AccessFs::from_all(ABI::V4))
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("handle_access: {}", e))
-                })?
+                .map_err(|e| std::io::Error::other(format!("handle_access: {}", e)))?
                 .create()
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("create: {}", e))
-                })?;
+                .map_err(|e| std::io::Error::other(format!("create: {}", e)))?;
 
             let ruleset = if let Ok(path_fd) = PathFd::new("/tmp") {
                 ruleset
                     .add_rule(PathBeneath::new(path_fd, AccessFs::from_all(ABI::V4)))
-                    .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, format!("add_rule: {}", e))
-                    })?
+                    .map_err(|e| std::io::Error::other(format!("add_rule: {}", e)))?
             } else {
                 ruleset
             };
@@ -46,10 +40,7 @@ fn main() {
                 Ok(status) => eprintln!("  pre_exec: Landlock status = {:?}", status.ruleset),
                 Err(e) => {
                     eprintln!("  pre_exec: Landlock restrict_self FAILED: {}", e);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("restrict_self: {}", e),
-                    ));
+                    return Err(std::io::Error::other(format!("restrict_self: {}", e)));
                 }
             }
 
@@ -64,17 +55,14 @@ fn main() {
                 SeccompAction::Allow,
                 TargetArch::aarch64,
             )
-            .map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("SeccompFilter: {:?}", e))
-            })?;
+            .map_err(|e| std::io::Error::other(format!("SeccompFilter: {:?}", e)))?;
 
-            let program: seccompiler::BpfProgram = filter.try_into().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("BpfProgram: {:?}", e))
-            })?;
+            let program: seccompiler::BpfProgram = filter
+                .try_into()
+                .map_err(|e| std::io::Error::other(format!("BpfProgram: {:?}", e)))?;
 
-            seccompiler::apply_filter(&program).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("apply_filter: {:?}", e))
-            })?;
+            seccompiler::apply_filter(&program)
+                .map_err(|e| std::io::Error::other(format!("apply_filter: {:?}", e)))?;
 
             eprintln!("  pre_exec: Seccomp done");
             Ok(())

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0](https://github.com/lexoliu/leash/compare/leash-v0.0.1...leash-v0.1.0) - 2026-03-25
+## [0.1.0](https://github.com/lexoliu/heel/compare/heel-v0.0.1...heel-v0.1.0) - 2026-03-25
 
 ### Added
 
@@ -22,9 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- Unify leash library and CLI crate
+- Unify heel library and CLI crate
 - Use smol in async policy tests
-- Integrate IPC into leash CLI
+- Integrate IPC into heel CLI
 - Update workspace metadata for integrated IPC
 - Add release asset publishing workflow
 - Support TCP IPC and refine IPC wrappers
@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Implement Linux sandbox with Landlock + Seccomp
 - Add type-safe IPC for sandboxed process communication
 - Update CLAUDE.md
-- Rename to leash
+- Rename to heel
 - Rewrite NetworkProxy with hyper and executor-core
 - Restrict network to proxy port only and add Homebrew access
 - Integrate NetworkProxy and always route traffic through proxy

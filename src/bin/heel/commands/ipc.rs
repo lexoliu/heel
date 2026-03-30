@@ -39,7 +39,7 @@ struct LooseCommandEnvelope {
 }
 
 pub async fn execute(args: IpcArgs) -> CliResult<()> {
-    let endpoint = env::var("LEASH_IPC_ENDPOINT").map_err(|_| CliError::MissingIpcEndpoint)?;
+    let endpoint = env::var("HEEL_IPC_ENDPOINT").map_err(|_| CliError::MissingIpcEndpoint)?;
     let payload = build_payload(&args)?;
     let response = send_request(&endpoint, &args.command, &payload)?;
     if !response.is_empty() {
@@ -80,7 +80,7 @@ fn send_request(endpoint: &str, method: &str, params: &[u8]) -> CliResult<String
                 endpoint: endpoint.to_string(),
                 source,
             })?;
-        return send_request_with_stream(&mut stream, method, params);
+        send_request_with_stream(&mut stream, method, params)
     }
 
     #[cfg(not(unix))]

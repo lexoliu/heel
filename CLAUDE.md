@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**leash** is a cross-platform Rust library for running untrusted code in secure sandboxes with native OS-level isolation.
+**heel** is a cross-platform Rust library for running untrusted code in secure sandboxes with native OS-level isolation.
 
 Platform support:
 - **macOS**: `sandbox-exec` with SBPL profiles (fully implemented)
@@ -15,10 +15,10 @@ Platform support:
 
 ```
 .
-├── Cargo.toml      # Main library package and `leash` CLI binary
-├── src/bin/leash/  # CLI sources: `leash run`, `leash shell`, `leash python`, `leash ipc`
-├── ipc/            # IPC support library used by the `leash ipc` subcommand
-└── nodejs/         # Node.js bindings via NAPI-RS (leash-nodejs)
+├── Cargo.toml      # Main library package and `heel` CLI binary
+├── src/bin/heel/  # CLI sources: `heel run`, `heel shell`, `heel python`, `heel ipc`
+├── ipc/            # IPC support library used by the `heel ipc` subcommand
+└── nodejs/         # Node.js bindings via NAPI-RS (heel-nodejs)
 ```
 
 ## Build Commands
@@ -27,7 +27,7 @@ Platform support:
 cargo build                                  # Debug build (all workspace members)
 cargo build --release                        # Release build
 cargo test                                   # Run all tests
-cargo test -p leash                          # Run tests for main library only
+cargo test -p heel                          # Run tests for main library only
 cargo test test_name                         # Run specific test by name
 cargo run --example basic                    # Run an example
 cargo run --example python_sandbox           # Python venv example
@@ -37,9 +37,9 @@ RUST_LOG=debug cargo run --example basic     # With debug logging
 ### CLI usage
 
 ```bash
-cargo run --bin leash -- run echo hello      # Run command in sandbox
-cargo run --bin leash -- shell               # Interactive shell in sandbox
-cargo run --bin leash -- python script.py    # Run Python in sandbox with venv
+cargo run --bin heel -- run echo hello      # Run command in sandbox
+cargo run --bin heel -- shell               # Interactive shell in sandbox
+cargo run --bin heel -- python script.py    # Run Python in sandbox with venv
 ```
 
 ### Platform-specific testing

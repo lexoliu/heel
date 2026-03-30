@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use leash::{StdioConfig, VenvConfig, VenvManager};
+use heel::{StdioConfig, VenvConfig, VenvManager};
 
 use crate::cli::PythonArgs;
 use crate::config::{MergedConfig, merge_python_args};
@@ -57,13 +57,12 @@ pub async fn execute(args: PythonArgs, mut config: MergedConfig) -> CliResult<()
         // Determine Python executable
         let python = get_python_executable(&config);
 
-        let code = match args.script {
+        match args.script {
             Some(script_path) => {
                 run_script(&sandbox, &python, &script_path, &args.args, &envs).await?
             }
             None => run_repl(&sandbox, &python, &envs).await?,
-        };
-        code
+        }
         // sandbox dropped here, working dir cleaned up
     };
 
