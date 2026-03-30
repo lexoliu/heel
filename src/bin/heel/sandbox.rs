@@ -2,7 +2,7 @@
 use heel::PtyExitStatus;
 use heel::{
     AllowAll, AllowList, Command, DenyAll, PythonConfig, Sandbox, SandboxConfig,
-    SandboxConfigBuilder, VenvConfig,
+    SandboxConfigBuilder, StdioConfig, VenvConfig,
 };
 
 use crate::cli::NetworkMode;

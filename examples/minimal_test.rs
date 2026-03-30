@@ -15,22 +15,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     unsafe {
         cmd.pre_exec(|| {
-            use landlock::{ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr};
+            use landlock::{ABI, Access, AccessFs, Ruleset, RulesetAttr};
 
             let abi = ABI::V4;
             let ruleset = Ruleset::default()
                 .handle_access(AccessFs::from_all(abi))
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("handle_access: {}", e))
-                })?
+                .map_err(|e| std::io::Error::other(format!("handle_access: {}", e)))?
                 .create()
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, format!("create: {}", e))
-                })?;
+                .map_err(|e| std::io::Error::other(format!("create: {}", e)))?;
 
-            let status = ruleset.restrict_self().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("restrict_self: {}", e))
-            })?;
+            let status = ruleset
+                .restrict_self()
+                .map_err(|e| std::io::Error::other(format!("restrict_self: {}", e)))?;
 
             println!("Landlock status: {:?}", status);
             Ok(())
@@ -67,20 +63,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 SeccompAction::Allow,
                 TargetArch::aarch64, // Adjust based on arch
             )
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("SeccompFilter::new: {:?}", e),
-                )
-            })?;
+            .map_err(|e| std::io::Error::other(format!("SeccompFilter::new: {:?}", e)))?;
 
-            let program: seccompiler::BpfProgram = filter.try_into().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("BpfProgram: {:?}", e))
-            })?;
+            let program: seccompiler::BpfProgram = filter
+                .try_into()
+                .map_err(|e| std::io::Error::other(format!("BpfProgram: {:?}", e)))?;
 
-            seccompiler::apply_filter(&program).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("apply_filter: {:?}", e))
-            })?;
+            seccompiler::apply_filter(&program)
+                .map_err(|e| std::io::Error::other(format!("apply_filter: {:?}", e)))?;
 
             Ok(())
         });

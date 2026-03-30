@@ -712,7 +712,8 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::Sandbox;
 
     #[cfg(target_os = "macos")]
     #[test]

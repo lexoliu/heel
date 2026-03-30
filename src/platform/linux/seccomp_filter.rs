@@ -32,10 +32,7 @@ fn seccomp_error_to_io(error: seccompiler::Error) -> std::io::Error {
         seccompiler::Error::Prctl(source) | seccompiler::Error::Seccomp(source) => source,
         seccompiler::Error::EmptyFilter => std::io::Error::from_raw_os_error(libc::EINVAL),
         seccompiler::Error::ThreadSync(_) => std::io::Error::from_raw_os_error(libc::EIO),
-        other => std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Seccomp apply_filter failed: {other}"),
-        ),
+        other => std::io::Error::other(format!("Seccomp apply_filter failed: {other}")),
     }
 }
 
