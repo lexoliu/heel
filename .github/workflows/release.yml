@@ -92,7 +92,7 @@ jobs:
   release-assets:
     name: Release Assets
     needs: resolve-release
-    if: needs.resolve-release.outputs.upload_assets == 'true'
+    if: ${{ always() && needs.resolve-release.outputs.upload_assets == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
