@@ -195,11 +195,10 @@ async fn run_proxy<N: NetworkPolicy + 'static, E: Executor + Clone + 'static>(
                     })
                     .detach();
             }
-            Some(Err(e)) => {
-                if running.load(Ordering::SeqCst) {
-                    tracing::error!(error = %e, "network proxy: accept error");
-                }
+            Some(Err(e)) if running.load(Ordering::SeqCst) => {
+                tracing::error!(error = %e, "network proxy: accept error");
             }
+            Some(Err(_)) => {}
             None => {
                 // Timeout, continue loop to check running flag
             }

@@ -113,11 +113,10 @@ async fn run_server<E: Executor + Clone + 'static>(
                 let router = Arc::clone(&router);
                 executor.spawn(handle_connection(stream, router)).detach();
             }
-            Some(Err(e)) => {
-                if running.load(Ordering::SeqCst) {
-                    tracing::warn!(error = %e, "failed to accept IPC connection");
-                }
+            Some(Err(e)) if running.load(Ordering::SeqCst) => {
+                tracing::warn!(error = %e, "failed to accept IPC connection");
             }
+            Some(Err(_)) => {}
             None => {
                 // Timeout or listener closed; loop to re-check running flag
             }

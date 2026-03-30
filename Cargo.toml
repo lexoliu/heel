@@ -51,9 +51,6 @@ smol = "2"
 askama = "0.12"
 shell-escape = "0.1"
 
-# PTY support for interactive shells
-pty-process = "0.5"
-
 # Terminal raw mode
 crossterm = "0.29"
 
@@ -69,6 +66,10 @@ remove_dir_all = "0.8"
 # Unix process management
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# PTY support for interactive shells
+[target.'cfg(target_os = "macos")'.dependencies]
+pty-process = "0.5"
 
 # Python executable detection (optional)
 [dependencies.which]

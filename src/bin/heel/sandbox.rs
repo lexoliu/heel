@@ -1,8 +1,10 @@
 #[cfg(target_os = "macos")]
 use heel::PtyExitStatus;
+#[cfg(not(target_os = "macos"))]
+use heel::StdioConfig;
 use heel::{
     AllowAll, AllowList, Command, DenyAll, PythonConfig, Sandbox, SandboxConfig,
-    SandboxConfigBuilder, StdioConfig, VenvConfig,
+    SandboxConfigBuilder, VenvConfig,
 };
 
 use crate::cli::NetworkMode;
