@@ -13,12 +13,82 @@ jobs:
   release-plz:
     name: Release
     runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      release_tag: ${{ steps.release_tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: MarcoIeni/release-plz-action@v0.5
+      - id: release
+        uses: MarcoIeni/release-plz-action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Resolve released heel tag
+        id: release_tag
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          RELEASES_JSON: ${{ steps.release.outputs.releases }}
+        run: |
+          tag="$(jq -r '
+            map(select(.package_name == "heel")) as $releases
+            | if ($releases | length) == 1 then $releases[0].tag else empty end
+          ' <<<"${RELEASES_JSON}")"
+          if [[ -z "${tag}" ]]; then
+            echo "release-plz created releases but did not return exactly one heel release tag" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+  release-assets:
+    name: Release Assets
+    needs: release-plz
+    if: needs.release-plz.outputs.releases_created == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build heel
+        run: cargo build --locked --bin heel --target "${{ matrix.target }}"
+
+      - name: Prepare release asset
+        id: asset
+        run: |
+          asset_name="heel-${{ matrix.target }}"
+          binary_path="target/${{ matrix.target }}/debug/heel"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            asset_name="${asset_name}.exe"
+            binary_path="${binary_path}.exe"
+          fi
+          cp "${binary_path}" "${asset_name}"
+          echo "asset_name=${asset_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload asset to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.release-plz.outputs.release_tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" "${{ steps.asset.outputs.asset_name }}#${{ steps.asset.outputs.asset_name }}" --clobber
