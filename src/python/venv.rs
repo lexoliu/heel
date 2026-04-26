@@ -108,8 +108,7 @@ impl VenvManager {
         let python = config
             .python()
             .map(|p| p.to_path_buf())
-            .or_else(|| resolve_tool("python3"))
-            .or_else(|| resolve_tool("python"))
+            .or_else(Self::resolve_python_interpreter)
             .ok_or(Error::PythonNotFound)?;
 
         tracing::debug!(
@@ -247,6 +246,11 @@ impl VenvManager {
     pub fn site_packages_path(&self) -> &Path {
         &self.site_packages_path
     }
+
+    /// Resolve a runnable Python interpreter for host-side venv setup.
+    pub fn resolve_python_interpreter() -> Option<PathBuf> {
+        resolve_python_interpreter()
+    }
 }
 
 #[cfg(feature = "python")]
@@ -257,6 +261,91 @@ fn resolve_tool(name: &str) -> Option<PathBuf> {
 #[cfg(not(feature = "python"))]
 fn resolve_tool(_name: &str) -> Option<PathBuf> {
     None
+}
+
+fn resolve_python_interpreter() -> Option<PathBuf> {
+    let path_candidates = ["python3", "python"]
+        .into_iter()
+        .filter_map(resolve_tool)
+        .filter(|path| is_usable_python_path(path));
+
+    path_candidates
+        .chain(known_windows_python_candidates())
+        .next()
+}
+
+fn is_usable_python_path(path: &Path) -> bool {
+    if windows_store_python_alias(path) {
+        return false;
+    }
+
+    path.exists()
+}
+
+fn windows_store_python_alias(path: &Path) -> bool {
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("\\microsoft\\windowsapps\\python")
+}
+
+#[cfg(target_os = "windows")]
+fn known_windows_python_candidates() -> impl Iterator<Item = PathBuf> {
+    let mut candidates = Vec::new();
+
+    for root in windows_python_search_roots() {
+        collect_python_install_candidates(&root, &mut candidates);
+    }
+
+    candidates.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+    candidates.reverse();
+    candidates.into_iter().filter(|path| path.exists())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn known_windows_python_candidates() -> impl Iterator<Item = PathBuf> {
+    std::iter::empty()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_python_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(
+            PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("Python"),
+        );
+    }
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        roots.push(PathBuf::from(program_files));
+    }
+    if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+        roots.push(PathBuf::from(program_files_x86));
+    }
+
+    roots
+}
+
+#[cfg(target_os = "windows")]
+fn collect_python_install_candidates(root: &Path, candidates: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().starts_with("python") {
+            continue;
+        }
+        candidates.push(path.join("python.exe"));
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +367,11 @@ mod tests {
             VenvManager::python_executable(path),
             PathBuf::from("/tmp/test-venv/Scripts/python.exe")
         );
+    }
+
+    #[test]
+    fn windows_store_python_aliases_are_rejected() {
+        let alias = Path::new(r"C:\Users\name\AppData\Local\Microsoft\WindowsApps\python.exe");
+        assert!(super::windows_store_python_alias(alias));
     }
 }

@@ -22,9 +22,9 @@ We provide three tier isolation level
 
 | Platform | Backend | Status |
 |----------|---------|--------|
-| macOS | `sandbox-exec` with SBPL profiles | ✅ Fully implemented |
-| Linux | Landlock (ABI v4) + Seccomp | ✅ Implemented (kernel 6.7+) |
-| Windows | AppContainer | 🚧 Planned |
+| macOS | `sandbox-exec` with SBPL profiles | Fully implemented |
+| Linux | Landlock (ABI v4) + Seccomp | Implemented (kernel 6.7+) |
+| Windows | AppContainer | First-phase implemented: execution, strict filesystem, DenyAll network |
 
 ## Features
 

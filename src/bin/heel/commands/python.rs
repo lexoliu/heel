@@ -10,6 +10,7 @@ use crate::sandbox::create_sandbox;
 pub async fn execute(args: PythonArgs, mut config: MergedConfig) -> CliResult<()> {
     // Merge Python-specific args into config
     merge_python_args(&mut config, &args);
+    resolve_default_windows_python(&mut config)?;
 
     // Create venv before sandbox if packages are specified
     if !config.python.packages.is_empty() || config.python.venv.is_some() {
@@ -84,6 +85,22 @@ fn get_python_executable(config: &MergedConfig) -> String {
         // Use system Python
         "python3".to_string()
     }
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_default_windows_python(config: &mut MergedConfig) -> CliResult<()> {
+    if config.python.interpreter.is_some() {
+        return Ok(());
+    }
+
+    config.python.interpreter =
+        Some(VenvManager::resolve_python_interpreter().ok_or(heel::Error::PythonNotFound)?);
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_default_windows_python(_config: &mut MergedConfig) -> CliResult<()> {
+    Ok(())
 }
 
 async fn run_script(

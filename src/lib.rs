@@ -3,8 +3,8 @@
 //! This library provides a simple API for running untrusted code in a secure sandbox.
 //! It uses platform-native sandboxing mechanisms:
 //! - macOS: `sandbox-exec` with SBPL profiles
-//! - Linux: Landlock + Seccomp (planned)
-//! - Windows: AppContainer (planned)
+//! - Linux: Landlock + Seccomp
+//! - Windows: AppContainer
 //!
 //! # Example
 //!
@@ -69,10 +69,11 @@ pub mod pty;
 mod python;
 mod sandbox;
 mod security;
+mod stdio;
 mod workdir;
 
 // Re-export public types
-pub use command::{Command, StdioConfig};
+pub use command::Command;
 pub use config::{
     PythonConfig, PythonConfigBuilder, ResourceLimits, ResourceLimitsBuilder, SandboxConfig,
     SandboxConfigBuilder, VenvConfig, VenvConfigBuilder, python_data_science_preset,
@@ -83,12 +84,13 @@ pub use ipc::{IpcCommand, IpcError, IpcRouter};
 pub use network::{
     AllowAll, AllowList, ConnectionDirection, CustomPolicy, DenyAll, DomainRequest, NetworkPolicy,
 };
-pub use platform::Child;
+pub use platform::{Child, PlatformCapabilities, platform_capabilities};
 pub use python::VenvManager;
 /// Re-export rmp_serde for IpcCommand::apply_args implementations.
 pub use rmp_serde;
 pub use sandbox::Sandbox;
 pub use security::{SecurityConfig, SecurityConfigBuilder};
+pub use stdio::{ChildStderr, ChildStdin, ChildStdout, StdioConfig};
 pub use workdir::WorkingDir;
 
 // PTY support (macOS only for now)

@@ -4,7 +4,7 @@ mod landlock_rules;
 mod seccomp_filter;
 
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use blocking::unblock;
 
@@ -12,6 +12,7 @@ use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::linux::landlock_rules::LandlockConfig;
 use crate::platform::{Backend, Child};
+use crate::stdio::StdioConfig;
 
 /// Minimum required kernel version for full security (Landlock ABI v4)
 const MIN_KERNEL_VERSION: KernelVersion = KernelVersion::new(6, 7, 0);
@@ -35,9 +36,9 @@ struct CommandLaunch<'a> {
     args: &'a [String],
     envs: &'a [(String, String)],
     current_dir: Option<&'a std::path::Path>,
-    stdin: Stdio,
-    stdout: Stdio,
-    stderr: Stdio,
+    stdin: StdioConfig,
+    stdout: StdioConfig,
+    stderr: StdioConfig,
 }
 
 /// Parsed kernel version
@@ -301,9 +302,9 @@ impl LinuxBackend {
         }
 
         // Set stdio
-        cmd.stdin(launch.stdin);
-        cmd.stdout(launch.stdout);
-        cmd.stderr(launch.stderr);
+        cmd.stdin(std::process::Stdio::from(launch.stdin));
+        cmd.stdout(std::process::Stdio::from(launch.stdout));
+        cmd.stderr(std::process::Stdio::from(launch.stderr));
 
         // CRITICAL: Apply sandbox restrictions after fork, before exec
         // Keep pre_exec minimal and async-signal-safe: only apply pre-built rulesets/filters.
@@ -370,9 +371,9 @@ impl Backend for LinuxBackend {
         args: &[String],
         envs: &[(String, String)],
         current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> Result<Output> {
         tracing::debug!(program = %program, args = ?args, "sandbox: executing command");
 
@@ -419,9 +420,9 @@ impl Backend for LinuxBackend {
         args: &[String],
         envs: &[(String, String)],
         current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> Result<Child> {
         tracing::debug!(program = %program, args = ?args, "sandbox: spawning command");
 

@@ -387,15 +387,93 @@ impl ProcessTracker {
                 }
                 #[cfg(windows)]
                 {
-                    use std::process::Command;
-                    let _ = Command::new("taskkill")
-                        .args(["/F", "/PID", &pid.to_string()])
-                        .output();
+                    kill_windows_process_tree(pid);
                 }
             }
             pids.clear();
         }
     }
+}
+
+#[cfg(windows)]
+fn kill_windows_process_tree(pid: u32) {
+    let Some(command) = windows_taskkill_process_tree_command_from_env(pid, std::env::vars_os())
+    else {
+        tracing::warn!(
+            pid = pid,
+            "failed to resolve System32 taskkill.exe from SystemRoot or WINDIR"
+        );
+        return;
+    };
+
+    match ProcessCommand::new(&command.executable)
+        .args(&command.args)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                pid = pid,
+                executable = %command.executable.display(),
+                status = %output.status,
+                stderr = %stderr.trim(),
+                "taskkill process-tree cleanup failed"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                pid = pid,
+                executable = %command.executable.display(),
+                "failed to spawn taskkill process-tree cleanup: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(any(test, windows))]
+fn windows_taskkill_process_tree_args(pid: u32) -> [String; 4] {
+    [
+        "/F".to_string(),
+        "/T".to_string(),
+        "/PID".to_string(),
+        pid.to_string(),
+    ]
+}
+
+#[cfg(any(test, windows))]
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsTaskkillCommand {
+    executable: PathBuf,
+    args: [String; 4],
+}
+
+#[cfg(any(test, windows))]
+fn windows_taskkill_process_tree_command_from_env(
+    pid: u32,
+    env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<WindowsTaskkillCommand> {
+    let mut system_root = None;
+    let mut windir = None;
+
+    for (key, value) in env {
+        if value.as_os_str().is_empty() {
+            continue;
+        }
+
+        let key = key.to_string_lossy();
+        if key.eq_ignore_ascii_case("SystemRoot") && system_root.is_none() {
+            system_root = Some(PathBuf::from(value));
+        } else if key.eq_ignore_ascii_case("WINDIR") && windir.is_none() {
+            windir = Some(PathBuf::from(value));
+        }
+    }
+
+    let windows_root = system_root.or(windir)?;
+    Some(WindowsTaskkillCommand {
+        executable: windows_root.join("System32").join("taskkill.exe"),
+        args: windows_taskkill_process_tree_args(pid),
+    })
 }
 
 /// A sandbox for running untrusted code with restricted permissions
@@ -714,6 +792,53 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
 mod tests {
     #[cfg(target_os = "macos")]
     use crate::Sandbox;
+
+    #[test]
+    fn windows_taskkill_args_include_tree_cleanup_flag() {
+        assert_eq!(
+            super::windows_taskkill_process_tree_args(42),
+            [
+                "/F".to_string(),
+                "/T".to_string(),
+                "/PID".to_string(),
+                "42".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_taskkill_command_uses_system32_executable_from_systemroot() {
+        let command = super::windows_taskkill_process_tree_command_from_env(
+            42,
+            [(
+                std::ffi::OsString::from("SystemRoot"),
+                std::ffi::OsString::from(r"C:\Windows"),
+            )],
+        )
+        .expect("taskkill command");
+
+        assert_eq!(
+            command.executable,
+            std::path::Path::new(r"C:\Windows")
+                .join("System32")
+                .join("taskkill.exe")
+        );
+        assert_eq!(command.args, super::windows_taskkill_process_tree_args(42));
+    }
+
+    #[test]
+    fn windows_taskkill_command_requires_windows_root_environment() {
+        assert!(
+            super::windows_taskkill_process_tree_command_from_env(
+                42,
+                [(
+                    std::ffi::OsString::from("PATH"),
+                    std::ffi::OsString::from(r"C:\Temp"),
+                )],
+            )
+            .is_none()
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

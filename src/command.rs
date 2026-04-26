@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Output, Stdio};
+use std::process::{ExitStatus, Output};
 
 use crate::config::SandboxConfigData;
 use crate::error::Result;
@@ -7,6 +7,7 @@ use crate::network::NetworkPolicy;
 use crate::network::NetworkProxy;
 use crate::platform::{Backend, Child};
 use crate::sandbox::ProcessTracker;
+use crate::stdio::StdioConfig;
 
 #[cfg(target_os = "macos")]
 type NativeBackend = crate::platform::macos::MacOSBackend;
@@ -16,27 +17,6 @@ type NativeBackend = crate::platform::linux::LinuxBackend;
 
 #[cfg(target_os = "windows")]
 type NativeBackend = crate::platform::windows::WindowsBackend;
-
-/// Standard I/O configuration for a sandboxed command
-#[derive(Debug, Clone, Copy)]
-pub enum StdioConfig {
-    /// Inherit from parent process
-    Inherit,
-    /// Create a new pipe
-    Piped,
-    /// Redirect to null
-    Null,
-}
-
-impl From<StdioConfig> for Stdio {
-    fn from(config: StdioConfig) -> Self {
-        match config {
-            StdioConfig::Inherit => Stdio::inherit(),
-            StdioConfig::Piped => Stdio::piped(),
-            StdioConfig::Null => Stdio::null(),
-        }
-    }
-}
 
 /// A builder for sandboxed commands, similar to smol::process::Command
 ///
@@ -198,9 +178,9 @@ impl<'a> Command<'a> {
                 &self.args,
                 &envs,
                 self.current_dir.as_deref(),
-                Stdio::null(),
-                Stdio::piped(),
-                Stdio::piped(),
+                StdioConfig::Null,
+                StdioConfig::Piped,
+                StdioConfig::Piped,
             )
             .await
     }
@@ -217,9 +197,9 @@ impl<'a> Command<'a> {
                 &self.args,
                 &envs,
                 self.current_dir.as_deref(),
-                self.stdin.into(),
-                self.stdout.into(),
-                self.stderr.into(),
+                self.stdin,
+                self.stdout,
+                self.stderr,
             )
             .await?;
         Ok(output.status)
@@ -237,9 +217,9 @@ impl<'a> Command<'a> {
                 &self.args,
                 &envs,
                 self.current_dir.as_deref(),
-                self.stdin.into(),
-                self.stdout.into(),
-                self.stderr.into(),
+                self.stdin,
+                self.stdout,
+                self.stderr,
             )
             .await?;
 

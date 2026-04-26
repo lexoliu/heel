@@ -2,13 +2,14 @@ mod profile;
 
 pub use profile::generate_profile;
 
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use blocking::unblock;
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::{Backend, Child};
+use crate::stdio::StdioConfig;
 
 /// macOS sandbox backend using sandbox-exec
 pub struct MacOSBackend {
@@ -66,9 +67,9 @@ impl MacOSBackend {
         args: &[String],
         envs: &[(String, String)],
         current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> Result<Command> {
         // Generate SBPL profile
         let sbpl_profile = profile::generate_profile(config, proxy_port)?;
@@ -99,9 +100,9 @@ impl MacOSBackend {
         }
 
         // Set stdio
-        cmd.stdin(stdin);
-        cmd.stdout(stdout);
-        cmd.stderr(stderr);
+        cmd.stdin(std::process::Stdio::from(stdin));
+        cmd.stdout(std::process::Stdio::from(stdout));
+        cmd.stderr(std::process::Stdio::from(stderr));
 
         Ok(cmd)
     }
@@ -116,9 +117,9 @@ impl Backend for MacOSBackend {
         args: &[String],
         envs: &[(String, String)],
         current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> Result<Output> {
         tracing::debug!(program = %program, args = ?args, "sandbox: executing command");
 
@@ -154,9 +155,9 @@ impl Backend for MacOSBackend {
         args: &[String],
         envs: &[(String, String)],
         current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> Result<Child> {
         tracing::debug!(program = %program, args = ?args, "sandbox: spawning command");
 
