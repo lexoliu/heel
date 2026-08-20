@@ -23,6 +23,7 @@ pub fn convert_error(err: heel::Error) -> Error {
         heel::Error::VenvCreationFailed(msg) => ("ERR_VENV_CREATION", msg.clone()),
         heel::Error::PackageInstallFailed(msg) => ("ERR_PACKAGE_INSTALL", msg.clone()),
         heel::Error::ProxyError(msg) => ("ERR_PROXY", msg.clone()),
+        heel::Error::AuditLog(msg) => ("ERR_AUDIT_LOG", msg.clone()),
         heel::Error::ProcessError(e) => ("ERR_PROCESS", e.to_string()),
         heel::Error::CommandFailed { code, message } => (
             "ERR_COMMAND_FAILED",

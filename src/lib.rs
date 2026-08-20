@@ -81,7 +81,8 @@ pub use config::{
 pub use error::{Error, Result};
 pub use ipc::{IpcCommand, IpcError, IpcRouter};
 pub use network::{
-    AllowAll, AllowList, ConnectionDirection, CustomPolicy, DenyAll, DomainRequest, NetworkPolicy,
+    AllowAll, AllowList, Audited, ConnectionDirection, CustomPolicy, DenyAll, DomainRequest,
+    NetworkAuditLog, NetworkPolicy,
 };
 pub use platform::Child;
 pub use python::VenvManager;

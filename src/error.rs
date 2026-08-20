@@ -50,6 +50,9 @@ pub enum Error {
     #[error("network proxy error: {0}")]
     ProxyError(String),
 
+    #[error("network audit log error: {0}")]
+    AuditLog(String),
+
     #[error("process execution failed: {0}")]
     ProcessError(#[from] io::Error),
 
