@@ -194,6 +194,10 @@
 ; Network: deny by default; optionally allow proxy port
 ; =============================================================================
 (deny network*)
+; Allow sandboxed tools to host ephemeral loopback services for local rendering,
+; browser previews, language servers, and similar terminal-first workflows.
+; macOS requires network-inbound here; that operation also grants the bind.
+(allow network-inbound (local tcp "localhost:*"))
 {% if let Some(ipc_port) = ipc_port %}
 ; Allow IPC endpoint only (sandbox-local heel IPC server)
 (allow network-outbound (remote ip "localhost:{{ ipc_port }}"))

@@ -180,6 +180,7 @@ mod tests {
     use crate::config::SandboxConfig;
     use crate::network::AllowAll;
     use crate::network::DenyAll;
+    use std::process::Command;
 
     #[test]
     fn test_generate_basic_profile() {
@@ -192,6 +193,7 @@ mod tests {
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(allow file-read*)"));
         assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains("(allow network-inbound (local tcp \"localhost:*\"))"));
         // Verify deny-all has no allow rule for proxy
         assert!(!profile.contains("(allow network-outbound (remote ip \"localhost:12345\"))"));
 
@@ -210,6 +212,34 @@ mod tests {
         assert!(profile.contains("(allow network-outbound (remote ip \"localhost:23456\"))"));
 
         // Clean up the random working directory
+        std::fs::remove_dir(&working_dir).ok();
+    }
+
+    #[test]
+    fn generated_profile_allows_ephemeral_loopback_server() {
+        let config = SandboxConfig::<DenyAll>::new().unwrap();
+        let working_dir = config.working_dir().to_path_buf();
+        let (_policy, config_data) = config.into_parts();
+        let profile = generate_profile(&config_data, 12345).unwrap();
+
+        let output = Command::new("sandbox-exec")
+            .args([
+                "-p",
+                &profile,
+                "/usr/bin/ruby",
+                "-rsocket",
+                "-e",
+                "server = TCPServer.new('127.0.0.1', 0); server.close",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "loopback bind failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
         std::fs::remove_dir(&working_dir).ok();
     }
 
