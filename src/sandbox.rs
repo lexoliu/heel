@@ -381,15 +381,13 @@ impl ProcessTracker {
                         }
                     }
 
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
+                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
                 }
                 #[cfg(windows)]
                 {
                     use std::process::Command;
                     let _ = Command::new("taskkill")
-                        .args(["/F", "/PID", &pid.to_string()])
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
                         .output();
                 }
             }

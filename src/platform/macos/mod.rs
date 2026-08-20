@@ -2,6 +2,7 @@ mod profile;
 
 pub use profile::generate_profile;
 
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 
 use blocking::unblock;
@@ -171,6 +172,7 @@ impl Backend for MacOSBackend {
             stdout,
             stderr,
         )?;
+        cmd.process_group(0);
 
         let child = cmd.spawn()?;
 

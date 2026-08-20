@@ -438,6 +438,7 @@ impl Backend for LinuxBackend {
                 stderr,
             },
         )?;
+        cmd.process_group(0);
 
         let child = cmd.spawn()?;
 

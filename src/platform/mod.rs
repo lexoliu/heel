@@ -113,11 +113,23 @@ impl Child {
 
     /// Attempt to kill the child process
     pub fn kill(&mut self) -> Result<()> {
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("child process no longer available");
-        Ok(inner.kill()?)
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
+            if result == 0 {
+                return Ok(());
+            }
+            Err(std::io::Error::last_os_error().into())
+        }
+
+        #[cfg(not(unix))]
+        {
+            let inner = self
+                .inner
+                .as_mut()
+                .expect("child process no longer available");
+            Ok(inner.kill()?)
+        }
     }
 
     /// Check if the child has exited without blocking
