@@ -3,6 +3,26 @@
 # stdin_arg: {{ stdin_arg }}, primary_arg: {{ primary_arg }}
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
+# Short-circuit help before probing stdin so `command --help` never blocks on
+# non-tty stdin in agent-driven shells.
+for arg in "$@"; do
+    if [ "$arg" = "--" ]; then
+        break
+    fi
+    case "$arg" in
+        --help|-h)
+            exec "$SELF_DIR/heel" ipc {{ command }} -- "$@"
+            ;;
+        -*)
+            case "$arg" in
+                *h*)
+                    exec "$SELF_DIR/heel" ipc {{ command }} -- "$@"
+                    ;;
+            esac
+            ;;
+    esac
+done
+
 STDIN_CONTENT=""
 if [ ! -t 0 ]; then
     STDIN_CONTENT=$(cat)

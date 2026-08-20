@@ -38,7 +38,10 @@ struct PositionalWrapperTemplate<'a> {
     positional_args: &'a [PositionalWrapperArg],
 }
 
-/// Template for IPC wrapper with stdin piping support
+/// Template for IPC wrapper with stdin piping support.
+///
+/// Help flags must bypass stdin capture so `command --help` stays non-blocking
+/// in agent-driven non-tty shells.
 #[derive(Template)]
 #[template(path = "ipc/wrapper_stdin.sh", escape = "none")]
 struct StdinWrapperTemplate<'a> {
