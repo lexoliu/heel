@@ -15,9 +15,10 @@ use async_net::{TcpListener, TcpStream};
 use bytes::Bytes;
 use executor_core::{Executor, Task};
 use futures_lite::StreamExt;
-use futures_lite::io::{AsyncRead, AsyncWrite};
+use futures_lite::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
+use hyper::header::{CONNECTION, HeaderMap, HeaderName, HeaderValue};
 use hyper::rt::Executor as HyperExecutor;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -219,6 +220,7 @@ async fn handle_connection<N: NetworkPolicy + 'static, E: Executor + 'static>(
     let hyper_executor = ExecutorWrapper::new(executor);
 
     http1::Builder::new()
+        .keep_alive(false)
         .preserve_header_case(true)
         .title_case_headers(true)
         .serve_connection(
@@ -389,10 +391,10 @@ async fn handle_http<N: NetworkPolicy, E: Executor + 'static>(
         .uri(path)
         .version(req.version());
 
-    // Copy headers
-    for (name, value) in req.headers() {
+    for (name, value) in filtered_end_to_end_headers(req.headers()) {
         forward_req = forward_req.header(name, value);
     }
+    forward_req = forward_req.header(CONNECTION, close_header_value());
 
     let forward_req = match forward_req.body(req.into_body()) {
         Ok(req) => req,
@@ -406,7 +408,7 @@ async fn handle_http<N: NetworkPolicy, E: Executor + 'static>(
     };
 
     match sender.send_request(forward_req).await {
-        Ok(response) => Ok(response.map(|b| b.boxed())),
+        Ok(response) => Ok(rewrite_proxy_response(response)),
         Err(e) => {
             tracing::warn!(error = %e, "network proxy: forward error");
             Ok(Response::builder()
@@ -415,6 +417,69 @@ async fn handle_http<N: NetworkPolicy, E: Executor + 'static>(
                 .unwrap())
         }
     }
+}
+
+fn rewrite_proxy_response(response: Response<Incoming>) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let (parts, body) = response.into_parts();
+    let mut builder = Response::builder()
+        .status(parts.status)
+        .version(parts.version);
+
+    for (name, value) in filtered_end_to_end_headers(&parts.headers) {
+        builder = builder.header(name, value);
+    }
+
+    builder = builder.header(CONNECTION, close_header_value());
+
+    builder.body(body.boxed()).unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "network proxy: response build error");
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(full_body("Response build error"))
+            .expect("static error response must build")
+    })
+}
+
+fn filtered_end_to_end_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
+    let connection_scoped = connection_scoped_headers(headers);
+    headers
+        .iter()
+        .filter(|(name, _)| !is_hop_by_hop_header(name, &connection_scoped))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+fn connection_scoped_headers(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .collect()
+}
+
+fn is_hop_by_hop_header(name: &HeaderName, connection_scoped: &[HeaderName]) -> bool {
+    if connection_scoped.iter().any(|candidate| candidate == name) {
+        return true;
+    }
+
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn close_header_value() -> HeaderValue {
+    HeaderValue::from_static("close")
 }
 
 /// Format a host/port pair for TcpStream::connect, including IPv6 brackets.
@@ -431,7 +496,7 @@ async fn tunnel(
     upgraded: hyper::upgrade::Upgraded,
     target: TcpStream,
 ) -> std::result::Result<(), std::io::Error> {
-    use futures_lite::io::{copy, split};
+    use futures_lite::io::split;
 
     // Wrap upgraded connection to implement AsyncRead/AsyncWrite
     let upgraded = UpgradedWrapper(upgraded);
@@ -439,13 +504,29 @@ async fn tunnel(
     let (client_read, client_write) = split(upgraded);
     let (target_read, target_write) = split(target);
 
-    let client_to_target = copy(client_read, target_write);
-    let target_to_client = copy(target_read, client_write);
+    let client_to_target = relay_and_close(client_read, target_write);
+    let target_to_client = relay_and_close(target_read, client_write);
 
     // Run both directions concurrently
-    let _ = futures_lite::future::zip(client_to_target, target_to_client).await;
+    let (client_result, target_result) =
+        futures_lite::future::zip(client_to_target, target_to_client).await;
+    client_result?;
+    target_result?;
 
     Ok(())
+}
+
+async fn relay_and_close<R, W>(reader: R, mut writer: W) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let copy_result = futures_lite::io::copy(reader, &mut writer).await;
+    let close_result = writer.close().await;
+    match copy_result {
+        Ok(bytes) => close_result.map(|()| bytes),
+        Err(error) => Err(error),
+    }
 }
 
 /// Wrapper for hyper::upgrade::Upgraded to implement futures_lite AsyncRead/AsyncWrite
@@ -503,6 +584,11 @@ fn full_body(s: &'static str) -> BoxBody<Bytes, hyper::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::AllowAll;
+    use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+    use hyper::header::{CONTENT_TYPE, HOST};
+    use std::net::Shutdown;
+    use std::time::Duration;
 
     #[test]
     fn test_format_target_addr() {
@@ -510,5 +596,112 @@ mod tests {
         assert_eq!(format_target_addr("127.0.0.1", 8080), "127.0.0.1:8080");
         assert_eq!(format_target_addr("::1", 443), "[::1]:443");
         assert_eq!(format_target_addr("2001:db8::1", 80), "[2001:db8::1]:80");
+    }
+
+    #[test]
+    fn test_filtered_end_to_end_headers_removes_hop_by_hop_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("example.com"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            CONNECTION,
+            HeaderValue::from_static("keep-alive, x-trace-id"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-trace-id"),
+            HeaderValue::from_static("abc123"),
+        );
+        headers.insert(
+            HeaderName::from_static("proxy-connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
+        headers.insert(
+            HeaderName::from_static("te"),
+            HeaderValue::from_static("trailers"),
+        );
+
+        let filtered = filtered_end_to_end_headers(&headers);
+
+        assert!(filtered.iter().any(|(name, _)| name == HOST));
+        assert!(filtered.iter().any(|(name, _)| name == CONTENT_TYPE));
+        assert!(!filtered.iter().any(|(name, _)| name == CONNECTION));
+        assert!(
+            !filtered
+                .iter()
+                .any(|(name, _)| name.as_str() == "x-trace-id")
+        );
+        assert!(
+            !filtered
+                .iter()
+                .any(|(name, _)| name.as_str() == "proxy-connection")
+        );
+        assert!(!filtered.iter().any(|(name, _)| name.as_str() == "te"));
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_propagates_client_half_close() {
+        let target_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("target listener binds");
+        let target_addr = target_listener
+            .local_addr()
+            .expect("target listener has an address");
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.expect("target accepts");
+            let mut request = Vec::new();
+            stream
+                .read_to_end(&mut request)
+                .await
+                .expect("target reads through client EOF");
+            assert_eq!(request, b"ping");
+            stream
+                .write_all(b"pong")
+                .await
+                .expect("target writes response");
+        });
+
+        let proxy = NetworkProxy::new(AllowAll, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("proxy starts");
+        let mut client = TcpStream::connect(proxy.addr())
+            .await
+            .expect("client connects to proxy");
+        let connect_request =
+            format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n");
+        client
+            .write_all(connect_request.as_bytes())
+            .await
+            .expect("client writes CONNECT request");
+
+        let mut response = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            client
+                .read_exact(&mut byte)
+                .await
+                .expect("proxy writes CONNECT response");
+            response.push(byte[0]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+
+        client
+            .write_all(b"ping")
+            .await
+            .expect("client writes tunneled request");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("client half-closes write side");
+
+        let mut tunneled_response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.read_to_end(&mut tunneled_response),
+        )
+        .await
+        .expect("proxy must propagate client EOF to target")
+        .expect("client reads tunneled response");
+        assert_eq!(tunneled_response, b"pong");
+
+        target.await.expect("target task completes");
     }
 }
