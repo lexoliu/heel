@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/lexoliu/heel/compare/heel-v0.1.1...heel-v0.2.0) - 2026-08-26
+
+### Added
+
+- *(workdir)* expose random_in for hosts that own their sandbox roots
+- *(ipc)* [**breaking**] take command name and argument shape from the value, not the type
+- *(macos)* allow sandboxed processes to bind loopback ports
+- *(network)* record policy decisions in a rolling audit log
+
+### Fixed
+
+- *(linux)* refuse clone3 with ENOSYS so sandboxed code can use threads
+- *(spelling)* correct the spellings the typos lint rejects
+- *(linux)* stop granting execute where the sandbox can write
+- *(ipc)* short-circuit help flags before stdin capture
+- *(platform)* kill the whole sandboxed process group
+- *(network)* strip hop-by-hop headers and close CONNECT tunnels
+
+### Other
+
+- Merge pull request #12 from lexoliu/release-0.2.0
+- allow CI to be started by hand
+- *(sandbox)* compile the sandbox tests only where a backend exists
+- *(cli)* carry pass-through errors in tuple variants
+- [**breaking**] rework the sandbox core, IPC transport and enforcement rules
+- use supported intel macOS release runner
+
 ## [0.1.1](https://github.com/lexoliu/heel/compare/heel-v0.1.0...heel-v0.1.1) - 2026-03-30
 
 ### Other
