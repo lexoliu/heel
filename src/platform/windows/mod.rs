@@ -100,10 +100,11 @@ impl WindowsBackend {
         let launched = launch_in_container_with_io(&prepared.capabilities, &prepared.options)
             .map_err(|source| {
                 Error::InitFailed(format!(
-                    "cannot launch {} in the AppContainer from {}: {}",
+                    "cannot launch {} in the AppContainer from {}: {}; environment was {}",
                     request.program,
                     request.working_dir().display(),
                     with_causes(&source),
+                    describe(&prepared.options),
                 ))
             })?;
 
@@ -137,6 +138,37 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(std::ffi::OsString, std::ffi:
     );
     env.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_lowercase());
     env
+}
+
+/// Summarize a launch's environment for a failure message.
+///
+/// `CreateProcessW` reports a malformed environment block as
+/// `ERROR_ENVVAR_NOT_FOUND`, which names nothing and points at no entry, so the
+/// entries themselves have to be in the message to be diagnosable at all. Only
+/// names and value lengths are shown: values carry proxy URLs and paths, and a
+/// failure message is not the place to print them.
+fn describe(options: &LaunchOptions) -> String {
+    let Some(env) = options.env.as_ref() else {
+        return "inherited".to_string();
+    };
+
+    let entries = env
+        .iter()
+        .map(|(name, value)| {
+            let name = name.to_string_lossy();
+            let flag = if name.is_empty() {
+                " <EMPTY NAME>"
+            } else if name.contains('=') {
+                " <NAME CONTAINS =>"
+            } else {
+                ""
+            };
+            format!("{name}[{}]{flag}", value.len())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("{} entries: {entries}", env.len())
 }
 
 /// Render an error together with everything that caused it.
