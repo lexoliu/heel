@@ -395,7 +395,11 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
     }
 }
 
-#[cfg(test)]
+// Every test here starts a real sandbox, which needs an implemented backend.
+// Windows has none yet and `WindowsBackend::new` refuses to construct, so these
+// are compiled only where there is something to exercise, matching how
+// `tests/isolation.rs` and `tests/ipc.rs` are gated.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
 
