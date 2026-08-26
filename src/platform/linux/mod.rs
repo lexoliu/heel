@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_kernel_versions_are_rejected() {
+    fn unparsable_kernel_versions_are_rejected() {
         assert!(KernelVersion::parse("").is_err());
         assert!(KernelVersion::parse("linux").is_err());
     }

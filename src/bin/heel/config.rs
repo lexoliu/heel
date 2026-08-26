@@ -360,7 +360,9 @@ mod tests {
 
     #[test]
     fn unknown_config_keys_are_rejected() {
-        let error = toml::from_str::<FileConfig>("netwrok = \"allow\"").unwrap_err();
+        // A mistyped key must be an error rather than a setting silently
+        // ignored, which is what `deny_unknown_fields` buys.
+        let error = toml::from_str::<FileConfig>("not_a_real_setting = \"allow\"").unwrap_err();
         assert!(error.to_string().contains("unknown field"), "{error}");
     }
 }

@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_versions_are_rejected() {
+    fn unparsable_versions_are_rejected() {
         assert!(parse_macos_version("").is_err());
         assert!(parse_macos_version("sonoma").is_err());
     }
