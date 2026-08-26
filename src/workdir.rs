@@ -98,6 +98,21 @@ impl WorkingDir {
         })
     }
 
+    /// Create a working directory with a generated name inside `parent`.
+    ///
+    /// For hosts that manage their own sandbox roots rather than letting the
+    /// configuration pick one. The generated name carries a random suffix, so
+    /// this needs no collision retry, and the directory is removed when the
+    /// returned value is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created, restricted to its
+    /// owner, or canonicalized.
+    pub fn random_in(parent: impl AsRef<Path>) -> Result<Self> {
+        Self::create(&parent.as_ref().join(generate_working_dir_name()), true)
+    }
+
     /// The canonical path of the working directory.
     pub fn path(&self) -> &Path {
         &self.path
