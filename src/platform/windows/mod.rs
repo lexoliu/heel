@@ -69,17 +69,7 @@ impl WindowsBackend {
             exe: program,
             cmdline: Some(command_line(request)),
             cwd: Some(request.working_dir().to_path_buf()),
-            // Windows processes need a handful of variables from the parent --
-            // `SystemRoot` above all -- or the loader and much of the Win32 API
-            // fail before the program's first instruction. The sandbox's own
-            // variables win where the two overlap.
-            env: Some(merge_parent_env(
-                request
-                    .envs
-                    .iter()
-                    .map(|(key, value)| (key.into(), value.into()))
-                    .collect(),
-            )),
+            env: Some(environment(request)),
             stdio: stdio(request.stdout),
             // The launcher configures the three streams together, so the
             // request's stdout decides for all of them; every caller in this
@@ -123,6 +113,30 @@ impl WindowsBackend {
 
         Ok(Child::new(child))
     }
+}
+
+/// The environment the sandboxed process starts with.
+///
+/// Windows processes need a handful of variables from the parent -- `SystemRoot`
+/// above all -- or the loader and much of the Win32 API fail before the
+/// program's first instruction. The sandbox's own variables win where the two
+/// overlap, because `merge_parent_env` only fills in what is missing.
+///
+/// The result has to be sorted case-insensitively by name: `CreateProcessW`
+/// refuses an unsorted block with `ERROR_ENVVAR_NOT_FOUND`, which names no
+/// variable and reads like something else entirely. `merge_parent_env` appends
+/// to whatever it is given, so sorting has to happen after it rather than at
+/// the point the variables are collected.
+fn environment(request: &SpawnRequest<'_>) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut env = merge_parent_env(
+        request
+            .envs
+            .iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+    );
+    env.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_lowercase());
+    env
 }
 
 /// Render an error together with everything that caused it.
