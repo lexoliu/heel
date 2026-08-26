@@ -13,15 +13,26 @@ use seccompiler::{
 
 use crate::error::{Error, Result};
 
-/// A compiled filter, ready to be applied after fork.
+/// Compiled filters, ready to be applied after fork.
+///
+/// Two programs rather than one, because a `SeccompFilter` carries a single
+/// action for everything it matches and `clone3` needs a different one. Their
+/// rule sets are disjoint, so each returns `Allow` wherever the other decides
+/// and the kernel's "most restrictive result wins" leaves no ambiguity.
 pub(crate) struct PreparedFilter {
-    program: seccompiler::BpfProgram,
+    programs: Vec<seccompiler::BpfProgram>,
 }
 
 impl PreparedFilter {
-    /// Install the filter on the current process. Called from `pre_exec`.
+    /// Install the filters on the current process. Called from `pre_exec`.
+    ///
+    /// Safe to call there: the programs are compiled before forking, so this
+    /// only issues `prctl` and `seccomp` syscalls.
     pub(crate) fn apply(self) -> std::io::Result<()> {
-        seccompiler::apply_filter(&self.program).map_err(seccomp_error_to_io)
+        for program in &self.programs {
+            seccompiler::apply_filter(program).map_err(seccomp_error_to_io)?;
+        }
+        Ok(())
     }
 }
 
@@ -44,21 +55,48 @@ pub(crate) fn build_filter(allow_tcp: bool) -> Result<PreparedFilter> {
     // Default-allow with explicit blocks. A default-deny filter would need a
     // complete allow list for every runtime a sandbox might host, which is not
     // maintainable; the kernel-level isolation comes from Landlock instead.
-    let filter = SeccompFilter::new(
+    let denied = compile(
         build_rules(allow_tcp)?,
-        SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
         arch,
-    )
-    .map_err(|e| Error::InvalidProfile(format!("seccomp filter error: {e:?}")))?;
+    )?;
 
-    let program: seccompiler::BpfProgram = filter
+    // `clone3` cannot be filtered by flags: its arguments live behind a struct
+    // pointer that seccomp cannot dereference, so it has to be refused outright
+    // or it would be a way around the flag checks on `clone`.
+    //
+    // It must be refused with ENOSYS, not EPERM. glibc issues `clone3` first for
+    // every thread it creates and falls back to `clone` only on ENOSYS; any
+    // other error is fatal, so EPERM here stops a sandboxed process from
+    // creating threads at all. Refusing it this way keeps the namespace path
+    // closed, since the fallback lands on `clone`, which is filtered.
+    let unsupported = compile(
+        BTreeMap::from([(libc::SYS_clone3, Vec::new())]),
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )?;
+
+    tracing::debug!(allow_tcp, "seccomp: filters built");
+
+    Ok(PreparedFilter {
+        programs: vec![denied, unsupported],
+    })
+}
+
+/// Compile one rule set into a BPF program.
+///
+/// Syscalls with no rule are allowed: a default-deny filter would need a
+/// complete allow list for every runtime a sandbox might host, which is not
+/// maintainable. The kernel-level isolation comes from Landlock instead.
+fn compile(
+    rules: BTreeMap<i64, Vec<SeccompRule>>,
+    matched: SeccompAction,
+    arch: TargetArch,
+) -> Result<seccompiler::BpfProgram> {
+    SeccompFilter::new(rules, SeccompAction::Allow, matched, arch)
+        .map_err(|e| Error::InvalidProfile(format!("seccomp filter error: {e:?}")))?
         .try_into()
-        .map_err(|e| Error::InvalidProfile(format!("seccomp BPF compilation error: {e:?}")))?;
-
-    tracing::debug!(allow_tcp, "seccomp: filter built");
-
-    Ok(PreparedFilter { program })
+        .map_err(|e| Error::InvalidProfile(format!("seccomp BPF compilation error: {e:?}")))
 }
 
 fn detect_arch() -> Result<TargetArch> {
@@ -77,8 +115,8 @@ fn build_rules(allow_tcp: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
 
     rules.insert(libc::SYS_socket, socket_rules(allow_tcp)?);
     rules.insert(libc::SYS_clone, namespace_clone_rules()?);
-    #[cfg(target_arch = "x86_64")]
-    rules.insert(libc::SYS_clone3, Vec::new());
+    // `clone3` is refused by its own filter, with a different error; see
+    // `build_filter`.
 
     add_dangerous_syscall_blocks(&mut rules);
 
@@ -236,7 +274,7 @@ mod tests {
     fn filters_compile_in_both_network_modes() {
         for allow_tcp in [false, true] {
             let filter = build_filter(allow_tcp).expect("builds");
-            assert!(!filter.program.is_empty());
+            assert!(filter.programs.iter().all(|program| !program.is_empty()));
         }
     }
 
@@ -281,6 +319,24 @@ mod tests {
         assert!(
             !rules[&libc::SYS_clone].is_empty(),
             "clone must be filtered by flags, not blocked outright"
+        );
+    }
+
+    #[test]
+    fn clone3_is_refused_separately_from_everything_else() {
+        // It must not share the general EPERM filter: glibc issues `clone3` for
+        // every thread it creates and falls back to `clone` only on ENOSYS, so
+        // refusing it with EPERM stops a sandboxed process from threading.
+        assert!(
+            !build_rules(true)
+                .expect("builds")
+                .contains_key(&libc::SYS_clone3),
+            "clone3 belongs to its own ENOSYS filter"
+        );
+        assert_eq!(
+            build_filter(true).expect("builds").programs.len(),
+            2,
+            "the general filter and the clone3 filter are installed separately"
         );
     }
 }
