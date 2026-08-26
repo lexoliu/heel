@@ -175,7 +175,7 @@ impl Container {
         rappct::acl::grant_to_package(target, self.sid(), dir).map_err(|source| {
             Error::path(
                 path,
-                std::io::Error::other(format!("ACL grant failed: {source}")),
+                std::io::Error::other(format!("ACL grant failed: {}", super::with_causes(&source))),
             )
         })
     }
@@ -188,7 +188,7 @@ impl Container {
         rappct::acl::grant_to_package(target, self.sid(), access).map_err(|source| {
             Error::path(
                 path,
-                std::io::Error::other(format!("ACL grant failed: {source}")),
+                std::io::Error::other(format!("ACL grant failed: {}", super::with_causes(&source))),
             )
         })
     }
@@ -203,7 +203,10 @@ impl Container {
             builder = builder.with_named(&[INTERNET_CLIENT]);
         }
         builder.build().map_err(|source| {
-            Error::InitFailed(format!("cannot derive container capabilities: {source}"))
+            Error::InitFailed(format!(
+                "cannot derive container capabilities: {}",
+                super::with_causes(&source)
+            ))
         })
     }
 

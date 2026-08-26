@@ -110,8 +110,10 @@ impl WindowsBackend {
         let launched = launch_in_container_with_io(&prepared.capabilities, &prepared.options)
             .map_err(|source| {
                 Error::InitFailed(format!(
-                    "cannot launch {} in the AppContainer: {source}",
-                    request.program
+                    "cannot launch {} in the AppContainer from {}: {}",
+                    request.program,
+                    request.working_dir().display(),
+                    with_causes(&source),
                 ))
             })?;
 
@@ -121,6 +123,18 @@ impl WindowsBackend {
 
         Ok(Child::new(child))
     }
+}
+
+/// Render an error together with everything that caused it.
+///
+/// The launcher's `Display` names the stage it failed at and keeps the reason
+/// the operating system gave as a source, so printing it alone says only that
+/// something went wrong and not what.
+pub(crate) fn with_causes(error: &dyn std::error::Error) -> String {
+    std::iter::successors(Some(error), |error| error.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 /// Everything one launch needs, built before the process starts.
