@@ -25,10 +25,38 @@ use container::Container;
 use crate::error::{Error, Result};
 use crate::platform::{Backend, Child, SpawnRequest};
 
+/// Machine facts a Windows process expects to find in its environment.
+///
+/// The launcher already fills in `SystemRoot`, `windir`, `ComSpec`, `PATHEXT`
+/// and the temp variables. These are the rest of what the loader and the C
+/// runtime consult, and they describe the machine rather than the user, so
+/// passing them through leaks nothing: the user's own variables stay out.
+const MACHINE_FACTS: &[&str] = &[
+    "SystemDrive",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "NUMBER_OF_PROCESSORS",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramW6432",
+];
+
 /// Windows sandbox backend.
 #[derive(Debug)]
 pub struct WindowsBackend {
     container: Container,
+    /// Granting the configured paths rewrites directory ACLs, which makes
+    /// Windows re-propagate inheritance through everything beneath them. That
+    /// costs seconds on a directory as busy as the user's temp, so it is done
+    /// once for the sandbox rather than once per process.
+    granted: std::sync::OnceLock<()>,
 }
 
 impl WindowsBackend {
@@ -40,6 +68,7 @@ impl WindowsBackend {
     pub fn new() -> Result<Self> {
         Ok(Self {
             container: Container::create()?,
+            granted: std::sync::OnceLock::new(),
         })
     }
 
@@ -48,7 +77,10 @@ impl WindowsBackend {
     /// Returns the options, the capabilities and the loopback exemption, which
     /// must outlive the process it is granted for.
     fn prepare(&self, request: &SpawnRequest<'_>) -> Result<Prepared> {
-        self.container.grant_configured_paths(request.config)?;
+        if self.granted.get().is_none() {
+            self.container.grant_configured_paths(request.config)?;
+            let _ = self.granted.set(());
+        }
 
         // The container has to read the program to run it. Anything under the
         // system directories is already open to every package; a program
@@ -129,13 +161,21 @@ impl WindowsBackend {
 /// to whatever it is given, so sorting has to happen after it rather than at
 /// the point the variables are collected.
 fn environment(request: &SpawnRequest<'_>) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    let mut env = merge_parent_env(
-        request
-            .envs
-            .iter()
-            .map(|(key, value)| (key.into(), value.into()))
-            .collect(),
-    );
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = request
+        .envs
+        .iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+
+    for name in MACHINE_FACTS {
+        if let Some(value) = std::env::var_os(name)
+            && !env.iter().any(|(existing, _)| existing == name)
+        {
+            env.push(((*name).into(), value));
+        }
+    }
+
+    let mut env = merge_parent_env(env);
     env.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_lowercase());
     env
 }
