@@ -148,7 +148,13 @@ fn add_system_rules(
         &["/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin"]
     };
 
-    let exec_access = make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute });
+    // Permissive mode makes the system directories writable as well; otherwise
+    // they are read and execute only.
+    let exec_access = if config.writable_file_system() {
+        AccessFs::from_all(abi)
+    } else {
+        make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute })
+    };
     for path in exec_paths {
         add_system_path(ruleset, path, exec_access, abi)?;
     }
@@ -159,16 +165,27 @@ fn add_system_rules(
         add_system_path(ruleset, path, AccessFs::from_read(abi), abi)?;
     }
 
-    // Shared temp directories are readable outside strict mode, but never
-    // writable: the sandbox has its own writable directory, exported as TMPDIR.
+    // Shared temp directories are readable outside strict mode, and writable
+    // only when the whole filesystem is. They are never executable: giving up
+    // isolation is what permissive mode is for, but a payload dropped in shared
+    // temp still must not be runnable, and that costs nothing to keep.
     if !config.filesystem_strict() {
+        let access = if config.writable_file_system() {
+            writable_access(abi)
+        } else {
+            AccessFs::from_read(abi)
+        };
         for path in ["/tmp", "/var/tmp"] {
-            add_system_path(ruleset, path, AccessFs::from_read(abi), abi)?;
+            add_system_path(ruleset, path, access, abi)?;
         }
     }
 
     if config.writable_file_system() {
-        add_system_path(ruleset, "/", AccessFs::from_all(abi), abi)?;
+        // Not `from_all`: Landlock cannot carve an exception out of a granted
+        // hierarchy, so granting execute on `/` here would silently re-grant it
+        // to shared temp and to the working directory. Execute is granted above,
+        // to the system directories that need it, and nowhere else.
+        add_system_path(ruleset, "/", writable_access(abi), abi)?;
     }
 
     // Landlock is default-deny, so the protections that macOS expresses as
@@ -251,19 +268,44 @@ fn add_device_rules(
     Ok(())
 }
 
+/// Everything a writable location may do, except execute.
+///
+/// Landlock has no deny rule: a path gets exactly the rights granted to it, so
+/// withholding `Execute` here is what stops a sandboxed process from writing a
+/// payload into a directory it controls and then running it. The macOS profile
+/// enforces the same invariant with explicit `(deny process-exec ...)` rules,
+/// and `tests/isolation.rs` asserts it on both platforms.
+fn writable_access(abi: ABI) -> BitFlags<AccessFs> {
+    AccessFs::from_all(abi) & !BitFlags::from(AccessFs::Execute)
+}
+
 /// Grant access to the paths the caller configured.
 fn add_configured_rules(
     ruleset: &mut RulesetCreated,
     config: &SandboxConfigData,
     abi: ABI,
 ) -> Result<()> {
-    add_required_path(ruleset, config.working_dir(), AccessFs::from_all(abi), abi)?;
+    add_required_path(ruleset, config.working_dir(), writable_access(abi), abi)?;
+
+    // The generated IPC shims live inside the working directory and are written
+    // by the host before the sandbox starts, so they are the one place in it
+    // that may be executed. This mirrors the macOS profile, which carves out the
+    // same directory.
+    if config.ipc_socket().is_some() {
+        let layout = crate::ipc::IpcLayout::new(config.working_dir());
+        add_required_path(
+            ruleset,
+            layout.bin_dir(),
+            make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute }),
+            abi,
+        )?;
+    }
 
     for path in config.readable_paths() {
         add_required_path(ruleset, path, AccessFs::from_read(abi), abi)?;
     }
     for path in config.writable_paths() {
-        add_required_path(ruleset, path, AccessFs::from_all(abi), abi)?;
+        add_required_path(ruleset, path, writable_access(abi), abi)?;
     }
 
     let exec_access = make_bitflags!(AccessFs::{ ReadFile | Execute });
@@ -276,7 +318,7 @@ fn add_configured_rules(
     if let Some(socket) = config.ipc_socket()
         && let Some(dir) = socket.parent()
     {
-        add_required_path(ruleset, dir, AccessFs::from_all(abi), abi)?;
+        add_required_path(ruleset, dir, writable_access(abi), abi)?;
     }
 
     if let Some(python) = config.python() {
