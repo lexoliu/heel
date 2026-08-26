@@ -26,7 +26,7 @@ print_stderr = "warn"
 
 [package]
 name = "heel"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform native sandboxing library for running untrusted code"
