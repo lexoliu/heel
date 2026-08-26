@@ -5,6 +5,7 @@
 //! own: they forward the declared argument names to `heel ipc`, which does the
 //! parsing in Rust where it can be tested.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use askama::Template;
@@ -24,8 +25,8 @@ pub const SOCKET_NAME: &str = "s";
 #[template(path = "ipc/wrapper.sh", escape = "none")]
 struct WrapperTemplate<'a> {
     command: &'a str,
-    positional_args: &'a [&'static str],
-    stdin_arg: Option<&'static str>,
+    positional_args: &'a [Cow<'static, str>],
+    stdin_arg: Option<&'a str>,
 }
 
 /// The `heel` launcher placed alongside the wrappers.
@@ -105,8 +106,8 @@ pub(crate) fn socket_root() -> PathBuf {
 fn render_wrapper(command: &str, meta: &CommandMeta) -> Result<String> {
     Ok(WrapperTemplate {
         command,
-        positional_args: meta.positional_args,
-        stdin_arg: meta.stdin_arg,
+        positional_args: &meta.positional_args,
+        stdin_arg: meta.stdin_arg.as_deref(),
     }
     .render()?)
 }
@@ -154,9 +155,15 @@ mod tests {
     }
 
     impl IpcCommand for Search {
-        const NAME: &'static str = "search";
-        const POSITIONAL_ARGS: &'static [&'static str] = &["query"];
-        const STDIN_ARG: Option<&'static str> = Some("input");
+        fn name(&self) -> Cow<'static, str> {
+            "search".into()
+        }
+        fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+            Cow::Borrowed(&[Cow::Borrowed("query")])
+        }
+        fn stdin_arg(&self) -> Option<Cow<'static, str>> {
+            Some("input".into())
+        }
 
         type Args = SearchArgs;
         type Response = ();
@@ -167,7 +174,9 @@ mod tests {
     struct Plain;
 
     impl IpcCommand for Plain {
-        const NAME: &'static str = "plain";
+        fn name(&self) -> Cow<'static, str> {
+            "plain".into()
+        }
 
         type Args = NoArgs;
         type Response = ();
@@ -180,8 +189,8 @@ mod tests {
         let script = render_wrapper(
             "search",
             &CommandMeta {
-                positional_args: &["query", "scope"],
-                stdin_arg: Some("input"),
+                positional_args: Cow::Borrowed(&[Cow::Borrowed("query"), Cow::Borrowed("scope")]),
+                stdin_arg: Some(Cow::Borrowed("input")),
             },
         )
         .expect("renders");
@@ -196,7 +205,7 @@ mod tests {
         let script = render_wrapper(
             "plain",
             &CommandMeta {
-                positional_args: &[],
+                positional_args: Cow::Borrowed(&[]),
                 stdin_arg: None,
             },
         )

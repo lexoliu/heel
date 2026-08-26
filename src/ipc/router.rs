@@ -1,5 +1,6 @@
 //! Dispatch of IPC requests to registered command handlers.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -20,9 +21,9 @@ type ErasedHandler = Arc<
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandMeta {
     /// Argument names that may be given positionally, in order.
-    pub positional_args: &'static [&'static str],
+    pub positional_args: Cow<'static, [Cow<'static, str>]>,
     /// Argument that receives piped standard input, if any.
-    pub stdin_arg: Option<&'static str>,
+    pub stdin_arg: Option<Cow<'static, str>>,
 }
 
 /// Whether a name is usable as a command or argument name.
@@ -50,8 +51,8 @@ fn assert_valid_identifier(kind: &str, value: &str) {
 /// Registration is type-safe; dispatch is by name.
 #[derive(Default)]
 pub struct IpcRouter {
-    handlers: BTreeMap<&'static str, ErasedHandler>,
-    metadata: BTreeMap<&'static str, CommandMeta>,
+    handlers: BTreeMap<Cow<'static, str>, ErasedHandler>,
+    metadata: BTreeMap<Cow<'static, str>, CommandMeta>,
 }
 
 impl IpcRouter {
@@ -72,17 +73,20 @@ impl IpcRouter {
     /// the program rather than runtime conditions, and both would otherwise
     /// produce a broken wrapper script inside the sandbox.
     pub fn register<C: IpcCommand>(mut self, command: C) -> Self {
-        assert_valid_identifier("command name", C::NAME);
-        for arg in C::POSITIONAL_ARGS {
+        let name = command.name();
+        let positional_args = command.positional_args();
+        let stdin_arg = command.stdin_arg();
+
+        assert_valid_identifier("command name", &name);
+        for arg in positional_args.iter() {
             assert_valid_identifier("positional argument name", arg);
         }
-        if let Some(arg) = C::STDIN_ARG {
+        if let Some(arg) = &stdin_arg {
             assert_valid_identifier("stdin argument name", arg);
         }
         assert!(
-            !self.handlers.contains_key(C::NAME),
-            "IPC command '{}' is already registered",
-            C::NAME
+            !self.handlers.contains_key(&name),
+            "IPC command '{name}' is already registered"
         );
 
         let command = Arc::new(command);
@@ -96,13 +100,13 @@ impl IpcRouter {
         });
 
         self.metadata.insert(
-            C::NAME,
+            name.clone(),
             CommandMeta {
-                positional_args: C::POSITIONAL_ARGS,
-                stdin_arg: C::STDIN_ARG,
+                positional_args,
+                stdin_arg,
             },
         );
-        self.handlers.insert(C::NAME, handler);
+        self.handlers.insert(name, handler);
         self
     }
 
@@ -117,8 +121,10 @@ impl IpcRouter {
     }
 
     /// The registered commands and how their arguments may be written.
-    pub fn methods(&self) -> impl Iterator<Item = (&'static str, &CommandMeta)> {
-        self.metadata.iter().map(|(name, meta)| (*name, meta))
+    pub fn methods(&self) -> impl Iterator<Item = (&str, &CommandMeta)> {
+        self.metadata
+            .iter()
+            .map(|(name, meta)| (name.as_ref(), meta))
     }
 }
 
@@ -149,8 +155,12 @@ mod tests {
     }
 
     impl IpcCommand for Doubler {
-        const NAME: &'static str = "double";
-        const POSITIONAL_ARGS: &'static [&'static str] = &["value"];
+        fn name(&self) -> Cow<'static, str> {
+            "double".into()
+        }
+        fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+            Cow::Borrowed(&[Cow::Borrowed("value")])
+        }
 
         type Args = DoublerArgs;
         type Response = DoublerResponse;
@@ -173,7 +183,9 @@ mod tests {
     }
 
     impl IpcCommand for Counter {
-        const NAME: &'static str = "greet";
+        fn name(&self) -> Cow<'static, str> {
+            "greet".into()
+        }
 
         type Args = CounterArgs;
         type Response = String;
@@ -237,14 +249,19 @@ mod tests {
         let methods: Vec<_> = router.methods().collect();
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].0, "double");
-        assert_eq!(methods[0].1.positional_args, &["value"]);
+        assert_eq!(
+            methods[0].1.positional_args.as_ref(),
+            &[Cow::Borrowed("value")]
+        );
         assert_eq!(methods[0].1.stdin_arg, None);
     }
 
     struct BadName;
 
     impl IpcCommand for BadName {
-        const NAME: &'static str = "bad/name";
+        fn name(&self) -> Cow<'static, str> {
+            "bad/name".into()
+        }
 
         type Args = NoArgs;
         type Response = ();

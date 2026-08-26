@@ -83,6 +83,7 @@ mod tests {
     use super::*;
     use crate::ipc::{IpcCommand, IpcRouter, IpcServer};
     use serde::Deserialize;
+    use std::borrow::Cow;
 
     struct Sum;
 
@@ -93,7 +94,9 @@ mod tests {
     }
 
     impl IpcCommand for Sum {
-        const NAME: &'static str = "sum";
+        fn name(&self) -> Cow<'static, str> {
+            "sum".into()
+        }
 
         type Args = SumArgs;
         type Response = i64;
@@ -106,7 +109,9 @@ mod tests {
     struct Failing;
 
     impl IpcCommand for Failing {
-        const NAME: &'static str = "failing";
+        fn name(&self) -> Cow<'static, str> {
+            "failing".into()
+        }
 
         type Args = i64;
         type Response = ();

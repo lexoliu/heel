@@ -7,6 +7,7 @@
 // Examples report what the sandbox did, so printing is the point here.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use heel::ipc::{IpcCommand, IpcRouter};
@@ -33,10 +34,14 @@ struct WebSearchResult {
 }
 
 impl IpcCommand for WebSearch {
-    const NAME: &'static str = "web_search";
+    fn name(&self) -> Cow<'static, str> {
+        "web_search".into()
+    }
     // Lets sandboxed code write `web_search "rust"` instead of
     // `web_search --query rust`.
-    const POSITIONAL_ARGS: &'static [&'static str] = &["query"];
+    fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+        Cow::Borrowed(&[Cow::Borrowed("query")])
+    }
 
     type Args = WebSearchArgs;
     type Response = WebSearchResult;
@@ -60,8 +65,12 @@ struct SummarizeArgs {
 }
 
 impl IpcCommand for Summarize {
-    const NAME: &'static str = "summarize";
-    const STDIN_ARG: Option<&'static str> = Some("text");
+    fn name(&self) -> Cow<'static, str> {
+        "summarize".into()
+    }
+    fn stdin_arg(&self) -> Option<Cow<'static, str>> {
+        Some("text".into())
+    }
 
     type Args = SummarizeArgs;
     type Response = String;

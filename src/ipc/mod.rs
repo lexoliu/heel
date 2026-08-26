@@ -25,8 +25,13 @@
 //! }
 //!
 //! impl IpcCommand for WebSearch {
-//!     const NAME: &'static str = "web_search";
-//!     const POSITIONAL_ARGS: &'static [&'static str] = &["query"];
+//!     fn name(&self) -> Cow<'static, str> {
+//!         "web_search".into()
+//!     }
+//!
+//!     fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+//!         Cow::Borrowed(&[Cow::Borrowed("query")])
+//!     }
 //!
 //!     type Args = WebSearchArgs;
 //!     type Response = Vec<String>;

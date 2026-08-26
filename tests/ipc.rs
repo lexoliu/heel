@@ -6,6 +6,7 @@
 
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,9 +32,15 @@ struct EchoArgs {
 }
 
 impl IpcCommand for Echo {
-    const NAME: &'static str = "echo-args";
-    const POSITIONAL_ARGS: &'static [&'static str] = &["first", "second"];
-    const STDIN_ARG: Option<&'static str> = Some("piped");
+    fn name(&self) -> Cow<'static, str> {
+        "echo-args".into()
+    }
+    fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+        Cow::Borrowed(&[Cow::Borrowed("first"), Cow::Borrowed("second")])
+    }
+    fn stdin_arg(&self) -> Option<Cow<'static, str>> {
+        Some("piped".into())
+    }
 
     type Args = EchoArgs;
     type Response = String;
@@ -54,7 +61,9 @@ impl IpcCommand for Echo {
 struct Structured;
 
 impl IpcCommand for Structured {
-    const NAME: &'static str = "structured";
+    fn name(&self) -> Cow<'static, str> {
+        "structured".into()
+    }
 
     type Args = NoArgs;
     type Response = Vec<u32>;

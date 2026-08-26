@@ -1,5 +1,6 @@
 //! The trait host-side IPC commands implement.
 
+use std::borrow::Cow;
 use std::future::Future;
 
 use serde::Deserialize;
@@ -39,9 +40,14 @@ pub struct NoArgs {}
 /// }
 ///
 /// impl IpcCommand for Search {
-///     const NAME: &'static str = "search";
+///     fn name(&self) -> Cow<'static, str> {
+///         "search".into()
+///     }
+///
 ///     // Enables `search "rust"` in the sandbox, mapped to `--query rust`.
-///     const POSITIONAL_ARGS: &'static [&'static str] = &["query"];
+///     fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+///         Cow::Borrowed(&[Cow::Borrowed("query")])
+///     }
 ///
 ///     type Args = SearchArgs;
 ///     type Response = Vec<String>;
@@ -56,20 +62,29 @@ pub trait IpcCommand: Send + Sync + 'static {
     ///
     /// This is also the file name of the generated wrapper script, so it must
     /// match `[A-Za-z][A-Za-z0-9_-]*`.
-    const NAME: &'static str;
+    ///
+    /// Taken from the value rather than the type so that one command type can
+    /// serve many names: a host exposing tools it discovered at runtime cannot
+    /// know them at compile time. Return a `Cow::Borrowed` for a fixed name and
+    /// nothing is allocated.
+    fn name(&self) -> Cow<'static, str>;
 
     /// Names for arguments that may be passed positionally.
     ///
     /// `["query"]` lets `search "foo"` stand in for `search --query foo`;
     /// `["subagent", "prompt"]` maps `run a "b"` to `--subagent a --prompt b`.
-    const POSITIONAL_ARGS: &'static [&'static str] = &[];
+    fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+        Cow::Borrowed(&[])
+    }
 
     /// Name of the argument that receives piped standard input.
     ///
     /// With `Some("input")`, `cat file | summarize "brief"` arrives as
     /// `--input <file contents> --prompt brief`. Standard input is not read
     /// when the invocation asks for help.
-    const STDIN_ARG: Option<&'static str> = None;
+    fn stdin_arg(&self) -> Option<Cow<'static, str>> {
+        None
+    }
 
     /// Per-request arguments, deserialized from the wire.
     type Args: DeserializeOwned + Send;

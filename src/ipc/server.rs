@@ -266,6 +266,7 @@ mod tests {
     use super::*;
     use crate::ipc::IpcCommand;
     use serde::Deserialize;
+    use std::borrow::Cow;
 
     struct Echo;
 
@@ -275,7 +276,9 @@ mod tests {
     }
 
     impl IpcCommand for Echo {
-        const NAME: &'static str = "echo";
+        fn name(&self) -> Cow<'static, str> {
+            "echo".into()
+        }
 
         type Args = EchoArgs;
         type Response = String;
