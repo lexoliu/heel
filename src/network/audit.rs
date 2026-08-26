@@ -13,30 +13,20 @@ use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 use crate::error::{Error, Result};
-use crate::network::{ConnectionDirection, DomainRequest, NetworkPolicy};
+use crate::network::{DomainRequest, NetworkPolicy};
 
 /// One audited network access decision, serialized as a JSON line.
 #[derive(Debug, Serialize)]
 struct NetworkAuditRecord<'a> {
-    /// RFC 3339 timestamp of the decision.
+    /// RFC 3339 timestamp of the decision, with millisecond resolution so that
+    /// decisions stay ordered within a single second.
     timestamp: String,
     /// Domain or IP the sandboxed process tried to reach.
-    target: &'a str,
+    host: &'a str,
     /// Destination port.
     port: u16,
-    /// Connection direction.
-    direction: &'static str,
-    /// PID of the requesting process (0 when unknown).
-    pid: u32,
     /// Whether the active policy allowed the connection.
     allowed: bool,
-}
-
-const fn direction_str(direction: ConnectionDirection) -> &'static str {
-    match direction {
-        ConnectionDirection::Inbound => "inbound",
-        ConnectionDirection::Outbound => "outbound",
-    }
 }
 
 /// Rolling JSONL sink for network access decisions.
@@ -74,11 +64,9 @@ impl NetworkAuditLog {
     /// Record one policy decision.
     pub fn record(&self, request: &DomainRequest, allowed: bool) {
         let record = NetworkAuditRecord {
-            timestamp: humantime::format_rfc3339_seconds(SystemTime::now()).to_string(),
-            target: request.target(),
+            timestamp: humantime::format_rfc3339_millis(SystemTime::now()).to_string(),
+            host: request.host(),
             port: request.port(),
-            direction: direction_str(request.direction()),
-            pid: request.pid(),
             allowed,
         };
         let mut line = match serde_json::to_vec(&record) {
@@ -111,6 +99,10 @@ impl<N> Audited<N> {
 }
 
 impl<N: NetworkPolicy> NetworkPolicy for Audited<N> {
+    /// Auditing does not change what the inner policy permits, so a wrapped
+    /// [`DenyAll`](crate::DenyAll) still skips the proxy entirely.
+    const DENIES_ALL: bool = N::DENIES_ALL;
+
     async fn check(&self, request: &DomainRequest) -> bool {
         let allowed = self.inner.check(request).await;
         self.log.record(request, allowed);
@@ -143,12 +135,7 @@ mod tests {
         smol::block_on(async {
             let allow = Audited::new(AllowAll, log.clone());
             let deny = Audited::new(DenyAll, log.clone());
-            let request = DomainRequest::new(
-                "api.github.com".to_string(),
-                443,
-                ConnectionDirection::Outbound,
-                42,
-            );
+            let request = DomainRequest::new("api.github.com", 443);
             assert!(allow.check(&request).await);
             assert!(!deny.check(&request).await);
         });
@@ -161,9 +148,14 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .all(|line| line["target"] == "api.github.com" && line["port"] == 443)
+                .all(|line| line["host"] == "api.github.com" && line["port"] == 443)
         );
         assert!(lines.iter().any(|line| line["allowed"] == true));
         assert!(lines.iter().any(|line| line["allowed"] == false));
     }
+
+    // Checked at compile time: the marker decides whether a proxy runs at all,
+    // so it must be a property of the type rather than of a test run.
+    const _: () = assert!(Audited::<DenyAll>::DENIES_ALL);
+    const _: () = assert!(!Audited::<AllowAll>::DENIES_ALL);
 }

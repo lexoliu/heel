@@ -1,55 +1,110 @@
-//! Security configuration for sandbox profiles
+//! Security configuration for sandbox profiles.
 //!
-//! The sandbox profile is static (generated at creation time), so security
-//! is configured via a builder with toggles for each protection category.
+//! The sandbox profile is generated once, when the sandbox is created, so
+//! protections are expressed as a set of toggles rather than as runtime hooks.
 //!
 //! # Presets
 //!
-//! - `SecurityConfig::privacy_first()` - Maximum privacy protection (default)
-//! - `SecurityConfig::permissive()` - Minimal restrictions, only logging
+//! - [`SecurityConfig::strict`] - maximum protection (the default)
+//! - [`SecurityConfig::interactive`] - strict, but lets macOS prompt for
+//!   TCC-protected folders
+//! - [`SecurityConfig::permissive`] - minimal restrictions
 //!
-//! # Custom Configuration
+//! # Overrides
+//!
+//! [`SecurityOverrides`] carries a partial set of toggles and can be layered
+//! onto any preset, which is how the CLI merges a config file and command-line
+//! flags without restating every switch.
 //!
 //! ```rust,ignore
-//! use heel::SecurityConfig;
+//! use heel::{SecurityConfig, SecurityOverrides};
 //!
-//! let config = SecurityConfig::builder()
-//!     .protect_credentials(true)
-//!     .protect_browser_data(true)
-//!     .protect_user_home(false)  // Allow access to home directory
-//!     .build();
+//! let mut config = SecurityConfig::strict();
+//! config.apply(&SecurityOverrides {
+//!     protect_user_home: Some(false),
+//!     ..SecurityOverrides::default()
+//! });
 //! ```
 
-/// Static security configuration for sandbox profile generation
-#[derive(Debug, Clone)]
-pub struct SecurityConfig {
-    /// Protect user home directories (/Users, /home)
-    pub protect_user_home: bool,
-    /// Allow macOS TCC prompts for protected folders (Desktop, Documents, Downloads, etc.)
-    /// When true, TCC-protected folders are not blocked at sandbox level, letting macOS prompt.
-    /// When false (strict mode), these folders are blocked at sandbox level without prompts.
-    pub allow_tcc_prompts: bool,
-    /// Protect SSH/GPG credentials (.ssh, .gnupg)
-    pub protect_credentials: bool,
-    /// Protect cloud provider config (.aws, .kube, .docker)
-    pub protect_cloud_config: bool,
-    /// Protect browser data (cookies, history, passwords)
-    pub protect_browser_data: bool,
-    /// Protect system keychain
-    pub protect_keychain: bool,
-    /// Protect shell history (.bash_history, .zsh_history, etc.)
-    pub protect_shell_history: bool,
-    /// Protect package manager credentials (.npmrc, .pypirc, .netrc)
-    pub protect_package_credentials: bool,
-    /// Allow GPU access (Metal, CUDA, OpenCL, etc.)
-    /// Enabled by default - essential for graphics and compute workloads
-    pub allow_gpu: bool,
-    /// Allow NPU/Neural Engine access (CoreML, ANE on Apple Silicon)
-    /// Enabled by default - essential for ML/AI workloads
-    pub allow_npu: bool,
-    /// Allow general hardware access (USB, Bluetooth, cameras, etc.)
-    /// Disabled by default in strict mode
-    pub allow_hardware: bool,
+use serde::Deserialize;
+
+/// Define the toggle set once, and derive the configuration, its getters, its
+/// builder and its override type from that single list.
+///
+/// Adding a protection here adds it everywhere it must appear, which is what
+/// keeps the CLI, the config file and the profile templates from drifting
+/// apart.
+macro_rules! security_toggles {
+    ($( $(#[$doc:meta])* $name:ident ),* $(,)?) => {
+        /// Static security configuration for sandbox profile generation.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct SecurityConfig {
+            $( $(#[$doc])* $name: bool, )*
+        }
+
+        impl SecurityConfig {
+            $(
+                $(#[$doc])*
+                pub fn $name(&self) -> bool {
+                    self.$name
+                }
+            )*
+
+            /// Layer a partial set of toggles onto this configuration.
+            pub fn apply(&mut self, overrides: &SecurityOverrides) {
+                $(
+                    if let Some(value) = overrides.$name {
+                        self.$name = value;
+                    }
+                )*
+            }
+        }
+
+        impl SecurityConfigBuilder {
+            $(
+                $(#[$doc])*
+                pub fn $name(mut self, enabled: bool) -> Self {
+                    self.config.$name = enabled;
+                    self
+                }
+            )*
+        }
+
+        /// A partial set of security toggles to layer onto a preset.
+        ///
+        /// Every field is `None` by default, meaning "leave the preset alone".
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+        #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+        pub struct SecurityOverrides {
+            $( $(#[$doc])* pub $name: Option<bool>, )*
+        }
+    };
+}
+
+security_toggles! {
+    /// Protect user home directories (`/Users`, `/home`).
+    protect_user_home,
+    /// Let macOS raise TCC prompts for protected folders (Desktop, Documents,
+    /// Downloads and friends) instead of denying them in the profile.
+    allow_tcc_prompts,
+    /// Protect SSH and GPG credentials (`.ssh`, `.gnupg`).
+    protect_credentials,
+    /// Protect cloud provider configuration (`.aws`, `.kube`, `.docker`).
+    protect_cloud_config,
+    /// Protect browser data (cookies, history, saved passwords).
+    protect_browser_data,
+    /// Protect the system keychain.
+    protect_keychain,
+    /// Protect shell history files.
+    protect_shell_history,
+    /// Protect package manager credentials (`.npmrc`, `.pypirc`, `.netrc`).
+    protect_package_credentials,
+    /// Allow GPU access (Metal, CUDA, OpenCL).
+    allow_gpu,
+    /// Allow NPU / Neural Engine access (CoreML, ANE).
+    allow_npu,
+    /// Allow general hardware access (USB, Bluetooth, cameras).
+    allow_hardware,
 }
 
 impl Default for SecurityConfig {
@@ -59,12 +114,8 @@ impl Default for SecurityConfig {
 }
 
 impl SecurityConfig {
-    /// Strict preset - maximum protection (default)
-    ///
-    /// All sensitive data protection is enabled.
-    /// TCC prompts are disabled (sandbox blocks TCC-protected folders).
-    /// GPU and NPU access allowed (essential for ML workloads).
-    /// General hardware access is disabled.
+    /// Maximum protection: every data protection on, TCC folders denied without
+    /// prompting, GPU and NPU available, general hardware denied.
     pub fn strict() -> Self {
         Self {
             protect_user_home: true,
@@ -81,12 +132,16 @@ impl SecurityConfig {
         }
     }
 
-    /// Permissive preset - minimal restrictions
-    ///
-    /// Use when you fully trust the sandboxed code.
-    /// TCC prompts are enabled (macOS will prompt for protected folders).
-    /// Logging still works for audit purposes.
-    /// All hardware access is allowed.
+    /// Strict data protection, but TCC-protected folders are left to macOS so
+    /// the user can approve them interactively.
+    pub fn interactive() -> Self {
+        Self {
+            allow_tcc_prompts: true,
+            ..Self::strict()
+        }
+    }
+
+    /// Minimal restrictions, for code you already trust.
     pub fn permissive() -> Self {
         Self {
             protect_user_home: false,
@@ -103,116 +158,48 @@ impl SecurityConfig {
         }
     }
 
-    /// Interactive preset - suitable for CLI tools with user interaction
-    ///
-    /// Protects sensitive credentials but allows TCC prompts for user folders.
-    /// User can approve/deny access to Desktop, Documents, Downloads, etc. via macOS dialogs.
-    pub fn interactive() -> Self {
-        Self {
-            protect_user_home: true,
-            allow_tcc_prompts: true,
-            protect_credentials: true,
-            protect_cloud_config: true,
-            protect_browser_data: true,
-            protect_keychain: true,
-            protect_shell_history: true,
-            protect_package_credentials: true,
-            allow_gpu: true,
-            allow_npu: true,
-            allow_hardware: false,
+    /// Start from the strict preset.
+    pub fn builder() -> SecurityConfigBuilder {
+        SecurityConfigBuilder {
+            config: Self::strict(),
         }
     }
 
-    /// Create a builder for custom configuration
-    pub fn builder() -> SecurityConfigBuilder {
-        SecurityConfigBuilder::default()
+    /// Return this configuration with `overrides` layered on top.
+    pub fn with(mut self, overrides: &SecurityOverrides) -> Self {
+        self.apply(overrides);
+        self
     }
 }
 
-/// Builder for SecurityConfig
-#[derive(Debug, Clone, Default)]
+/// Builder for [`SecurityConfig`].
+#[derive(Debug, Clone)]
 pub struct SecurityConfigBuilder {
     config: SecurityConfig,
 }
 
+impl Default for SecurityConfigBuilder {
+    fn default() -> Self {
+        SecurityConfig::builder()
+    }
+}
+
 impl SecurityConfigBuilder {
-    /// Start from permissive config
+    /// Start from the permissive preset instead of the strict one.
     pub fn from_permissive() -> Self {
         Self {
             config: SecurityConfig::permissive(),
         }
     }
 
-    /// Protect user home directories
-    pub fn protect_user_home(mut self, enabled: bool) -> Self {
-        self.config.protect_user_home = enabled;
-        self
+    /// Start from the interactive preset.
+    pub fn from_interactive() -> Self {
+        Self {
+            config: SecurityConfig::interactive(),
+        }
     }
 
-    /// Allow macOS TCC prompts for protected folders
-    ///
-    /// When enabled, TCC-protected folders (Desktop, Documents, Downloads, etc.)
-    /// are not blocked at sandbox level, letting macOS prompt the user.
-    pub fn allow_tcc_prompts(mut self, enabled: bool) -> Self {
-        self.config.allow_tcc_prompts = enabled;
-        self
-    }
-
-    /// Protect SSH/GPG credentials
-    pub fn protect_credentials(mut self, enabled: bool) -> Self {
-        self.config.protect_credentials = enabled;
-        self
-    }
-
-    /// Protect cloud provider config
-    pub fn protect_cloud_config(mut self, enabled: bool) -> Self {
-        self.config.protect_cloud_config = enabled;
-        self
-    }
-
-    /// Protect browser data
-    pub fn protect_browser_data(mut self, enabled: bool) -> Self {
-        self.config.protect_browser_data = enabled;
-        self
-    }
-
-    /// Protect system keychain
-    pub fn protect_keychain(mut self, enabled: bool) -> Self {
-        self.config.protect_keychain = enabled;
-        self
-    }
-
-    /// Protect shell history
-    pub fn protect_shell_history(mut self, enabled: bool) -> Self {
-        self.config.protect_shell_history = enabled;
-        self
-    }
-
-    /// Protect package manager credentials
-    pub fn protect_package_credentials(mut self, enabled: bool) -> Self {
-        self.config.protect_package_credentials = enabled;
-        self
-    }
-
-    /// Allow GPU access (Metal, CUDA, OpenCL)
-    pub fn allow_gpu(mut self, enabled: bool) -> Self {
-        self.config.allow_gpu = enabled;
-        self
-    }
-
-    /// Allow NPU/Neural Engine access (CoreML, ANE)
-    pub fn allow_npu(mut self, enabled: bool) -> Self {
-        self.config.allow_npu = enabled;
-        self
-    }
-
-    /// Allow general hardware access (USB, Bluetooth, cameras, etc.)
-    pub fn allow_hardware(mut self, enabled: bool) -> Self {
-        self.config.allow_hardware = enabled;
-        self
-    }
-
-    /// Build the configuration
+    /// Finish building.
     pub fn build(self) -> SecurityConfig {
         self.config
     }
@@ -223,77 +210,90 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_strict_has_all_protections() {
+    fn strict_enables_every_protection() {
         let config = SecurityConfig::strict();
 
-        assert!(config.protect_user_home);
-        assert!(!config.allow_tcc_prompts); // Strict blocks TCC folders
-        assert!(config.protect_credentials);
-        assert!(config.protect_cloud_config);
-        assert!(config.protect_browser_data);
-        assert!(config.protect_keychain);
-        assert!(config.protect_shell_history);
-        assert!(config.protect_package_credentials);
-        assert!(config.allow_gpu);
-        assert!(config.allow_npu);
-        assert!(!config.allow_hardware);
+        assert!(config.protect_user_home());
+        assert!(!config.allow_tcc_prompts());
+        assert!(config.protect_credentials());
+        assert!(config.protect_cloud_config());
+        assert!(config.protect_browser_data());
+        assert!(config.protect_keychain());
+        assert!(config.protect_shell_history());
+        assert!(config.protect_package_credentials());
+        assert!(config.allow_gpu());
+        assert!(config.allow_npu());
+        assert!(!config.allow_hardware());
     }
 
     #[test]
-    fn test_permissive_has_no_protections() {
+    fn permissive_disables_data_protections() {
         let config = SecurityConfig::permissive();
 
-        assert!(!config.protect_user_home);
-        assert!(config.allow_tcc_prompts); // Permissive allows TCC prompts
-        assert!(!config.protect_credentials);
-        assert!(!config.protect_cloud_config);
-        assert!(!config.protect_browser_data);
-        assert!(!config.protect_keychain);
-        assert!(!config.protect_shell_history);
-        assert!(!config.protect_package_credentials);
-        assert!(config.allow_gpu);
-        assert!(config.allow_npu);
-        assert!(config.allow_hardware);
+        assert!(!config.protect_user_home());
+        assert!(config.allow_tcc_prompts());
+        assert!(!config.protect_credentials());
+        assert!(!config.protect_keychain());
+        assert!(config.allow_hardware());
     }
 
     #[test]
-    fn test_interactive_allows_tcc_prompts() {
-        let config = SecurityConfig::interactive();
+    fn interactive_differs_from_strict_only_in_tcc_prompts() {
+        let interactive = SecurityConfig::interactive();
+        let strict = SecurityConfig::strict();
 
-        assert!(config.protect_user_home);
-        assert!(config.allow_tcc_prompts); // Interactive allows TCC prompts
-        assert!(config.protect_credentials);
-        assert!(config.protect_cloud_config);
-        assert!(config.protect_browser_data);
-        assert!(config.protect_keychain);
-        assert!(config.protect_shell_history);
-        assert!(config.protect_package_credentials);
-        assert!(config.allow_gpu);
-        assert!(config.allow_npu);
-        assert!(!config.allow_hardware);
+        assert!(interactive.allow_tcc_prompts());
+        assert!(!strict.allow_tcc_prompts());
+        assert_eq!(
+            SecurityConfig {
+                allow_tcc_prompts: false,
+                ..interactive
+            },
+            strict
+        );
     }
 
     #[test]
-    fn test_builder_custom() {
-        let config = SecurityConfig::builder()
-            .protect_user_home(false)
-            .protect_credentials(true)
-            .protect_browser_data(false)
-            .build();
+    fn overrides_only_touch_the_fields_they_set() {
+        let mut config = SecurityConfig::strict();
+        config.apply(&SecurityOverrides {
+            protect_user_home: Some(false),
+            allow_hardware: Some(true),
+            ..SecurityOverrides::default()
+        });
 
-        assert!(!config.protect_user_home);
-        assert!(config.protect_credentials);
-        assert!(!config.protect_browser_data);
+        assert!(!config.protect_user_home());
+        assert!(config.allow_hardware());
+        // Untouched fields keep their preset value.
+        assert!(config.protect_credentials());
     }
 
     #[test]
-    fn test_builder_from_permissive() {
+    fn empty_overrides_are_a_no_op() {
+        let config = SecurityConfig::strict();
+        assert_eq!(
+            config.clone().with(&SecurityOverrides::default()),
+            config,
+            "an empty override set must not change anything"
+        );
+    }
+
+    #[test]
+    fn overrides_parse_from_partial_config_files() {
+        let overrides: SecurityOverrides =
+            toml::from_str("protect-user-home = false\nallow-gpu = true").expect("parses");
+        assert_eq!(overrides.protect_user_home, Some(false));
+        assert_eq!(overrides.allow_gpu, Some(true));
+        assert_eq!(overrides.protect_keychain, None);
+    }
+
+    #[test]
+    fn builder_starts_from_the_requested_preset() {
         let config = SecurityConfigBuilder::from_permissive()
             .protect_credentials(true)
             .build();
 
-        assert!(config.protect_credentials);
-        assert!(!config.protect_user_home);
-        assert!(!config.protect_browser_data);
+        assert!(config.protect_credentials());
+        assert!(!config.protect_user_home());
     }
 }

@@ -1,26 +1,33 @@
-//! Node.js bindings for heel sandbox library
+//! Node.js bindings for the heel sandbox library.
 //!
-//! This crate provides NAPI-RS bindings to expose heel's sandboxing
-//! capabilities to Node.js/TypeScript applications.
+//! IPC is not exposed here: registering a host command means writing typed Rust
+//! handlers, so it belongs to the Rust API rather than to a string-keyed
+//! JavaScript surface.
 
 #![deny(clippy::all)]
+// The `#[napi]` macro generates the glue that JavaScript actually calls, and
+// those generated items cannot carry doc comments of their own.
+#![allow(missing_docs)]
 
 mod child;
 mod command;
 mod config;
 mod error;
-mod ipc;
-mod network;
+mod policy;
 mod python;
 mod sandbox;
 mod security;
 
-// Re-export main types for NAPI
 pub use child::ChildProcessJs;
 pub use command::{Command, ExitStatusJs, ProcessOutputJs, StdioConfigJs};
-pub use config::{SandboxConfigJs, preset_python_data_science, preset_python_dev, preset_strict};
-pub use ipc::{IpcRouterJs, create_ipc_router};
-pub use network::{DomainRequestJs, NetworkPolicyConfig};
+pub use config::{
+    IsolationJs, ResourceLimitsJs, SandboxConfigJs, preset_python_data_science, preset_python_dev,
+    preset_strict,
+};
+pub use policy::NetworkPolicyConfig;
 pub use python::{PythonConfigJs, VenvConfigJs};
 pub use sandbox::{Sandbox, create_sandbox};
-pub use security::{SecurityConfigJs, security_config_permissive, security_config_strict};
+pub use security::{
+    SecurityConfigJs, security_config_interactive, security_config_permissive,
+    security_config_strict,
+};

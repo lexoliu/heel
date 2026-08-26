@@ -1,103 +1,94 @@
+//! Security toggles exposed to JavaScript.
+
+use heel::{SecurityConfig, SecurityOverrides};
 use napi_derive::napi;
 
-/// Security configuration for the sandbox
+/// A partial set of security toggles, layered onto the strict preset.
+///
+/// Every field is optional: omitting one keeps the preset's value.
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct SecurityConfigJs {
-    /// Protect user home directories (/Users, /home)
+    /// Protect user home directories.
     pub protect_user_home: Option<bool>,
-    /// Protect SSH/GPG credentials (.ssh, .gnupg)
+    /// Let macOS prompt for TCC-protected folders instead of denying them.
+    pub allow_tcc_prompts: Option<bool>,
+    /// Protect SSH and GPG credentials.
     pub protect_credentials: Option<bool>,
-    /// Protect cloud provider config (.aws, .kube, .docker)
+    /// Protect cloud provider configuration.
     pub protect_cloud_config: Option<bool>,
-    /// Protect browser data (cookies, history, passwords)
+    /// Protect browser data.
     pub protect_browser_data: Option<bool>,
-    /// Protect system keychain
+    /// Protect the system keychain.
     pub protect_keychain: Option<bool>,
-    /// Protect shell history (.bash_history, .zsh_history, etc.)
+    /// Protect shell history.
     pub protect_shell_history: Option<bool>,
-    /// Protect package manager credentials (.npmrc, .pypirc, .netrc)
+    /// Protect package manager credentials.
     pub protect_package_credentials: Option<bool>,
-    /// Allow GPU access (Metal, CUDA, OpenCL)
+    /// Allow GPU access.
     pub allow_gpu: Option<bool>,
-    /// Allow NPU/Neural Engine access (CoreML, ANE)
+    /// Allow NPU / Neural Engine access.
     pub allow_npu: Option<bool>,
-    /// Allow general hardware access (USB, Bluetooth, cameras)
+    /// Allow general hardware access.
     pub allow_hardware: Option<bool>,
 }
 
 impl SecurityConfigJs {
-    /// Convert to Rust SecurityConfig, starting from strict preset
-    pub fn into_rust(self) -> heel::SecurityConfig {
-        let mut builder = heel::SecurityConfig::builder();
+    /// The overrides these fields describe.
+    fn overrides(&self) -> SecurityOverrides {
+        SecurityOverrides {
+            protect_user_home: self.protect_user_home,
+            allow_tcc_prompts: self.allow_tcc_prompts,
+            protect_credentials: self.protect_credentials,
+            protect_cloud_config: self.protect_cloud_config,
+            protect_browser_data: self.protect_browser_data,
+            protect_keychain: self.protect_keychain,
+            protect_shell_history: self.protect_shell_history,
+            protect_package_credentials: self.protect_package_credentials,
+            allow_gpu: self.allow_gpu,
+            allow_npu: self.allow_npu,
+            allow_hardware: self.allow_hardware,
+        }
+    }
 
-        if let Some(v) = self.protect_user_home {
-            builder = builder.protect_user_home(v);
-        }
-        if let Some(v) = self.protect_credentials {
-            builder = builder.protect_credentials(v);
-        }
-        if let Some(v) = self.protect_cloud_config {
-            builder = builder.protect_cloud_config(v);
-        }
-        if let Some(v) = self.protect_browser_data {
-            builder = builder.protect_browser_data(v);
-        }
-        if let Some(v) = self.protect_keychain {
-            builder = builder.protect_keychain(v);
-        }
-        if let Some(v) = self.protect_shell_history {
-            builder = builder.protect_shell_history(v);
-        }
-        if let Some(v) = self.protect_package_credentials {
-            builder = builder.protect_package_credentials(v);
-        }
-        if let Some(v) = self.allow_gpu {
-            builder = builder.allow_gpu(v);
-        }
-        if let Some(v) = self.allow_npu {
-            builder = builder.allow_npu(v);
-        }
-        if let Some(v) = self.allow_hardware {
-            builder = builder.allow_hardware(v);
-        }
-
-        builder.build()
+    /// Apply these toggles to `preset`.
+    pub fn apply_to(&self, preset: SecurityConfig) -> SecurityConfig {
+        preset.with(&self.overrides())
     }
 }
 
-/// Get strict security preset
+impl From<&SecurityConfig> for SecurityConfigJs {
+    fn from(config: &SecurityConfig) -> Self {
+        Self {
+            protect_user_home: Some(config.protect_user_home()),
+            allow_tcc_prompts: Some(config.allow_tcc_prompts()),
+            protect_credentials: Some(config.protect_credentials()),
+            protect_cloud_config: Some(config.protect_cloud_config()),
+            protect_browser_data: Some(config.protect_browser_data()),
+            protect_keychain: Some(config.protect_keychain()),
+            protect_shell_history: Some(config.protect_shell_history()),
+            protect_package_credentials: Some(config.protect_package_credentials()),
+            allow_gpu: Some(config.allow_gpu()),
+            allow_npu: Some(config.allow_npu()),
+            allow_hardware: Some(config.allow_hardware()),
+        }
+    }
+}
+
+/// The strict security preset, with every protection enabled.
 #[napi]
 pub fn security_config_strict() -> SecurityConfigJs {
-    let rust = heel::SecurityConfig::strict();
-    SecurityConfigJs {
-        protect_user_home: Some(rust.protect_user_home),
-        protect_credentials: Some(rust.protect_credentials),
-        protect_cloud_config: Some(rust.protect_cloud_config),
-        protect_browser_data: Some(rust.protect_browser_data),
-        protect_keychain: Some(rust.protect_keychain),
-        protect_shell_history: Some(rust.protect_shell_history),
-        protect_package_credentials: Some(rust.protect_package_credentials),
-        allow_gpu: Some(rust.allow_gpu),
-        allow_npu: Some(rust.allow_npu),
-        allow_hardware: Some(rust.allow_hardware),
-    }
+    SecurityConfigJs::from(&SecurityConfig::strict())
 }
 
-/// Get permissive security preset
+/// The interactive preset: strict, but macOS may prompt for protected folders.
+#[napi]
+pub fn security_config_interactive() -> SecurityConfigJs {
+    SecurityConfigJs::from(&SecurityConfig::interactive())
+}
+
+/// The permissive security preset.
 #[napi]
 pub fn security_config_permissive() -> SecurityConfigJs {
-    let rust = heel::SecurityConfig::permissive();
-    SecurityConfigJs {
-        protect_user_home: Some(rust.protect_user_home),
-        protect_credentials: Some(rust.protect_credentials),
-        protect_cloud_config: Some(rust.protect_cloud_config),
-        protect_browser_data: Some(rust.protect_browser_data),
-        protect_keychain: Some(rust.protect_keychain),
-        protect_shell_history: Some(rust.protect_shell_history),
-        protect_package_credentials: Some(rust.protect_package_credentials),
-        allow_gpu: Some(rust.allow_gpu),
-        allow_npu: Some(rust.allow_npu),
-        allow_hardware: Some(rust.allow_hardware),
-    }
+    SecurityConfigJs::from(&SecurityConfig::permissive())
 }

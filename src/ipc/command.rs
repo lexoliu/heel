@@ -1,107 +1,82 @@
-//! IPC command trait definition
+//! The trait host-side IPC commands implement.
 
-use std::borrow::Cow;
 use std::future::Future;
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Deserialize;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
-/// A type-safe IPC command with its handler
+/// Arguments for a command that takes none.
 ///
-/// Users implement this trait to define commands that can be called from sandboxed processes.
-/// The command struct contains the request data, and the `handle` method processes it.
+/// The wire format is always a map of named arguments, so a command without
+/// arguments still needs a type to decode that map into. Passing an argument to
+/// such a command is an error rather than something silently ignored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoArgs {}
+
+/// A command a sandboxed process can invoke on the host.
+///
+/// The command value itself holds whatever state the handler needs (API
+/// clients, registries, configuration); the per-request data arrives as a
+/// separate, typed [`IpcCommand::Args`]. Keeping the two apart means the router
+/// never has to clone handler state, and implementations never have to write
+/// deserialization glue.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use std::borrow::Cow;
-/// use serde::{Serialize, Deserialize};
+/// use serde::Deserialize;
 /// use heel::ipc::IpcCommand;
 ///
-/// #[derive(Clone, Serialize, Deserialize)]
-/// struct SearchCommand {
+/// struct Search {
+///     client: SearchClient,
+/// }
+///
+/// #[derive(Deserialize)]
+/// struct SearchArgs {
 ///     query: String,
 /// }
 ///
-/// #[derive(Serialize, Deserialize)]
-/// struct SearchResult {
-///     items: Vec<String>,
-/// }
+/// impl IpcCommand for Search {
+///     const NAME: &'static str = "search";
+///     // Enables `search "rust"` in the sandbox, mapped to `--query rust`.
+///     const POSITIONAL_ARGS: &'static [&'static str] = &["query"];
 ///
-/// impl IpcCommand for SearchCommand {
-///     type Response = SearchResult;
+///     type Args = SearchArgs;
+///     type Response = Vec<String>;
 ///
-///     fn name(&self) -> String {
-///         "search".to_string()
-///     }
-///
-///     fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
-///         Cow::Borrowed(&[Cow::Borrowed("query")])  // Enables: search "rust" → search --query "rust"
-///     }
-///
-///     fn apply_args(&mut self, params: &[u8]) -> Result<(), rmp_serde::decode::Error> {
-///         *self = rmp_serde::from_slice(params)?;
-///         Ok(())
-///     }
-///
-///     async fn handle(&mut self) -> SearchResult {
-///         let results = do_search(&self.query).await;
-///         SearchResult { items: results }
+///     async fn handle(&self, args: SearchArgs) -> Self::Response {
+///         self.client.search(&args.query).await
 ///     }
 /// }
 /// ```
-pub trait IpcCommand: Serialize + Send + 'static {
-    /// The response type returned by this command
-    type Response: Serialize + DeserializeOwned + Send;
+pub trait IpcCommand: Send + Sync + 'static {
+    /// The name sandboxed processes invoke.
+    ///
+    /// This is also the file name of the generated wrapper script, so it must
+    /// match `[A-Za-z][A-Za-z0-9_-]*`.
+    const NAME: &'static str;
 
-    /// Command name for wire protocol dispatch
+    /// Names for arguments that may be passed positionally.
     ///
-    /// This name is used to route incoming requests to the correct handler.
-    fn name(&self) -> String;
+    /// `["query"]` lets `search "foo"` stand in for `search --query foo`;
+    /// `["subagent", "prompt"]` maps `run a "b"` to `--subagent a --prompt b`.
+    const POSITIONAL_ARGS: &'static [&'static str] = &[];
 
-    /// Positional argument names for CLI conversion.
+    /// Name of the argument that receives piped standard input.
     ///
-    /// Returns a list of argument names that map to positional arguments in order.
-    /// The wrapper script converts positional args to named args:
-    /// - `["query"]` → `command "foo"` becomes `command --query "foo"`
-    /// - `["subagent", "prompt"]` → `command research "task"` becomes `command --subagent research --prompt "task"`
-    ///
-    /// Returns empty slice by default (no positional argument conversion).
-    fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
-        Cow::Borrowed(&[])
-    }
+    /// With `Some("input")`, `cat file | summarize "brief"` arrives as
+    /// `--input <file contents> --prompt brief`. Standard input is not read
+    /// when the invocation asks for help.
+    const STDIN_ARG: Option<&'static str> = None;
 
-    /// Stdin argument name for piped input.
-    ///
-    /// When set, the wrapper script will capture stdin and pass it as this argument:
-    /// `cat file | command "prompt"` → `heel ipc command --<stdin_arg> "<stdin>" --<primary_arg> "prompt"`
-    ///
-    /// Returns `None` by default (stdin is ignored).
-    fn stdin_arg(&self) -> Option<Cow<'static, str>> {
-        None
-    }
+    /// Per-request arguments, deserialized from the wire.
+    type Args: DeserializeOwned + Send;
 
-    /// Set the method name on the command after deserialization.
-    ///
-    /// This is called by the router after deserializing the command from IPC params.
-    /// Override this if your command needs the method name (e.g., for dispatching
-    /// to different handlers based on the method name).
-    ///
-    /// Default implementation does nothing.
-    fn set_method_name(&mut self, _name: &str) {}
+    /// The value returned to the sandboxed caller.
+    type Response: Serialize + Send;
 
-    /// Handle this command and produce a response
-    ///
-    /// The handler has mutable access to the command data, allowing it to
-    /// modify state if needed during processing.
-    fn handle(&mut self) -> impl Future<Output = Self::Response> + Send;
-
-    /// Apply arguments from serialized params to this command.
-    ///
-    /// The router calls this after cloning the command to apply request-specific
-    /// arguments while preserving stateful data (registries, connections, etc.).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the params cannot be applied.
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), rmp_serde::decode::Error>;
+    /// Handle one request.
+    fn handle(&self, args: Self::Args) -> impl Future<Output = Self::Response> + Send;
 }

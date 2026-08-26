@@ -1,45 +1,34 @@
 use napi::bindgen_prelude::*;
 
-/// Convert heel errors to NAPI errors with descriptive codes
+/// Convert a heel error into a NAPI error with a descriptive code.
+///
+/// The match is exhaustive on purpose: a new error variant should fail this
+/// build rather than silently fall into a generic bucket.
 pub fn convert_error(err: heel::Error) -> Error {
-    let (code, message) = match &err {
-        heel::Error::UnsupportedPlatform => ("ERR_UNSUPPORTED_PLATFORM", err.to_string()),
-        heel::Error::UnsupportedPlatformVersion { .. } => {
-            ("ERR_UNSUPPORTED_PLATFORM_VERSION", err.to_string())
-        }
-        heel::Error::InitFailed(msg) => ("ERR_INIT_FAILED", msg.clone()),
-        heel::Error::NotEnforced(msg) => ("ERR_NOT_ENFORCED", msg.to_string()),
-        heel::Error::PartialEnforcement(msg) => ("ERR_PARTIAL_ENFORCEMENT", msg.to_string()),
-        heel::Error::InvalidProfile(msg) => ("ERR_INVALID_PROFILE", msg.clone()),
-        heel::Error::PathNotFound(path) => (
-            "ERR_PATH_NOT_FOUND",
-            format!("Path not found: {}", path.display()),
-        ),
-        heel::Error::PythonNotFound => ("ERR_PYTHON_NOT_FOUND", err.to_string()),
-        heel::Error::VenvNotFound(path) => (
-            "ERR_VENV_NOT_FOUND",
-            format!("Venv not found: {}", path.display()),
-        ),
-        heel::Error::VenvCreationFailed(msg) => ("ERR_VENV_CREATION", msg.clone()),
-        heel::Error::PackageInstallFailed(msg) => ("ERR_PACKAGE_INSTALL", msg.clone()),
-        heel::Error::ProxyError(msg) => ("ERR_PROXY", msg.clone()),
-        heel::Error::AuditLog(msg) => ("ERR_AUDIT_LOG", msg.clone()),
-        heel::Error::ProcessError(e) => ("ERR_PROCESS", e.to_string()),
-        heel::Error::CommandFailed { code, message } => (
-            "ERR_COMMAND_FAILED",
-            format!("Exit code {}: {}", code, message),
-        ),
-        heel::Error::ConfigError(msg) => ("ERR_CONFIG", msg.clone()),
-        heel::Error::FfiError(msg) => ("ERR_FFI", msg.clone()),
-        heel::Error::IoError(msg) => ("ERR_IO", msg.clone()),
-        heel::Error::IpcError(e) => ("ERR_IPC", e.to_string()),
-        heel::Error::PtyError(msg) => ("ERR_PTY", msg.clone()),
+    let code = match &err {
+        heel::Error::UnsupportedPlatform => "ERR_UNSUPPORTED_PLATFORM",
+        heel::Error::UnsupportedPlatformVersion { .. } => "ERR_UNSUPPORTED_PLATFORM_VERSION",
+        heel::Error::InitFailed(_) => "ERR_INIT_FAILED",
+        heel::Error::NotEnforced(_) => "ERR_NOT_ENFORCED",
+        heel::Error::InvalidProfile(_) => "ERR_INVALID_PROFILE",
+        heel::Error::Path { .. } => "ERR_PATH",
+        heel::Error::WorkingDir { .. } => "ERR_WORKING_DIR",
+        heel::Error::PythonNotFound => "ERR_PYTHON_NOT_FOUND",
+        heel::Error::VenvNotFound(_) => "ERR_VENV_NOT_FOUND",
+        heel::Error::VenvCreationFailed(_) => "ERR_VENV_CREATION",
+        heel::Error::PackageInstallFailed(_) => "ERR_PACKAGE_INSTALL",
+        heel::Error::Proxy(_) => "ERR_PROXY",
+        heel::Error::AuditLog(_) => "ERR_AUDIT_LOG",
+        heel::Error::Template(_) => "ERR_TEMPLATE",
+        heel::Error::Io(_) => "ERR_IO",
+        heel::Error::Ipc(_) => "ERR_IPC",
+        heel::Error::Pty(_) => "ERR_PTY",
     };
 
-    Error::new(Status::GenericFailure, format!("[{}] {}", code, message))
+    Error::new(Status::GenericFailure, format!("[{code}] {err}"))
 }
 
-/// Extension trait for converting heel Results to NAPI Results
+/// Extension trait for converting heel results to NAPI results.
 pub trait IntoNapiResult<T> {
     fn into_napi(self) -> Result<T>;
 }

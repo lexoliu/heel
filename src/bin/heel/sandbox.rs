@@ -1,158 +1,129 @@
-#[cfg(target_os = "macos")]
-use heel::PtyExitStatus;
-#[cfg(not(target_os = "macos"))]
-use heel::StdioConfig;
+//! Bridge from the CLI's runtime configuration to the library's generics.
+
 use heel::{
-    AllowAll, AllowList, Command, DenyAll, PythonConfig, Sandbox, SandboxConfig,
+    AllowAll, AllowList, Command, DenyAll, NetworkPolicy, PythonConfig, Sandbox, SandboxConfig,
     SandboxConfigBuilder, VenvConfig,
 };
 
 use crate::cli::NetworkMode;
 use crate::config::MergedConfig;
-use crate::error::{CliError, CliResult};
+use crate::error::CliResult;
 
-/// Type-erased sandbox handle for CLI use
+/// A sandbox whose network policy was chosen at runtime.
 ///
-/// This enum dispatches to the appropriate generic Sandbox type at runtime,
-/// bridging the CLI's runtime configuration to the library's compile-time generics.
+/// The library is generic over the policy so that policies compose at compile
+/// time; the CLI picks one from a flag, so it needs this small dispatch layer.
 pub enum SandboxHandle {
     DenyAll(Sandbox<DenyAll>),
     AllowAll(Sandbox<AllowAll>),
     AllowList(Sandbox<AllowList>),
 }
 
+/// Run the same expression against whichever policy the sandbox was built with.
+macro_rules! dispatch {
+    ($self:expr, $sandbox:ident => $body:expr) => {
+        match $self {
+            SandboxHandle::DenyAll($sandbox) => $body,
+            SandboxHandle::AllowAll($sandbox) => $body,
+            SandboxHandle::AllowList($sandbox) => $body,
+        }
+    };
+}
+
 impl SandboxHandle {
-    /// Create a command builder for running a program in the sandbox
+    /// Build a command to run in the sandbox.
     pub fn command(&self, program: impl Into<String>) -> Command<'_> {
-        match self {
-            Self::DenyAll(s) => s.command(program),
-            Self::AllowAll(s) => s.command(program),
-            Self::AllowList(s) => s.command(program),
-        }
+        dispatch!(self, sandbox => sandbox.command(program))
     }
 
-    /// Keep the working directory after the sandbox is dropped
+    /// Keep the working directory after the sandbox is dropped.
     pub fn keep_working_dir(&mut self) {
-        match self {
-            Self::DenyAll(s) => {
-                s.keep_working_dir();
-            }
-            Self::AllowAll(s) => {
-                s.keep_working_dir();
-            }
-            Self::AllowList(s) => {
-                s.keep_working_dir();
-            }
-        }
+        dispatch!(self, sandbox => {
+            sandbox.keep_working_dir();
+        });
     }
 
-    #[cfg(not(target_os = "macos"))]
-    pub async fn run_shell(
-        &self,
-        program: &str,
-        args: &[String],
-        envs: &[(String, String)],
-    ) -> heel::Result<std::process::ExitStatus> {
-        let mut command = self.command(program);
-        command = command.args(args);
-        for (key, value) in envs {
-            command = command.env(key, value);
-        }
-        command
-            .stdin(StdioConfig::Inherit)
-            .stdout(StdioConfig::Inherit)
-            .stderr(StdioConfig::Inherit)
-            .status()
-            .await
-    }
-
-    /// Run an interactive command with PTY support
+    /// Run an interactive command on a pseudo-terminal.
     #[cfg(target_os = "macos")]
     pub fn run_interactive(
         &self,
         program: &str,
         args: &[String],
         envs: &[(String, String)],
-    ) -> heel::Result<PtyExitStatus> {
-        match self {
-            Self::DenyAll(s) => s.run_interactive(program, args, envs),
-            Self::AllowAll(s) => s.run_interactive(program, args, envs),
-            Self::AllowList(s) => s.run_interactive(program, args, envs),
-        }
+    ) -> heel::Result<std::process::ExitStatus> {
+        dispatch!(self, sandbox => sandbox.run_interactive(program, args, envs))
     }
 }
 
-/// Create a sandbox from merged configuration
+/// Create a sandbox from the merged configuration.
 pub async fn create_sandbox(config: &MergedConfig) -> CliResult<SandboxHandle> {
-    match config.network_mode {
+    let builder = SandboxConfigBuilder::default();
+
+    Ok(match config.network_mode {
         NetworkMode::Deny => {
-            let sandbox_config = build_config(SandboxConfigBuilder::default(), config)?;
-            let sandbox = Sandbox::with_config(sandbox_config).await?;
-            Ok(SandboxHandle::DenyAll(sandbox))
+            SandboxHandle::DenyAll(Sandbox::with_config(build(builder, config)).await?)
         }
-        NetworkMode::Allow => {
-            let sandbox_config =
-                build_config(SandboxConfigBuilder::default().network(AllowAll), config)?;
-            let sandbox = Sandbox::with_config(sandbox_config).await?;
-            Ok(SandboxHandle::AllowAll(sandbox))
-        }
+        NetworkMode::Allow => SandboxHandle::AllowAll(
+            Sandbox::with_config(build(builder.network(AllowAll), config)).await?,
+        ),
         NetworkMode::AllowList => {
-            if config.allow_domains.is_empty() {
-                return Err(CliError::MissingAllowDomains);
-            }
-            let policy = AllowList::new(config.allow_domains.iter().cloned());
-            let sandbox_config =
-                build_config(SandboxConfigBuilder::default().network(policy), config)?;
-            let sandbox = Sandbox::with_config(sandbox_config).await?;
-            Ok(SandboxHandle::AllowList(sandbox))
+            let policy = AllowList::new(config.allow_domains.iter());
+            SandboxHandle::AllowList(
+                Sandbox::with_config(build(builder.network(policy), config)).await?,
+            )
         }
-    }
+    })
 }
 
-/// Build a SandboxConfig from merged CLI/file configuration
-fn build_config<N: heel::NetworkPolicy>(
+/// Apply the merged configuration to a sandbox config builder.
+fn build<N: NetworkPolicy>(
     builder: SandboxConfigBuilder<N>,
     config: &MergedConfig,
-) -> CliResult<SandboxConfig<N>> {
+) -> SandboxConfig<N> {
     let mut builder = builder
         .security(config.security.clone())
         .limits(config.limits.clone())
-        .readable_paths(config.readable_paths.iter().cloned())
-        .writable_paths(config.writable_paths.iter().cloned())
-        .executable_paths(config.executable_paths.iter().cloned())
+        .readable_paths(&config.readable_paths)
+        .writable_paths(&config.writable_paths)
+        .executable_paths(&config.executable_paths)
         .env_passthroughs(config.env_passthroughs.iter().cloned())
-        .filesystem_strict(config.filesystem_strict)
-        .writable_file_system(config.writable_file_system);
+        .filesystem_strict(config.isolation.filesystem_strict())
+        .writable_file_system(config.isolation.writable_file_system());
 
-    // Set working directory if specified
-    if let Some(ref dir) = config.working_dir {
+    if let Some(dir) = &config.working_dir {
         builder = builder.working_dir(dir);
     }
 
-    // Add Python config if venv or packages are specified
-    if config.python.venv.is_some() || !config.python.packages.is_empty() {
-        let mut venv_builder = VenvConfig::builder();
-
-        if let Some(ref venv_path) = config.python.venv {
-            venv_builder = venv_builder.path(venv_path);
-        }
-        if let Some(ref interpreter) = config.python.interpreter {
-            venv_builder = venv_builder.python(interpreter);
-        }
-        if !config.python.packages.is_empty() {
-            venv_builder = venv_builder.packages(config.python.packages.iter().cloned());
-        }
-        venv_builder = venv_builder
-            .system_site_packages(config.python.system_site_packages)
-            .use_uv(config.python.use_uv);
-
-        let python_config = PythonConfig::builder()
-            .venv(venv_builder.build())
-            .allow_pip_install(config.python.allow_pip_install)
-            .build();
-
-        builder = builder.python(python_config);
+    if let Some(venv) = python_venv_config(config) {
+        builder = builder.python(
+            PythonConfig::builder()
+                .venv(venv)
+                .allow_pip_install(config.python.allow_pip_install)
+                .build(),
+        );
     }
 
-    Ok(builder.build()?)
+    builder.build()
+}
+
+/// The virtual environment configuration, when Python was configured at all.
+pub fn python_venv_config(config: &MergedConfig) -> Option<VenvConfig> {
+    let python = &config.python;
+    if python.venv.is_none() && python.packages.is_empty() {
+        return None;
+    }
+
+    let mut builder = VenvConfig::builder()
+        .system_site_packages(python.system_site_packages)
+        .backend(python.backend)
+        .packages(python.packages.iter().cloned());
+
+    if let Some(path) = &python.venv {
+        builder = builder.path(path);
+    }
+    if let Some(interpreter) = &python.interpreter {
+        builder = builder.python(interpreter);
+    }
+
+    Some(builder.build())
 }

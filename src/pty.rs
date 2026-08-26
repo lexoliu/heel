@@ -1,250 +1,322 @@
-//! PTY (pseudo-terminal) support for interactive shell sessions
+//! Interactive sessions on a pseudo-terminal.
+//!
+//! A piped [`Command`](crate::Command) cannot host an interactive shell: line
+//! editing, job control and full-screen programs all need a real terminal. This
+//! module allocates one, runs the sandboxed program on it, and relays bytes
+//! between it and the caller's terminal.
 
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::Path;
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::time::Duration;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use polling::{Event, Events, Poller};
+use pty_process::blocking::Pty;
 
-use crate::NetworkPolicy;
+use crate::command::sandbox_environment;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
-use crate::network::NetworkProxy;
+use crate::sandbox::ProcessTracker;
 
-/// Result of running a command with PTY
-pub struct PtyExitStatus {
-    success: bool,
+/// Everything needed to run one interactive session.
+pub struct PtySession<'a> {
+    /// Policy-independent sandbox configuration.
+    pub config: &'a SandboxConfigData,
+    /// Port of the sandbox proxy, when network access is enabled.
+    pub proxy_port: Option<u16>,
+    /// Proxy URL to publish to the sandboxed process.
+    pub proxy_url: Option<String>,
+    /// Tracker that kills the session if the sandbox is dropped first.
+    pub tracker: &'a ProcessTracker,
+    /// Program to run.
+    pub program: &'a str,
+    /// Arguments for the program.
+    pub args: &'a [String],
+    /// Extra environment variables.
+    pub envs: &'a [(String, String)],
+    /// Working directory override.
+    pub current_dir: Option<&'a Path>,
 }
 
-impl PtyExitStatus {
-    pub fn success(&self) -> bool {
-        self.success
-    }
-
-    pub fn code(&self) -> i32 {
-        if self.success { 0 } else { 1 }
-    }
-}
-
-/// Run a command in a PTY within the sandbox
-pub fn run_with_pty<N: NetworkPolicy>(
-    config: &SandboxConfigData,
-    proxy: Option<&NetworkProxy<N>>,
-    ipc_endpoint: Option<&str>,
-    program: &str,
-    args: &[String],
-    envs: &[(String, String)],
-    current_dir: Option<&Path>,
-) -> Result<PtyExitStatus> {
-    let (mut pty, pts) = pty_process::blocking::open()
-        .map_err(|e| Error::PtyError(format!("Failed to open PTY: {}", e)))?;
-
-    // Get terminal size and resize PTY
-    if let Ok((cols, rows)) = crossterm::terminal::size() {
-        let _ = pty.resize(pty_process::Size::new(rows, cols));
-    }
-
-    let proxy_port = proxy.map(|proxy| proxy.addr().port()).unwrap_or(0);
-    let sbpl_profile = crate::platform::macos::generate_profile(config, proxy_port)?;
-    let work_dir = current_dir.unwrap_or(config.working_dir());
-    let proxy_url = proxy.map(|proxy| proxy.proxy_url());
-
-    // Build command with chained methods (consuming builder pattern)
-    let mut cmd = pty_process::blocking::Command::new("/usr/bin/sandbox-exec")
-        .arg("-p")
-        .arg(&sbpl_profile)
-        .arg(program);
-
-    for arg in args {
-        cmd = cmd.arg(arg);
-    }
-
-    cmd = cmd.current_dir(work_dir).env_clear();
-
-    // Pass through standard environment variables
-    for var in &["PATH", "TERM", "HOME", "USER", "SHELL", "LANG", "LC_ALL"] {
-        if let Ok(val) = std::env::var(var) {
-            cmd = cmd.env(var, val);
-        }
-    }
-    if std::env::var("TERM").is_err() {
-        cmd = cmd.env("TERM", "xterm-256color");
-    }
-
-    for var in config.env_passthrough() {
-        if let Ok(val) = std::env::var(var) {
-            cmd = cmd.env(var, val);
-        }
-    }
-
-    if let Some(ref proxy_url) = proxy_url {
-        // Set proxy environment variables
-        cmd = cmd
-            .env("HTTP_PROXY", proxy_url)
-            .env("HTTPS_PROXY", proxy_url)
-            .env("http_proxy", proxy_url)
-            .env("https_proxy", proxy_url);
-    }
-
-    for (key, val) in envs {
-        cmd = cmd.env(key, val);
-    }
-
-    // Inject IPC endpoint and wrappers path for interactive IPC commands
-    if let Some(endpoint) = ipc_endpoint {
-        let heel_bin = config.working_dir().join(".heel").join("bin");
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{}", heel_bin.display(), current_path);
-        cmd = cmd.env("HEEL_IPC_ENDPOINT", endpoint).env("PATH", new_path);
-    }
-
-    // Spawn the child process
-    let mut child = cmd
-        .spawn(pts)
-        .map_err(|e| Error::PtyError(format!("Failed to spawn command: {}", e)))?;
-
-    // Check if stdin is a TTY and enable raw mode
-    let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
-    if stdin_is_tty {
-        enable_raw_mode()
-            .map_err(|e| Error::PtyError(format!("Failed to enable raw mode: {}", e)))?;
-    }
-
-    // Run I/O loop
-    let result = run_io_loop(&mut pty, &mut child);
-
-    // Restore terminal
-    if stdin_is_tty {
-        let _ = disable_raw_mode();
-    }
-
-    result
-}
+/// How often the relay loop wakes to notice a resized window or a child exit.
+///
+/// Both are edge cases the poller cannot report directly, and neither is
+/// latency-critical.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(100);
 
 const STDIN_KEY: usize = 0;
 const PTY_KEY: usize = 1;
 
-fn run_io_loop(pty: &mut pty_process::blocking::Pty, child: &mut Child) -> Result<PtyExitStatus> {
-    let poller =
-        Poller::new().map_err(|e| Error::PtyError(format!("Failed to create poller: {}", e)))?;
-    let mut events = Events::new();
+/// The control character a terminal in canonical mode reads as end-of-input.
+///
+/// Closing the caller's standard input does not close the pty, so the child
+/// would keep waiting for input that can never arrive. Sending EOT tells it
+/// what actually happened.
+const END_OF_TRANSMISSION: u8 = 0x04;
 
-    let stdin_fd = std::io::stdin().as_raw_fd();
-    let pty_fd = pty.as_raw_fd();
+/// Run a program on a pseudo-terminal inside the sandbox.
+///
+/// Returns the program's exit status, including the signal that killed it if
+/// there was one.
+pub fn run_with_pty(session: PtySession<'_>) -> Result<ExitStatus> {
+    let (mut pty, pts) = pty_process::blocking::open()
+        .map_err(|e| Error::Pty(format!("failed to open PTY: {e}")))?;
 
-    // Set both FDs to non-blocking
-    unsafe {
-        let flags = libc::fcntl(stdin_fd, libc::F_GETFL);
-        libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        let flags = libc::fcntl(pty_fd, libc::F_GETFL);
-        libc::fcntl(pty_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    resize_to_terminal(&pty);
+
+    let profile = crate::platform::macos::generate_profile(session.config, session.proxy_port)?;
+    let working_dir = session.current_dir.unwrap_or(session.config.working_dir());
+
+    let mut cmd = pty_process::blocking::Command::new("/usr/bin/sandbox-exec")
+        .arg("-p")
+        .arg(&profile)
+        .arg(session.program)
+        .args(session.args)
+        .current_dir(working_dir)
+        .env_clear();
+
+    for var in session.config.env_passthrough() {
+        if let Ok(value) = std::env::var(var) {
+            cmd = cmd.env(var, value);
+        }
     }
 
-    // Register FDs with poller
+    // An interactive session needs a terminal type; everything else about the
+    // environment is built the same way as for a non-interactive command.
+    let mut envs = session.envs.to_vec();
+    if !envs.iter().any(|(key, _)| key == "TERM") && std::env::var_os("TERM").is_none() {
+        envs.push(("TERM".to_string(), "xterm-256color".to_string()));
+    }
+    for (key, value) in sandbox_environment(session.config, session.proxy_url.as_deref(), &envs) {
+        cmd = cmd.env(key, value);
+    }
+
+    let mut child = cmd
+        .spawn(pts)
+        .map_err(|e| Error::Pty(format!("failed to spawn command: {e}")))?;
+
+    // Registered so that dropping the sandbox kills an interactive session too.
+    session.tracker.register(child.id());
+    let pid = child.id();
+
+    let _raw_mode = RawMode::enable()?;
+    let result = relay(&mut pty, &mut child);
+    session.tracker.unregister(pid);
+    result
+}
+
+/// Match the pty's window size to the caller's terminal.
+fn resize_to_terminal(pty: &Pty) {
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let _ = pty.resize(pty_process::Size::new(rows, cols));
+    }
+}
+
+/// Raw mode on the caller's terminal, restored however the session ends.
+///
+/// Without the guard, an error path or a panic would leave the user's shell
+/// with echo disabled.
+struct RawMode {
+    enabled: bool,
+}
+
+impl RawMode {
+    fn enable() -> Result<Self> {
+        // SAFETY: `isatty` only inspects a descriptor number and has no
+        // preconditions beyond that.
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        if !is_tty {
+            return Ok(Self { enabled: false });
+        }
+
+        enable_raw_mode().map_err(|e| Error::Pty(format!("failed to enable raw mode: {e}")))?;
+        Ok(Self { enabled: true })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
+/// A file descriptor's `O_NONBLOCK` flag, restored on drop.
+///
+/// Standard input is shared with the process that launched the sandbox, so
+/// leaving it non-blocking would break the caller's shell after the session
+/// ends.
+struct NonBlocking {
+    fd: i32,
+    previous_flags: i32,
+}
+
+impl NonBlocking {
+    fn set(fd: i32) -> Result<Self> {
+        // SAFETY: `fd` is owned by the caller for the lifetime of this value,
+        // and reading its flags has no other effect.
+        let previous_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if previous_flags == -1 {
+            return Err(Error::Pty(format!(
+                "failed to read descriptor flags: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: same descriptor, setting the flags just read.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, previous_flags | libc::O_NONBLOCK) } == -1 {
+            return Err(Error::Pty(format!(
+                "failed to set non-blocking mode: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        Ok(Self { fd, previous_flags })
+    }
+}
+
+impl Drop for NonBlocking {
+    fn drop(&mut self) {
+        // SAFETY: restoring the flags this value captured on construction.
+        unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.previous_flags) };
+    }
+}
+
+/// Relay bytes between the caller's terminal and the pty until the child exits.
+fn relay(pty: &mut Pty, child: &mut Child) -> Result<ExitStatus> {
+    let poller = Poller::new().map_err(|e| Error::Pty(format!("failed to create poller: {e}")))?;
+    let mut events = Events::new();
+
+    let stdin = std::io::stdin();
+    let stdin_fd = stdin.as_raw_fd();
+    let pty_fd = pty.as_raw_fd();
+
+    let _pty_flags = NonBlocking::set(pty_fd)?;
+
+    // SAFETY: stdin stays open for the whole loop; the poller only borrows it.
     let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+    // SAFETY: the pty is owned by the caller for the whole loop, likewise.
     let pty_borrowed = unsafe { BorrowedFd::borrow_raw(pty_fd) };
 
+    // SAFETY: the source is deregistered when the poller is dropped at the end
+    // of this function, before the descriptor is closed.
     unsafe {
-        #[allow(clippy::needless_borrows_for_generic_args)]
-        poller
-            .add(&stdin_borrowed, Event::readable(STDIN_KEY))
-            .map_err(|e| Error::PtyError(format!("Failed to add stdin to poller: {}", e)))?;
-        #[allow(clippy::needless_borrows_for_generic_args)]
         poller
             .add(&pty_borrowed, Event::readable(PTY_KEY))
-            .map_err(|e| Error::PtyError(format!("Failed to add PTY to poller: {}", e)))?;
+            .map_err(|e| Error::Pty(format!("failed to poll the PTY: {e}")))?;
     }
 
     let mut stdin_buf = [0u8; 1024];
     let mut pty_buf = [0u8; 4096];
-    let mut stdin_eof = false;
+    let mut last_size = crossterm::terminal::size().ok();
+
+    // Regular files and /dev/null cannot be registered for readiness on every
+    // platform, and they never block: forward them in one pass instead of
+    // polling. Only a stream that can block needs the event loop.
+    let mut stdin_flags = None;
+    let mut stdin_open = match NonBlocking::set(stdin_fd) {
+        Ok(flags) => {
+            // SAFETY: as above, deregistered with the poller.
+            match unsafe { poller.add(&stdin_borrowed, Event::readable(STDIN_KEY)) } {
+                Ok(()) => {
+                    stdin_flags = Some(flags);
+                    true
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "standard input is not pollable; forwarding it once");
+                    drop(flags);
+                    forward_all_of_stdin(pty)?;
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "standard input cannot be made non-blocking; forwarding it once");
+            forward_all_of_stdin(pty)?;
+            false
+        }
+    };
+    let _stdin_flags = stdin_flags;
 
     loop {
-        // Check if child has exited
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Drain remaining PTY output
-                drain_pty(pty_fd, &mut pty_buf);
-                return Ok(PtyExitStatus {
-                    success: status.success(),
-                });
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err(Error::PtyError(format!(
-                    "Failed to check child status: {}",
-                    e
-                )));
-            }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| Error::Pty(format!("failed to check child status: {e}")))?
+        {
+            // Drain whatever the child wrote just before exiting.
+            drain(pty, &mut pty_buf);
+            return Ok(status);
         }
 
         events.clear();
-        if poller
-            .wait(&mut events, Some(Duration::from_millis(100)))
-            .is_err()
-        {
-            continue;
+        if let Err(error) = poller.wait(&mut events, Some(HOUSEKEEPING_INTERVAL)) {
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(Error::Pty(format!(
+                "failed to wait for terminal I/O: {error}"
+            )));
+        }
+
+        // Window changes arrive as SIGWINCH, which this loop does not handle;
+        // comparing sizes on the housekeeping tick achieves the same result
+        // without installing a signal handler.
+        let size = crossterm::terminal::size().ok();
+        if size != last_size {
+            last_size = size;
+            resize_to_terminal(pty);
         }
 
         for event in events.iter() {
             match event.key {
-                STDIN_KEY if !stdin_eof => {
-                    // Read from stdin and write to PTY
-                    let mut stdin = std::io::stdin();
-                    match stdin.read(&mut stdin_buf) {
-                        Ok(0) => stdin_eof = true,
+                STDIN_KEY if stdin_open => {
+                    match (&stdin).read(&mut stdin_buf) {
+                        Ok(0) => {
+                            stdin_open = false;
+                            signal_end_of_input(pty);
+                        }
                         Ok(n) => {
-                            let mut pty_file = unsafe { std::fs::File::from_raw_fd(pty_fd) };
-                            let _ = pty_file.write_all(&stdin_buf[..n]);
-                            let _ = pty_file.flush();
-                            std::mem::forget(pty_file);
+                            let _ = pty.write_all(&stdin_buf[..n]);
+                            let _ = pty.flush();
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => stdin_eof = true,
+                        Err(_) => {
+                            stdin_open = false;
+                            signal_end_of_input(pty);
+                        }
                     }
-                    if !stdin_eof {
-                        #[allow(clippy::needless_borrows_for_generic_args)]
+                    if stdin_open {
                         poller
-                            .modify(&stdin_borrowed, Event::readable(STDIN_KEY))
-                            .ok();
+                            .modify(stdin_borrowed, Event::readable(STDIN_KEY))
+                            .map_err(|e| Error::Pty(format!("failed to re-arm stdin: {e}")))?;
                     }
                 }
                 PTY_KEY => {
-                    let mut pty_file = unsafe { std::fs::File::from_raw_fd(pty_fd) };
-                    match pty_file.read(&mut pty_buf) {
+                    match pty.read(&mut pty_buf) {
+                        // EOF on the pty means the child closed it; wait for the
+                        // real status rather than guessing.
                         Ok(0) => {
-                            std::mem::forget(pty_file);
-                            let status = child
+                            return child
                                 .wait()
-                                .map_err(|e| Error::PtyError(format!("Failed to wait: {}", e)))?;
-                            return Ok(PtyExitStatus {
-                                success: status.success(),
-                            });
+                                .map_err(|e| Error::Pty(format!("failed to wait: {e}")));
                         }
                         Ok(n) => {
-                            std::mem::forget(pty_file);
                             let mut stdout = std::io::stdout();
                             let _ = stdout.write_all(&pty_buf[..n]);
                             let _ = stdout.flush();
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::mem::forget(pty_file);
-                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => {
-                            std::mem::forget(pty_file);
-                            let status = child
+                            return child
                                 .wait()
-                                .map_err(|e| Error::PtyError(format!("Failed to wait: {}", e)))?;
-                            return Ok(PtyExitStatus {
-                                success: status.success(),
-                            });
+                                .map_err(|e| Error::Pty(format!("failed to wait: {e}")));
                         }
                     }
-                    #[allow(clippy::needless_borrows_for_generic_args)]
-                    poller.modify(&pty_borrowed, Event::readable(PTY_KEY)).ok();
+                    poller
+                        .modify(pty_borrowed, Event::readable(PTY_KEY))
+                        .map_err(|e| Error::Pty(format!("failed to re-arm the PTY: {e}")))?;
                 }
                 _ => {}
             }
@@ -252,21 +324,41 @@ fn run_io_loop(pty: &mut pty_process::blocking::Pty, child: &mut Child) -> Resul
     }
 }
 
-fn drain_pty(pty_fd: i32, buf: &mut [u8]) {
-    let mut pty_file = unsafe { std::fs::File::from_raw_fd(pty_fd) };
+/// Copy all of standard input into the pty, then signal end-of-input.
+///
+/// Used when standard input is a file or another descriptor that cannot be
+/// polled for readiness: such a descriptor never blocks, so one pass is enough.
+fn forward_all_of_stdin(pty: &mut Pty) -> Result<()> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut input)
+        .map_err(|error| Error::Pty(format!("failed to read standard input: {error}")))?;
+
+    if !input.is_empty() {
+        let _ = pty.write_all(&input);
+    }
+    signal_end_of_input(pty);
+    Ok(())
+}
+
+/// Tell the child that no more input is coming.
+fn signal_end_of_input(pty: &mut Pty) {
+    let _ = pty.write_all(&[END_OF_TRANSMISSION]);
+    let _ = pty.flush();
+}
+
+/// Write out whatever is still buffered in the pty.
+fn drain(pty: &mut Pty, buf: &mut [u8]) {
     let mut stdout = std::io::stdout();
 
     loop {
-        match pty_file.read(buf) {
+        match pty.read(buf) {
             Ok(0) => break,
             Ok(n) => {
                 let _ = stdout.write_all(&buf[..n]);
                 let _ = stdout.flush();
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => break,
         }
     }
-
-    std::mem::forget(pty_file);
 }

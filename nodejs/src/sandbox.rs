@@ -1,5 +1,8 @@
+//! The sandbox object exposed to JavaScript.
+
 use std::sync::Arc;
 
+use heel::{AllowAll, AllowList, Command as RustCommand, DenyAll, Sandbox as RustSandbox};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::Mutex;
@@ -7,129 +10,163 @@ use tokio::sync::Mutex;
 use crate::command::{Command, ProcessOutputJs};
 use crate::config::SandboxConfigJs;
 use crate::error::IntoNapiResult;
-use crate::network::NetworkPolicyWrapper;
+use crate::policy::PolicySelection;
 
-/// Internal sandbox wrapper that owns the Rust sandbox
-pub(crate) struct SandboxInner {
-    pub sandbox: heel::Sandbox<NetworkPolicyWrapper>,
+/// A sandbox whose network policy was chosen at runtime.
+pub(crate) enum SandboxInner {
+    DenyAll(RustSandbox<DenyAll>),
+    AllowAll(RustSandbox<AllowAll>),
+    AllowList(RustSandbox<AllowList>),
 }
 
-/// A sandbox for running untrusted code with restricted permissions
+/// Run the same expression against whichever policy the sandbox was built with.
+macro_rules! dispatch {
+    ($self:expr, $sandbox:ident => $body:expr) => {
+        match $self {
+            SandboxInner::DenyAll($sandbox) => $body,
+            SandboxInner::AllowAll($sandbox) => $body,
+            SandboxInner::AllowList($sandbox) => $body,
+        }
+    };
+}
+
+impl SandboxInner {
+    pub(crate) fn command(&self, program: String) -> RustCommand<'_> {
+        dispatch!(self, sandbox => sandbox.command(program))
+    }
+
+    fn working_dir(&self) -> String {
+        dispatch!(self, sandbox => sandbox.working_dir().to_string_lossy().into_owned())
+    }
+
+    fn proxy_url(&self) -> Option<String> {
+        dispatch!(self, sandbox => sandbox.proxy_url())
+    }
+
+    fn keep_working_dir(&mut self) {
+        dispatch!(self, sandbox => {
+            sandbox.keep_working_dir();
+        });
+    }
+
+    async fn run_python(&self, script: &str) -> heel::Result<std::process::Output> {
+        dispatch!(self, sandbox => sandbox.run_python(script).await)
+    }
+}
+
+/// A sandbox for running untrusted code with restricted permissions.
 ///
-/// All network traffic from sandboxed processes is routed through a local proxy
-/// that applies the configured network policy for filtering.
-///
-/// When disposed, the sandbox will:
-/// - Stop the network proxy
-/// - Stop the IPC server (if enabled)
-/// - Kill all child processes that were spawned within it
-/// - Delete the working directory if it was auto-created (unless `keepWorkingDir()` was called)
+/// When disposed, the sandbox stops its proxy, kills the processes it spawned,
+/// and removes a generated working directory.
 #[napi]
 pub struct Sandbox {
     inner: Arc<Mutex<Option<SandboxInner>>>,
     working_dir: String,
-    proxy_url: String,
+    proxy_url: Option<String>,
 }
 
 #[napi]
 impl Sandbox {
-    /// Create a new sandbox with optional configuration
+    /// Create a sandbox.
     #[napi(factory)]
     pub async fn create(config: Option<SandboxConfigJs>) -> Result<Sandbox> {
-        // Build the Rust config - do this before any await points
-        let rust_config = match config {
-            Some(cfg) => cfg.into_rust_config()?,
-            None => heel::SandboxConfig::builder()
-                .network(NetworkPolicyWrapper::deny_all())
-                .build()
+        let mut config = config.unwrap_or_else(crate::config::preset_strict);
+        let policy = PolicySelection::from_config(config.network.take())?;
+        let builder = heel::SandboxConfig::builder();
+
+        // The policy type is resolved here so that a deny-all sandbox gets the
+        // kernel-level denial its type selects, rather than a proxy that says no.
+        let inner = match policy {
+            PolicySelection::DenyAll => SandboxInner::DenyAll(
+                RustSandbox::with_config_and_executor(
+                    config.apply(builder)?,
+                    executor_core::tokio::TokioGlobal,
+                )
+                .await
                 .into_napi()?,
+            ),
+            PolicySelection::AllowAll => SandboxInner::AllowAll(
+                RustSandbox::with_config_and_executor(
+                    config.apply(builder.network(AllowAll))?,
+                    executor_core::tokio::TokioGlobal,
+                )
+                .await
+                .into_napi()?,
+            ),
+            PolicySelection::AllowList(domains) => SandboxInner::AllowList(
+                RustSandbox::with_config_and_executor(
+                    config.apply(builder.network(AllowList::new(domains)))?,
+                    executor_core::tokio::TokioGlobal,
+                )
+                .await
+                .into_napi()?,
+            ),
         };
 
-        // Create the sandbox with tokio executor
-        let sandbox =
-            heel::Sandbox::with_config_and_executor(rust_config, executor_core::tokio::TokioGlobal)
-                .await
-                .into_napi()?;
-
-        let working_dir = sandbox.working_dir().to_string_lossy().to_string();
-        let proxy_url = sandbox.proxy_url();
-
         Ok(Self {
-            inner: Arc::new(Mutex::new(Some(SandboxInner { sandbox }))),
-            working_dir,
-            proxy_url,
+            working_dir: inner.working_dir(),
+            proxy_url: inner.proxy_url(),
+            inner: Arc::new(Mutex::new(Some(inner))),
         })
     }
 
-    /// Get the working directory path
+    /// The working directory path.
     #[napi(getter)]
     pub fn working_dir(&self) -> String {
         self.working_dir.clone()
     }
 
-    /// Get the proxy URL for environment variables
+    /// The proxy URL, or `null` when network access is denied.
     #[napi(getter)]
-    pub fn proxy_url(&self) -> String {
+    pub fn proxy_url(&self) -> Option<String> {
         self.proxy_url.clone()
     }
 
-    /// Create a command builder for running a program in the sandbox
+    /// Build a command to run in the sandbox.
     #[napi]
     pub fn command(&self, program: String) -> Command {
         Command::new(self.inner.clone(), program)
     }
 
-    /// Run a Python script in the sandbox
+    /// Run a Python script in the sandbox.
     #[napi]
     pub async fn run_python(&self, script: String) -> Result<ProcessOutputJs> {
         let guard = self.inner.lock().await;
-        let sandbox_inner = guard
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Sandbox already disposed"))?;
-
-        let output = sandbox_inner
-            .sandbox
-            .run_python(&script)
-            .await
-            .into_napi()?;
-
+        let sandbox = guard.as_ref().ok_or_else(disposed)?;
+        let output = sandbox.run_python(&script).await.into_napi()?;
         Ok(ProcessOutputJs::from(output))
     }
 
-    /// Keep the working directory after the sandbox is disposed
+    /// Keep the working directory after the sandbox is disposed.
     #[napi]
     pub async fn keep_working_dir(&self) -> Result<()> {
         let mut guard = self.inner.lock().await;
-        if let Some(ref mut inner) = *guard {
-            inner.sandbox.keep_working_dir();
-        }
+        guard.as_mut().ok_or_else(disposed)?.keep_working_dir();
         Ok(())
     }
 
-    /// Dispose the sandbox (called automatically, but can be called manually)
-    ///
-    /// This will:
-    /// - Stop the network proxy
-    /// - Kill all child processes
-    /// - Delete the working directory if it was auto-created (unless keepWorkingDir was called)
+    /// Dispose the sandbox, releasing everything it holds.
     #[napi]
     pub async fn dispose(&self) -> Result<()> {
         let mut guard = self.inner.lock().await;
-        *guard = None; // Drop triggers cleanup
+        *guard = None;
         Ok(())
     }
 }
 
-/// Create a new sandbox with optional configuration
-///
-/// This is the main entry point for creating sandboxes.
+/// The error reported for any use after disposal.
+fn disposed() -> Error {
+    Error::from_reason("the sandbox has already been disposed")
+}
+
+/// Create a sandbox.
 ///
 /// @example
 /// ```typescript
 /// import { createSandbox } from 'heel-sandbox';
 ///
 /// const sandbox = await createSandbox();
-/// const output = await sandbox.command('echo').arg('hello').output();
+/// const output = await sandbox.command('/bin/echo').arg('hello').output();
 /// console.log(output.stdout.toString()); // "hello\n"
 /// ```
 #[napi]

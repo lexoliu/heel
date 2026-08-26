@@ -1,6 +1,5 @@
 use std::io;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use thiserror::Error;
 
@@ -23,63 +22,52 @@ pub enum CliError {
     #[error("failed to read config file {path}: {source}")]
     ReadConfig { path: PathBuf, source: io::Error },
 
+    /// The parse error carries the source span and is by far the largest thing
+    /// this enum holds, so it is boxed rather than widening every `CliResult`.
     #[error("failed to parse config file {path}: {source}")]
     ParseConfig {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 
-    #[error("invalid network mode in config: {value}")]
-    InvalidNetworkMode { value: String },
-
-    #[error("invalid env format (expected KEY=VALUE): {value}")]
+    #[error("invalid --env value (expected KEY=VALUE): {value}")]
     InvalidEnvFormat { value: String },
 
     #[error("--network allow-list requires at least one --allow-domain")]
     MissingAllowDomains,
 
-    #[error("HEEL_IPC_ENDPOINT environment variable not set")]
+    #[error(
+        "HEEL_IPC_ENDPOINT is not set; `heel ipc` runs inside a sandbox that has IPC configured"
+    )]
     MissingIpcEndpoint,
 
-    #[error("IPC request serialization failed: {source}")]
-    SerializeIpcRequest {
+    #[error("IPC error: {source}")]
+    Ipc {
+        #[from]
+        source: heel::IpcError,
+    },
+
+    #[error("failed to encode IPC arguments: {source}")]
+    EncodeIpcArgs {
         #[from]
         source: rmp_serde::encode::Error,
     },
 
-    #[error("IPC response decode failed: {source}")]
+    #[error("failed to decode the IPC response: {source}")]
     DecodeIpcResponse {
         #[from]
         source: rmp_serde::decode::Error,
     },
 
-    #[error("IPC JSON rendering failed: {source}")]
-    RenderIpcJson {
+    #[error("failed to render the IPC response: {source}")]
+    RenderIpcResponse {
         #[from]
         source: serde_json::Error,
     },
 
-    #[error("IPC transport error on {endpoint}: {source}")]
-    IpcTransport { endpoint: String, source: io::Error },
+    #[error("{command} takes no positional argument here: {value}")]
+    UnexpectedPositional { command: String, value: String },
 
-    #[error("invalid IPC response length: {length}")]
-    InvalidIpcResponseLength { length: usize },
-
-    #[cfg(not(unix))]
-    #[error("unsupported IPC endpoint: {endpoint}")]
-    UnsupportedIpcEndpoint { endpoint: String },
-
-    #[error("{message}")]
-    Message { message: String },
-}
-
-/// Convert a CliResult to an ExitCode, printing errors to stderr
-pub fn to_exit_code(result: CliResult<()>) -> ExitCode {
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error}");
-            ExitCode::FAILURE
-        }
-    }
+    #[error("{command} received an argument that is not --name or --name=value: {value}")]
+    UnexpectedArgument { command: String, value: String },
 }

@@ -12,135 +12,146 @@ export const enum StdioConfigJs {
   /** Redirect to null */
   Null = 'Null'
 }
-/** Process exit status */
+/** How a process exited. */
 export interface ExitStatusJs {
+  /** Whether the process exited with a success status. */
   success: boolean
+  /** The exit code, or `null` when a signal ended the process. */
   code?: number
 }
-/** Process output with stdout and stderr */
+/** A finished process and everything it wrote. */
 export interface ProcessOutputJs {
+  /** How the process exited. */
   status: ExitStatusJs
+  /** Everything the process wrote to standard output. */
   stdout: Buffer
+  /** Everything the process wrote to standard error. */
   stderr: Buffer
 }
-/** Resource limits for sandboxed processes */
+/** Resource limits for sandboxed processes. */
 export interface ResourceLimitsJs {
-  /** Maximum memory in bytes */
+  /** Maximum address space, in bytes. */
   maxMemoryBytes?: number
-  /** Maximum CPU time in seconds */
+  /** Maximum CPU time, in seconds. */
   maxCpuTimeSecs?: number
-  /** Maximum file size in bytes */
+  /** Maximum size of a file the process may create, in bytes. */
   maxFileSizeBytes?: number
-  /** Maximum number of processes */
+  /** Maximum number of processes. */
   maxProcesses?: number
 }
-/** Main sandbox configuration from JavaScript */
+/** How much of the host the sandbox can see. */
+export const enum IsolationJs {
+  /** Only the working directory is readable or writable. */
+  Strict = 'Strict',
+  /** The working directory is writable; the rest of the system is readable. */
+  Default = 'Default',
+  /** The whole filesystem is readable and writable. */
+  Permissive = 'Permissive'
+}
+/** Sandbox configuration. */
 export interface SandboxConfigJs {
-  /** Network policy configuration */
+  /** Network policy; defaults to denying everything. */
   network?: NetworkPolicyConfig
-  /** Security configuration */
+  /** Isolation level; defaults to `default`. */
+  isolation?: IsolationJs
+  /** Security toggles layered onto the isolation level's preset. */
   security?: SecurityConfigJs
-  /** Enable strict filesystem mode (deny reads outside sandbox/allowlist) */
-  filesystemStrict?: boolean
-  /** Paths with write access */
+  /** Paths the sandbox may write. */
   writablePaths?: Array<string>
-  /** Paths with read-only access */
+  /** Paths the sandbox may read. */
   readablePaths?: Array<string>
-  /** Paths with execute access */
+  /** Paths the sandbox may execute. */
   executablePaths?: Array<string>
-  /** Python configuration */
+  /** Python configuration. */
   python?: PythonConfigJs
-  /** Working directory path */
+  /** Working directory; generated when omitted. */
   workingDir?: string
-  /** Environment variables to pass through */
+  /** Host environment variables to forward. */
   envPassthrough?: Array<string>
-  /** Resource limits */
+  /** Resource limits. */
   limits?: ResourceLimitsJs
 }
-/** Get strict sandbox preset configuration */
+/** A sandbox that exposes only its own working directory, with no network. */
 export declare function presetStrict(): SandboxConfigJs
-/** Get Python dev sandbox preset configuration */
+/** A sandbox for Python development, with writes to the virtual environment. */
 export declare function presetPythonDev(): SandboxConfigJs
-/** Get Python data science sandbox preset configuration */
+/** A sandbox for Python data science, with the usual toolchain preinstalled. */
 export declare function presetPythonDataScience(): SandboxConfigJs
-/** Helper to create an IPC router (factory function for cleaner API) */
-export declare function createIpcRouter(): IpcRouterJs
-/** Domain request information exposed to JavaScript */
-export interface DomainRequestJs {
-  target: string
-  port: number
-  direction: string
-  pid: number
-}
-/** Network policy configuration from JavaScript */
+/** Network policy configuration. */
 export interface NetworkPolicyConfig {
-  /** Policy type: "deny-all", "allow-all", or "allow-list" */
+  /** Policy type: `deny-all`, `allow-all`, or `allow-list`. */
   policyType: string
-  /** Domains for allow-list policy (supports wildcards like "*.example.com") */
+  /** Domains for the allow-list policy; supports `*.example.com`. */
   domains?: Array<string>
 }
-/** Virtual environment configuration */
+/** Virtual environment configuration. */
 export interface VenvConfigJs {
-  /** Path to the virtual environment */
+  /** Where the environment lives. */
   path?: string
-  /** Python interpreter path */
+  /** Interpreter used to create the environment. */
   python?: string
-  /** Packages to install */
+  /** Packages to install. */
   packages?: Array<string>
-  /** Include system site-packages */
+  /** Expose the system's site-packages. */
   systemSitePackages?: boolean
-  /** Use uv package manager */
-  useUv?: boolean
+  /** Tool used to create the environment: `auto`, `uv`, or `python`. */
+  backend?: string
 }
-/** Python sandbox configuration */
+/** Python configuration. */
 export interface PythonConfigJs {
-  /** Virtual environment configuration */
+  /** Virtual environment configuration. */
   venv?: VenvConfigJs
-  /** Allow pip install in sandbox */
+  /** Let the sandboxed process write to the virtual environment. */
   allowPipInstall?: boolean
 }
 /**
- * Create a new sandbox with optional configuration
- *
- * This is the main entry point for creating sandboxes.
+ * Create a sandbox.
  *
  * @example
  * ```typescript
  * import { createSandbox } from 'heel-sandbox';
  *
  * const sandbox = await createSandbox();
- * const output = await sandbox.command('echo').arg('hello').output();
+ * const output = await sandbox.command('/bin/echo').arg('hello').output();
  * console.log(output.stdout.toString()); // "hello
 "
  * ```
  */
 export declare function createSandbox(config?: SandboxConfigJs | undefined | null): Promise<Sandbox>
-/** Security configuration for the sandbox */
+/**
+ * A partial set of security toggles, layered onto the strict preset.
+ *
+ * Every field is optional: omitting one keeps the preset's value.
+ */
 export interface SecurityConfigJs {
-  /** Protect user home directories (/Users, /home) */
+  /** Protect user home directories. */
   protectUserHome?: boolean
-  /** Protect SSH/GPG credentials (.ssh, .gnupg) */
+  /** Let macOS prompt for TCC-protected folders instead of denying them. */
+  allowTccPrompts?: boolean
+  /** Protect SSH and GPG credentials. */
   protectCredentials?: boolean
-  /** Protect cloud provider config (.aws, .kube, .docker) */
+  /** Protect cloud provider configuration. */
   protectCloudConfig?: boolean
-  /** Protect browser data (cookies, history, passwords) */
+  /** Protect browser data. */
   protectBrowserData?: boolean
-  /** Protect system keychain */
+  /** Protect the system keychain. */
   protectKeychain?: boolean
-  /** Protect shell history (.bash_history, .zsh_history, etc.) */
+  /** Protect shell history. */
   protectShellHistory?: boolean
-  /** Protect package manager credentials (.npmrc, .pypirc, .netrc) */
+  /** Protect package manager credentials. */
   protectPackageCredentials?: boolean
-  /** Allow GPU access (Metal, CUDA, OpenCL) */
+  /** Allow GPU access. */
   allowGpu?: boolean
-  /** Allow NPU/Neural Engine access (CoreML, ANE) */
+  /** Allow NPU / Neural Engine access. */
   allowNpu?: boolean
-  /** Allow general hardware access (USB, Bluetooth, cameras) */
+  /** Allow general hardware access. */
   allowHardware?: boolean
 }
-/** Get strict security preset */
+/** The strict security preset, with every protection enabled. */
 export declare function securityConfigStrict(): SecurityConfigJs
-/** Get permissive security preset */
+/** The interactive preset: strict, but macOS may prompt for protected folders. */
+export declare function securityConfigInteractive(): SecurityConfigJs
+/** The permissive security preset. */
 export declare function securityConfigPermissive(): SecurityConfigJs
 /** A spawned child process in the sandbox */
 export declare class ChildProcessJs {
@@ -187,49 +198,24 @@ export declare class Command {
   spawn(): Promise<ChildProcessJs>
 }
 /**
- * IPC router for handling commands from sandboxed processes
+ * A sandbox for running untrusted code with restricted permissions.
  *
- * Note: IPC support in the Node.js binding is currently limited.
- * For full IPC functionality, use the Rust library directly.
- */
-export declare class IpcRouterJs {
-  /** Create a new empty IPC router */
-  constructor()
-  /** Get the list of registered method names */
-  methods(): Array<string>
-}
-/**
- * A sandbox for running untrusted code with restricted permissions
- *
- * All network traffic from sandboxed processes is routed through a local proxy
- * that applies the configured network policy for filtering.
- *
- * When disposed, the sandbox will:
- * - Stop the network proxy
- * - Stop the IPC server (if enabled)
- * - Kill all child processes that were spawned within it
- * - Delete the working directory if it was auto-created (unless `keepWorkingDir()` was called)
+ * When disposed, the sandbox stops its proxy, kills the processes it spawned,
+ * and removes a generated working directory.
  */
 export declare class Sandbox {
-  /** Create a new sandbox with optional configuration */
+  /** Create a sandbox. */
   static create(config?: SandboxConfigJs | undefined | null): Promise<Sandbox>
-  /** Get the working directory path */
+  /** The working directory path. */
   get workingDir(): string
-  /** Get the proxy URL for environment variables */
-  get proxyUrl(): string
-  /** Create a command builder for running a program in the sandbox */
+  /** The proxy URL, or `null` when network access is denied. */
+  get proxyUrl(): string | null
+  /** Build a command to run in the sandbox. */
   command(program: string): Command
-  /** Run a Python script in the sandbox */
+  /** Run a Python script in the sandbox. */
   runPython(script: string): Promise<ProcessOutputJs>
-  /** Keep the working directory after the sandbox is disposed */
+  /** Keep the working directory after the sandbox is disposed. */
   keepWorkingDir(): Promise<void>
-  /**
-   * Dispose the sandbox (called automatically, but can be called manually)
-   *
-   * This will:
-   * - Stop the network proxy
-   * - Kill all child processes
-   * - Delete the working directory if it was auto-created (unless keepWorkingDir was called)
-   */
+  /** Dispose the sandbox, releasing everything it holds. */
   dispose(): Promise<void>
 }

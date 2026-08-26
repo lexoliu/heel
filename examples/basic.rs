@@ -1,25 +1,38 @@
-//! Basic sandbox example
+//! Run a command in a sandbox with the default, deny-everything configuration.
+
+// Examples report what the sandbox did, so printing is the point here.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use heel::Sandbox;
 
 #[tokio::main]
 async fn main() -> heel::Result<()> {
-    // Enable tracing for debug output
     tracing_subscriber::fmt::init();
 
-    // Create a sandbox with default configuration (network denied)
-    let sandbox = Sandbox::new().await?;
+    let sandbox = Sandbox::with_executor(executor_core::tokio::TokioGlobal).await?;
+    println!("working directory: {}", sandbox.working_dir().display());
 
-    // Run a simple command in the sandbox
     let output = sandbox
-        .command("echo")
-        .arg("Hello from sandbox!")
+        .command("/bin/echo")
+        .arg("hello from the sandbox")
         .output()
         .await?;
 
-    println!("Exit status: {:?}", output.status);
-    println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-    println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+    println!("status: {}", output.status);
+    print!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+
+    // The working directory is writable; the rest of the home directory is not.
+    let denied = sandbox
+        .command("/bin/sh")
+        .arg("-c")
+        .arg("echo scratch > scratch.txt && cat ~/.ssh/id_rsa")
+        .output()
+        .await?;
+
+    println!(
+        "reading ~/.ssh/id_rsa failed as expected: {}",
+        !denied.status.success()
+    );
 
     Ok(())
 }
