@@ -5,19 +5,16 @@ use thiserror::Error;
 
 pub type CliResult<T> = std::result::Result<T, CliError>;
 
+/// Variants that exist purely to carry another error use tuple form: thiserror
+/// derives the `From` impl either way, and a named `source` field makes the
+/// generated code trip `clippy::redundant_field_names` on current nightlies.
 #[derive(Debug, Error)]
 pub enum CliError {
-    #[error("{source}")]
-    Sandbox {
-        #[from]
-        source: heel::Error,
-    },
+    #[error("{0}")]
+    Sandbox(#[from] heel::Error),
 
-    #[error("I/O error: {source}")]
-    Io {
-        #[from]
-        source: io::Error,
-    },
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
 
     #[error("failed to read config file {path}: {source}")]
     ReadConfig { path: PathBuf, source: io::Error },
@@ -41,29 +38,17 @@ pub enum CliError {
     )]
     MissingIpcEndpoint,
 
-    #[error("IPC error: {source}")]
-    Ipc {
-        #[from]
-        source: heel::IpcError,
-    },
+    #[error("IPC error: {0}")]
+    Ipc(#[from] heel::IpcError),
 
-    #[error("failed to encode IPC arguments: {source}")]
-    EncodeIpcArgs {
-        #[from]
-        source: rmp_serde::encode::Error,
-    },
+    #[error("failed to encode IPC arguments: {0}")]
+    EncodeIpcArgs(#[from] rmp_serde::encode::Error),
 
-    #[error("failed to decode the IPC response: {source}")]
-    DecodeIpcResponse {
-        #[from]
-        source: rmp_serde::decode::Error,
-    },
+    #[error("failed to decode the IPC response: {0}")]
+    DecodeIpcResponse(#[from] rmp_serde::decode::Error),
 
-    #[error("failed to render the IPC response: {source}")]
-    RenderIpcResponse {
-        #[from]
-        source: serde_json::Error,
-    },
+    #[error("failed to render the IPC response: {0}")]
+    RenderIpcResponse(#[from] serde_json::Error),
 
     #[error("{command} takes no positional argument here: {value}")]
     UnexpectedPositional { command: String, value: String },
