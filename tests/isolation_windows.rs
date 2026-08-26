@@ -101,10 +101,16 @@ async fn a_program_written_inside_the_sandbox_cannot_be_executed() {
     // System32 fails before it proves anything.
     let sandbox = default_sandbox().await;
 
+    // Written rather than copied: `std::fs::copy` goes through `CopyFileExW`,
+    // which can carry the source file's own security descriptor onto the
+    // destination, so the staged file would not pick up the entry the working
+    // directory grants the container. Writing the bytes creates an ordinary new
+    // file, which inherits.
     let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let program = std::fs::read(format!("{system_root}\\System32\\whoami.exe"))
+        .expect("the host reads a program to stage");
     let source = sandbox.working_dir().join("source.exe");
-    std::fs::copy(format!("{system_root}\\System32\\whoami.exe"), &source)
-        .expect("the host stages an executable the sandbox can read");
+    std::fs::write(&source, program).expect("the host stages an executable the sandbox can read");
 
     // Each step is checked on its own: "access is denied" from `copy` does not
     // say whether the source could not be read or the destination could not be
