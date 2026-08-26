@@ -5,7 +5,7 @@
 //! - **macOS**: `sandbox-exec` with generated SBPL profiles
 //! - **Linux**: Landlock (ABI v4) for the filesystem and network, Seccomp for
 //!   syscalls
-//! - **Windows**: AppContainer (not yet implemented)
+//! - **Windows**: AppContainer + job objects (implemented, Windows 10+)
 //!
 //! # Example
 //!

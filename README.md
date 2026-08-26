@@ -18,15 +18,15 @@ Heel is designed for running LLM-generated code in a secure environment. It is n
 |----------|---------|--------|
 | macOS | `sandbox-exec` with SBPL profiles | ✅ Fully implemented |
 | Linux | Landlock (ABI v4) + Seccomp | ✅ Implemented (kernel 6.7+) |
-| Windows | AppContainer | 🚧 Planned (construction fails today) |
+| Windows | AppContainer + job objects | ✅ Implemented (Windows 10+) |
 
 ## What the sandbox enforces
 
-- **The working directory is the only writable place.** It is created for the sandbox, exported as `TMPDIR`, and removed when the sandbox is dropped.
-- **Nothing writable is executable.** The working directory, configured writable paths and the shared temp directories are all denied execute, so sandboxed code cannot drop a payload and run it.
+- **The working directory is the only writable place.** It is created for the sandbox and removed when the sandbox is dropped. Temporary files are directed into it through `TMPDIR` on Unix and `TEMP`/`TMP` on Windows, where an AppContainer is additionally given a private temporary directory of its own that nothing outside the container can read.
+- **Nothing writable is executable.** The working directory, configured writable paths and the shared temp directories are all denied execute, so sandboxed code cannot drop a payload and run it. Each backend spells that differently: SBPL and Landlock withhold execute directly, while on NTFS "run this file" and "enter this directory" are one bit, so directories and files are granted separately.
 - **Network access goes through a policy.** Under the default `DenyAll` no proxy exists and the kernel refuses outbound connections; any other policy routes every connection through a local proxy that applies the policy per request.
 - **Reads are opt-in above a baseline.** Configured paths are granted explicitly, and an explicit grant always beats a default protection.
-- **Resource limits apply to the whole process tree**, installed with `setrlimit` between fork and exec.
+- **Resource limits apply to the whole process tree**, installed with `setrlimit` between fork and exec on Unix, and carried by a job object on Windows.
 
 ### Isolation levels
 
