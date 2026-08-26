@@ -36,6 +36,19 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
 }
 
+/// The access control list Windows reports for a path, as the host sees it.
+///
+/// An AppContainer's reach is decided entirely by these entries, so when the
+/// container cannot read something the entries are the evidence: they say
+/// whether the grant landed on the directory and whether it reached the file.
+fn access_control_list(path: &std::path::Path) -> String {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .output()
+        .expect("icacls runs");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 /// A sandbox with the default, deny-everything configuration.
 async fn default_sandbox() -> Sandbox {
     Sandbox::with_config_and_executor(SandboxConfig::new(), executor_core::tokio::TokioGlobal)
@@ -123,8 +136,11 @@ async fn a_program_written_inside_the_sandbox_cannot_be_executed() {
     assert_eq!(
         stdout(&readable),
         "READABLE",
-        "the sandbox must be able to read a file staged in its working directory: {}",
-        stderr(&readable)
+        "the sandbox must be able to read a file staged in its working directory: {}\n\
+         working directory: {}\nstaged file: {}",
+        stderr(&readable),
+        access_control_list(sandbox.working_dir()),
+        access_control_list(&source),
     );
 
     let created = cmd(
