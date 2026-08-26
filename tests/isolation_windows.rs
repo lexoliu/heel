@@ -128,11 +128,10 @@ async fn a_program_written_inside_the_sandbox_cannot_be_executed() {
     // Each step is checked on its own: "access is denied" from `copy` does not
     // say whether the source could not be read or the destination could not be
     // written, and the difference decides what is actually enforced here.
-    let readable = cmd(
-        &sandbox,
-        "if exist source.exe (type source.exe >nul && echo READABLE) else (echo MISSING)",
-    )
-    .await;
+    // Kept to plain `&&` chains: `cmd.exe` mangles a parenthesised block inside
+    // a `/C "..."` string, and a probe that does not run says nothing about
+    // what the sandbox may do.
+    let readable = cmd(&sandbox, "type source.exe >nul && echo READABLE").await;
     assert_eq!(
         stdout(&readable),
         "READABLE",
@@ -143,11 +142,7 @@ async fn a_program_written_inside_the_sandbox_cannot_be_executed() {
         access_control_list(&source),
     );
 
-    let created = cmd(
-        &sandbox,
-        "echo placeholder> payload.exe && if exist payload.exe echo CREATED",
-    )
-    .await;
+    let created = cmd(&sandbox, "echo placeholder> payload.exe && echo CREATED").await;
     assert_eq!(
         stdout(&created),
         "CREATED",
@@ -159,7 +154,7 @@ async fn a_program_written_inside_the_sandbox_cannot_be_executed() {
     // a file created in the working directory inherits.
     let copied = cmd(
         &sandbox,
-        "copy /Y source.exe payload.exe >nul && if exist payload.exe echo COPIED",
+        "copy /Y source.exe payload.exe >nul && echo COPIED",
     )
     .await;
     assert_eq!(
