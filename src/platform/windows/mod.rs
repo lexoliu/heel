@@ -10,6 +10,7 @@
 //! `rappct`, which returns pipe handles rather than `std::process` streams,
 //! which is why [`crate::platform::child::Child`] is generic over its handle.
 
+mod acl;
 mod child;
 mod container;
 

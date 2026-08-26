@@ -12,44 +12,81 @@
 
 use std::path::Path;
 
-use rappct::acl::{AccessMask, ResourcePath};
 use rappct::capability::{SecurityCapabilities, SecurityCapabilitiesBuilder};
 use rappct::net::LoopbackExemptionGuard;
 use rappct::profile::AppContainerProfile;
 use rappct::sid::AppContainerSid;
 
+use windows::Win32::Storage::FileSystem::{
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
+};
+
+use super::acl::{self, Entry, Scope};
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 
 /// Capability that permits outbound connections.
 const INTERNET_CLIENT: &str = "internetClient";
 
-/// Traverse a directory.
+/// Read a file, or list a directory.
+const READ: u32 = FILE_GENERIC_READ.0;
+
+/// Write a file, or create entries in a directory.
+const WRITE: u32 = FILE_GENERIC_WRITE.0;
+
+/// Enter a directory. The same bit means "run" on a file, which is the whole
+/// reason directories and files are granted separately below.
+const TRAVERSE: u32 = FILE_TRAVERSE.0;
+
+/// Run a file.
+const EXECUTE: u32 = FILE_GENERIC_EXECUTE.0;
+
+/// What a directory tree the sandbox may write to is granted.
 ///
-/// Windows spells "enter this directory" and "run this file" with the same bit,
-/// so it has to be granted on directories -- a container that cannot traverse
-/// its own working directory cannot even be started there -- while being
-/// withheld from files, which is what keeps a dropped payload from running.
-const TRAVERSE: u32 = windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0;
+/// Directories carry traverse so the container can enter them; files do not
+/// carry execute, so nothing written there can be run. That split is the
+/// no-exec-where-you-can-write guarantee the other backends enforce, and
+/// `tests/isolation_windows.rs` asserts it.
+fn writable_tree() -> [Entry; 2] {
+    [
+        Entry {
+            access: READ | WRITE | TRAVERSE,
+            applies_to: Scope::Directories,
+        },
+        Entry {
+            access: READ | WRITE,
+            applies_to: Scope::Files,
+        },
+    ]
+}
 
-/// Read a file, but not run it.
-const FILE_READ: AccessMask = AccessMask::FILE_GENERIC_READ;
+/// What a directory tree the sandbox may only read is granted.
+fn readable_tree() -> [Entry; 2] {
+    [
+        Entry {
+            access: READ | TRAVERSE,
+            applies_to: Scope::Directories,
+        },
+        Entry {
+            access: READ,
+            applies_to: Scope::Files,
+        },
+    ]
+}
 
-/// Read and run a file.
-const FILE_READ_EXECUTE: AccessMask = AccessMask(
-    AccessMask::FILE_GENERIC_READ.0 | windows::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE.0,
-);
-
-/// Read and write a file, but not run it.
-const FILE_READ_WRITE: AccessMask =
-    AccessMask(AccessMask::FILE_GENERIC_READ.0 | AccessMask::FILE_GENERIC_WRITE.0);
-
-/// Enter and list a directory.
-const DIR_READ: AccessMask = AccessMask(AccessMask::FILE_GENERIC_READ.0 | TRAVERSE);
-
-/// Enter, list and write in a directory.
-const DIR_READ_WRITE: AccessMask =
-    AccessMask(AccessMask::FILE_GENERIC_READ.0 | AccessMask::FILE_GENERIC_WRITE.0 | TRAVERSE);
+/// What a directory tree the sandbox may run programs from is granted.
+fn executable_tree() -> [Entry; 2] {
+    [
+        Entry {
+            access: READ | TRAVERSE,
+            applies_to: Scope::Directories,
+        },
+        Entry {
+            access: READ | EXECUTE,
+            applies_to: Scope::Files,
+        },
+    ]
+}
 
 /// The AppContainer profile a sandbox's processes run in.
 ///
@@ -98,34 +135,42 @@ impl Container {
         // can enter by default. Each ancestor gets traverse and nothing else,
         // and the grant does not inherit, so their other children stay closed.
         self.grant_ancestors(config.working_dir())?;
-        self.grant(config.working_dir(), FILE_READ_WRITE, DIR_READ_WRITE)?;
+        self.grant(config.working_dir(), &writable_tree())?;
 
         for path in config.readable_paths() {
             self.grant_ancestors(path)?;
-            self.grant(path, FILE_READ, DIR_READ)?;
+            self.grant(path, &readable_tree())?;
         }
         for path in config.writable_paths() {
             self.grant_ancestors(path)?;
-            self.grant(path, FILE_READ_WRITE, DIR_READ_WRITE)?;
+            self.grant(path, &writable_tree())?;
         }
         for path in config.executable_paths() {
             self.grant_ancestors(path)?;
-            self.grant(path, FILE_READ_EXECUTE, DIR_READ)?;
+            self.grant(path, &executable_tree())?;
         }
 
         if let Some(python) = config.python() {
-            // A virtual environment is run from, and pip writes executables
-            // into it, so it is the one place that is both.
-            let (file, dir) = if python.allow_pip_install() {
-                (
-                    AccessMask(FILE_READ_WRITE.0 | FILE_READ_EXECUTE.0),
-                    DIR_READ_WRITE,
-                )
-            } else {
-                (FILE_READ_EXECUTE, DIR_READ)
-            };
+            // A virtual environment is run from, and pip writes executables into
+            // it, so it is the one place that is deliberately both.
             self.grant_ancestors(python.venv().path())?;
-            self.grant(python.venv().path(), file, dir)?;
+            if python.allow_pip_install() {
+                self.grant(
+                    python.venv().path(),
+                    &[
+                        Entry {
+                            access: READ | WRITE | TRAVERSE,
+                            applies_to: Scope::Directories,
+                        },
+                        Entry {
+                            access: READ | WRITE | EXECUTE,
+                            applies_to: Scope::Files,
+                        },
+                    ],
+                )?;
+            } else {
+                self.grant(python.venv().path(), &executable_tree())?;
+            }
         }
 
         Ok(())
@@ -139,7 +184,13 @@ impl Container {
             if ancestor.parent().is_none() || in_system_directory(ancestor) {
                 continue;
             }
-            self.grant_exactly(ancestor, AccessMask(TRAVERSE))?;
+            self.grant(
+                ancestor,
+                &[Entry {
+                    access: TRAVERSE,
+                    applies_to: Scope::ThisOnly,
+                }],
+            )?;
         }
         Ok(())
     }
@@ -158,39 +209,19 @@ impl Container {
             );
             return Ok(());
         }
-        self.grant(program, FILE_READ_EXECUTE, DIR_READ)
+        self.grant(
+            program,
+            &[Entry {
+                access: READ | EXECUTE,
+                applies_to: Scope::ThisOnly,
+            }],
+        )
     }
 
-    /// Grant access to a path and, for a directory, to what it contains.
-    ///
-    /// A directory grant is inherited by its children, and Windows applies one
-    /// mask to files and subdirectories alike, so `file` is what a directory's
-    /// contents end up with.
-    fn grant(&self, path: &Path, file: AccessMask, dir: AccessMask) -> Result<()> {
-        if !path.is_dir() {
-            return self.grant_exactly(path, file);
-        }
-
-        let target = ResourcePath::Directory(path.to_path_buf());
-        rappct::acl::grant_to_package(target, self.sid(), dir).map_err(|source| {
-            Error::path(
-                path,
-                std::io::Error::other(format!("ACL grant failed: {}", super::with_causes(&source))),
-            )
-        })
-    }
-
-    /// Grant access to exactly one path, with nothing inherited from it.
-    fn grant_exactly(&self, path: &Path, access: AccessMask) -> Result<()> {
-        // The `File` target is what carries no inheritance; it applies to a
-        // directory just as well, which is what an ancestor needs.
-        let target = ResourcePath::File(path.to_path_buf());
-        rappct::acl::grant_to_package(target, self.sid(), access).map_err(|source| {
-            Error::path(
-                path,
-                std::io::Error::other(format!("ACL grant failed: {}", super::with_causes(&source))),
-            )
-        })
+    /// Add entries to a path's access control list.
+    fn grant(&self, path: &Path, entries: &[Entry]) -> Result<()> {
+        acl::grant(path, self.sid().as_string(), entries)
+            .map_err(|source| Error::path(path, source))
     }
 
     /// The capabilities a process gets, given whether it may reach the network.
