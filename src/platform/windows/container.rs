@@ -110,7 +110,19 @@ impl Container {
     }
 
     /// Open a program to this container so that it can be read and run.
+    ///
+    /// Programs under the system directories are skipped: Windows already
+    /// grants every AppContainer read and execute on them, and their ACLs are
+    /// not ours to change, so asking would fail with access denied. Anything
+    /// outside them has to be granted, and failing there is a real error.
     pub(crate) fn grant_program(&self, program: &Path) -> Result<()> {
+        if in_system_directory(program) {
+            tracing::debug!(
+                program = %program.display(),
+                "program is already open to every AppContainer"
+            );
+            return Ok(());
+        }
         self.grant(program, READ_EXECUTE)
     }
 
@@ -163,6 +175,18 @@ impl Container {
             ))
         })
     }
+}
+
+/// Whether a path lives under a directory Windows opens to every package.
+///
+/// Compared case-insensitively, because Windows paths are, and the case a
+/// program is found under does not always match the environment variable.
+fn in_system_directory(path: &Path) -> bool {
+    let path = path.to_string_lossy().to_lowercase();
+    ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|variable| std::env::var(variable).ok())
+        .any(|root| path.starts_with(&root.to_lowercase()))
 }
 
 impl Drop for Container {

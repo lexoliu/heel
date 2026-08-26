@@ -260,9 +260,12 @@ mod tests {
         // unresolved path would silently match nothing.
         let path = std::env::temp_dir().join(generate_working_dir_name());
         let dir = WorkingDir::create(&path, true).expect("creates");
+        // Compared against the same canonicalization the type uses: on Windows
+        // `std::fs::canonicalize` adds the `\\?\` verbatim prefix that this
+        // deliberately avoids, so the two do not agree there.
         assert_eq!(
             dir.path(),
-            std::fs::canonicalize(dir.path()).expect("already canonical")
+            dunce::canonicalize(dir.path()).expect("already canonical")
         );
     }
 }
