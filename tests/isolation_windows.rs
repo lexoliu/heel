@@ -109,66 +109,50 @@ async fn a_program_written_inside_the_sandbox_cannot_be_executed() {
     // to sandboxed code. A real executable is required: `cmd.exe` interprets a
     // batch file after merely reading it, which execute rights do not govern.
     //
-    // The host stages the source inside the working directory because the
-    // container cannot read the system's own binaries, so copying one from
-    // System32 fails before it proves anything.
+    // The host stages the program because the container cannot read the
+    // system's own binaries, and writes it rather than copying it: `std::fs::copy`
+    // goes through CopyFileExW, which can carry the source's own permissions
+    // onto the destination instead of letting it inherit.
     let sandbox = default_sandbox().await;
+    let working_dir = sandbox.working_dir().to_path_buf();
 
-    // Written rather than copied: `std::fs::copy` goes through `CopyFileExW`,
-    // which can carry the source file's own security descriptor onto the
-    // destination, so the staged file would not pick up the entry the working
-    // directory grants the container. Writing the bytes creates an ordinary new
-    // file, which inherits.
     let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
     let program = std::fs::read(format!("{system_root}\\System32\\whoami.exe"))
         .expect("the host reads a program to stage");
-    let source = sandbox.working_dir().join("source.exe");
-    std::fs::write(&source, program).expect("the host stages an executable the sandbox can read");
+    std::fs::write(working_dir.join("source.exe"), program).expect("the host stages a program");
+    std::fs::write(working_dir.join("staged.txt"), "staged").expect("the host stages a file");
 
-    // Each step is checked on its own: "access is denied" from `copy` does not
-    // say whether the source could not be read or the destination could not be
-    // written, and the difference decides what is actually enforced here.
-    // Kept to plain `&&` chains: `cmd.exe` mangles a parenthesised block inside
-    // a `/C "..."` string, and a probe that does not run says nothing about
-    // what the sandbox may do.
-    let readable = cmd(&sandbox, "type source.exe >nul && echo READABLE").await;
+    // Every probe avoids redirection: what the sandbox may do is checked from
+    // the host afterwards, so a shell quirk cannot be mistaken for a denial.
+    let readable = cmd(&sandbox, "type staged.txt").await;
     assert_eq!(
         stdout(&readable),
-        "READABLE",
+        "staged",
         "the sandbox must be able to read a file staged in its working directory: {}\n\
          working directory: {}\nstaged file: {}",
         stderr(&readable),
-        access_control_list(sandbox.working_dir()),
-        access_control_list(&source),
-    );
-
-    let created = cmd(&sandbox, "echo placeholder> payload.exe && echo CREATED").await;
-    assert_eq!(
-        stdout(&created),
-        "CREATED",
-        "the sandbox must be able to create a file named like a program: {}",
-        stderr(&created)
+        access_control_list(&working_dir),
+        access_control_list(&working_dir.join("staged.txt")),
     );
 
     // The sandbox writes the payload itself, so what governs running it is what
     // a file created in the working directory inherits.
-    let copied = cmd(
-        &sandbox,
-        "copy /Y source.exe payload.exe >nul && echo COPIED",
-    )
-    .await;
-    assert_eq!(
-        stdout(&copied),
-        "COPIED",
-        "the sandbox must be able to write the payload, or running it proves nothing: {}",
-        stderr(&copied)
+    let copied = cmd(&sandbox, "copy /Y source.exe payload.exe").await;
+    let payload = working_dir.join("payload.exe");
+    assert!(
+        payload.is_file(),
+        "the sandbox must be able to write the payload, or running it proves \
+         nothing: {}\nworking directory: {}",
+        stderr(&copied),
+        access_control_list(&working_dir),
     );
 
     let ran = cmd(&sandbox, "payload.exe").await;
     assert!(
         !ran.status.success(),
-        "a program the sandbox wrote must not run, but it printed {:?}",
-        stdout(&ran)
+        "a program the sandbox wrote must not run, but it printed {:?}\npayload: {}",
+        stdout(&ran),
+        access_control_list(&payload),
     );
 }
 
