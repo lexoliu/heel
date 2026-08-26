@@ -1,17 +1,35 @@
-//! IPC router for dispatching commands
+//! Dispatch of IPC requests to registered command handlers.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::ipc::command::IpcCommand;
 use crate::ipc::protocol::IpcError;
 
-/// Type-erased handler function
-type ErasedHandler = Box<
-    dyn Fn(&[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, IpcError>> + Send>> + Send + Sync,
+/// A registered handler, erased so that commands of different types can share
+/// one dispatch table.
+type ErasedHandler = Arc<
+    dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, IpcError>> + Send>>
+        + Send
+        + Sync,
 >;
 
+/// How a command's arguments may be written on the sandbox command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandMeta {
+    /// Argument names that may be given positionally, in order.
+    pub positional_args: Cow<'static, [Cow<'static, str>]>,
+    /// Argument that receives piped standard input, if any.
+    pub stdin_arg: Option<Cow<'static, str>>,
+}
+
+/// Whether a name is usable as a command or argument name.
+///
+/// Names become file names and command-line flags, so they are restricted to a
+/// shape that needs no quoting anywhere it is used.
 fn is_valid_identifier(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {
@@ -28,71 +46,56 @@ fn assert_valid_identifier(kind: &str, value: &str) {
     );
 }
 
-/// Metadata about a registered command
-pub struct CommandMeta {
-    /// Positional argument names in order (e.g., ["query"] or ["subagent", "prompt"])
-    pub positional_args: Vec<String>,
-    /// Stdin argument name for piped input
-    pub stdin_arg: Option<String>,
-}
-
-/// Router that dispatches IPC requests to registered command handlers
+/// Routes IPC requests to registered [`IpcCommand`] handlers.
 ///
-/// The router stores type-erased handlers internally, but registration is type-safe
-/// via the `IpcCommand` trait.
+/// Registration is type-safe; dispatch is by name.
+#[derive(Default)]
 pub struct IpcRouter {
-    handlers: HashMap<String, ErasedHandler>,
-    metadata: HashMap<String, CommandMeta>,
+    handlers: BTreeMap<Cow<'static, str>, ErasedHandler>,
+    metadata: BTreeMap<Cow<'static, str>, CommandMeta>,
 }
 
 impl IpcRouter {
-    /// Create a new empty router
+    /// Create an empty router.
     pub fn new() -> Self {
-        Self {
-            handlers: HashMap::new(),
-            metadata: HashMap::new(),
-        }
+        Self::default()
     }
 
-    /// Register a command instance.
+    /// Register a command.
     ///
-    /// The command is cloned for each request, preserving any stateful data
-    /// (like registries, connections, etc.) while applying request arguments.
+    /// The command value is shared across requests, so handler state is set up
+    /// once rather than rebuilt per call.
     ///
-    /// # Example
+    /// # Panics
     ///
-    /// ```rust,ignore
-    /// let router = IpcRouter::new()
-    ///     .register(SearchCommand::new(api_key))
-    ///     .register(TasksCommand::new(registry));
-    /// ```
-    pub fn register<C: IpcCommand + Clone + Sync>(mut self, cmd: C) -> Self {
-        let name = cmd.name();
-        let positional_args = cmd.positional_args();
-        let stdin_arg = cmd.stdin_arg();
-        assert_valid_identifier("command name", &name);
-        let positional_args: Vec<String> =
-            positional_args.iter().map(|arg| arg.to_string()).collect();
-        for positional_arg in &positional_args {
-            assert_valid_identifier("positional argument name", positional_arg);
-        }
-        let stdin_arg = stdin_arg.map(|arg| arg.into_owned());
-        if let Some(ref stdin_arg) = stdin_arg {
-            assert_valid_identifier("stdin argument name", stdin_arg);
-        }
-        let method_name = name.clone();
+    /// Panics if the command's name or any of its argument names is not a valid
+    /// identifier, or if the name is already registered. Both are mistakes in
+    /// the program rather than runtime conditions, and both would otherwise
+    /// produce a broken wrapper script inside the sandbox.
+    pub fn register<C: IpcCommand>(mut self, command: C) -> Self {
+        let name = command.name();
+        let positional_args = command.positional_args();
+        let stdin_arg = command.stdin_arg();
 
-        // Clone the command for each request, preserving state
-        let handler: ErasedHandler = Box::new(move |params: &[u8]| {
-            let mut cmd = cmd.clone();
-            let params = params.to_vec();
-            let method_name = method_name.clone();
+        assert_valid_identifier("command name", &name);
+        for arg in positional_args.iter() {
+            assert_valid_identifier("positional argument name", arg);
+        }
+        if let Some(arg) = &stdin_arg {
+            assert_valid_identifier("stdin argument name", arg);
+        }
+        assert!(
+            !self.handlers.contains_key(&name),
+            "IPC command '{name}' is already registered"
+        );
+
+        let command = Arc::new(command);
+        let handler: ErasedHandler = Arc::new(move |params: Vec<u8>| {
+            let command = Arc::clone(&command);
             Box::pin(async move {
-                cmd.apply_args(&params)?;
-                cmd.set_method_name(&method_name);
-                let response = cmd.handle().await;
-                let bytes = rmp_serde::to_vec(&response)?;
-                Ok(bytes)
+                let args = rmp_serde::from_slice::<C::Args>(&params)?;
+                let response = command.handle(args).await;
+                Ok(rmp_serde::to_vec_named(&response)?)
             })
         });
 
@@ -107,10 +110,8 @@ impl IpcRouter {
         self
     }
 
-    /// Handle an incoming request
-    ///
-    /// This is called internally by the IPC server.
-    pub(crate) async fn handle(&self, method: &str, params: &[u8]) -> Result<Vec<u8>, IpcError> {
+    /// Dispatch one request. Called by the IPC server.
+    pub(crate) async fn handle(&self, method: &str, params: Vec<u8>) -> Result<Vec<u8>, IpcError> {
         let handler = self
             .handlers
             .get(method)
@@ -119,97 +120,164 @@ impl IpcRouter {
         handler(params).await
     }
 
-    /// Get the list of registered method names with their metadata
+    /// The registered commands and how their arguments may be written.
     pub fn methods(&self) -> impl Iterator<Item = (&str, &CommandMeta)> {
-        self.metadata.iter().map(|(k, v)| (k.as_str(), v))
+        self.metadata
+            .iter()
+            .map(|(name, meta)| (name.as_ref(), meta))
     }
 }
 
-impl Default for IpcRouter {
-    fn default() -> Self {
-        Self::new()
+impl std::fmt::Debug for IpcRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpcRouter")
+            .field("commands", &self.metadata.keys().collect::<Vec<_>>())
+            .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::NoArgs;
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct TestCommand {
+    struct Doubler;
+
+    #[derive(Deserialize)]
+    struct DoublerArgs {
         value: i32,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct TestResponse {
+    struct DoublerResponse {
         doubled: i32,
     }
 
-    impl IpcCommand for TestCommand {
-        type Response = TestResponse;
-
-        fn name(&self) -> String {
-            "test".to_string()
+    impl IpcCommand for Doubler {
+        fn name(&self) -> Cow<'static, str> {
+            "double".into()
+        }
+        fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+            Cow::Borrowed(&[Cow::Borrowed("value")])
         }
 
-        fn apply_args(&mut self, params: &[u8]) -> Result<(), rmp_serde::decode::Error> {
-            *self = rmp_serde::from_slice(params)?;
-            Ok(())
-        }
+        type Args = DoublerArgs;
+        type Response = DoublerResponse;
 
-        async fn handle(&mut self) -> TestResponse {
-            TestResponse {
-                doubled: self.value * 2,
+        async fn handle(&self, args: DoublerArgs) -> DoublerResponse {
+            DoublerResponse {
+                doubled: args.value * 2,
             }
         }
     }
 
+    /// A command whose handler keeps state across requests.
+    struct Counter {
+        greeting: String,
+    }
+
+    #[derive(Deserialize)]
+    struct CounterArgs {
+        name: String,
+    }
+
+    impl IpcCommand for Counter {
+        fn name(&self) -> Cow<'static, str> {
+            "greet".into()
+        }
+
+        type Args = CounterArgs;
+        type Response = String;
+
+        async fn handle(&self, args: CounterArgs) -> String {
+            format!("{}, {}!", self.greeting, args.name)
+        }
+    }
+
     #[test]
-    fn test_router_dispatch() {
+    fn dispatches_to_the_registered_handler() {
         smol::block_on(async {
-            let router = IpcRouter::new().register(TestCommand { value: 0 });
+            let router = IpcRouter::new().register(Doubler);
+            let params = rmp_serde::to_vec_named(&serde_json::json!({ "value": 21 })).unwrap();
 
-            let cmd = TestCommand { value: 21 };
-            let params = rmp_serde::to_vec(&cmd).unwrap();
+            let response = router.handle("double", params).await.unwrap();
+            let response: DoublerResponse = rmp_serde::from_slice(&response).unwrap();
 
-            let response_bytes = router.handle("test", &params).await.unwrap();
-            let response: TestResponse = rmp_serde::from_slice(&response_bytes).unwrap();
-
-            assert_eq!(response, TestResponse { doubled: 42 });
+            assert_eq!(response, DoublerResponse { doubled: 42 });
         });
     }
 
     #[test]
-    fn test_router_unknown_method() {
+    fn handler_state_is_shared_across_requests() {
+        smol::block_on(async {
+            let router = IpcRouter::new().register(Counter {
+                greeting: "Hello".to_string(),
+            });
+
+            for name in ["ada", "grace"] {
+                let params = rmp_serde::to_vec_named(&serde_json::json!({ "name": name })).unwrap();
+                let response = router.handle("greet", params).await.unwrap();
+                let response: String = rmp_serde::from_slice(&response).unwrap();
+                assert_eq!(response, format!("Hello, {name}!"));
+            }
+        });
+    }
+
+    #[test]
+    fn unknown_methods_are_reported() {
         smol::block_on(async {
             let router = IpcRouter::new();
-
-            let result = router.handle("unknown", &[]).await;
+            let result = router.handle("unknown", Vec::new()).await;
             assert!(matches!(result, Err(IpcError::UnknownMethod(_))));
         });
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct InvalidNameCommand;
+    #[test]
+    fn malformed_arguments_are_reported() {
+        smol::block_on(async {
+            let router = IpcRouter::new().register(Doubler);
+            let params = rmp_serde::to_vec_named(&serde_json::json!({ "wrong": 1 })).unwrap();
+            let result = router.handle("double", params).await;
+            assert!(matches!(result, Err(IpcError::Deserialization(_))));
+        });
+    }
 
-    impl IpcCommand for InvalidNameCommand {
+    #[test]
+    fn metadata_comes_from_the_command_type() {
+        let router = IpcRouter::new().register(Doubler);
+        let methods: Vec<_> = router.methods().collect();
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].0, "double");
+        assert_eq!(
+            methods[0].1.positional_args.as_ref(),
+            &[Cow::Borrowed("value")]
+        );
+        assert_eq!(methods[0].1.stdin_arg, None);
+    }
+
+    struct BadName;
+
+    impl IpcCommand for BadName {
+        fn name(&self) -> Cow<'static, str> {
+            "bad/name".into()
+        }
+
+        type Args = NoArgs;
         type Response = ();
 
-        fn name(&self) -> String {
-            "bad/name".to_string()
-        }
-
-        fn apply_args(&mut self, _params: &[u8]) -> Result<(), rmp_serde::decode::Error> {
-            Ok(())
-        }
-
-        async fn handle(&mut self) -> Self::Response {}
+        async fn handle(&self, _args: NoArgs) {}
     }
 
     #[test]
     #[should_panic(expected = "invalid IPC command name")]
-    fn test_router_rejects_invalid_command_name() {
-        let _ = IpcRouter::new().register(InvalidNameCommand);
+    fn invalid_command_names_are_rejected() {
+        let _ = IpcRouter::new().register(BadName);
+    }
+
+    #[test]
+    #[should_panic(expected = "already registered")]
+    fn duplicate_registration_is_rejected() {
+        let _ = IpcRouter::new().register(Doubler).register(Doubler);
     }
 }

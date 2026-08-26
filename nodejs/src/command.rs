@@ -29,20 +29,25 @@ impl From<StdioConfigJs> for heel::StdioConfig {
     }
 }
 
-/// Process exit status
+/// How a process exited.
 #[napi(object)]
 #[derive(Clone)]
 pub struct ExitStatusJs {
+    /// Whether the process exited with a success status.
     pub success: bool,
+    /// The exit code, or `null` when a signal ended the process.
     pub code: Option<i32>,
 }
 
-/// Process output with stdout and stderr
+/// A finished process and everything it wrote.
 #[napi(object)]
 pub struct ProcessOutputJs {
+    /// How the process exited.
     pub status: ExitStatusJs,
+    /// Everything the process wrote to standard output.
     #[napi(ts_type = "Buffer")]
     pub stdout: Buffer,
+    /// Everything the process wrote to standard error.
     #[napi(ts_type = "Buffer")]
     pub stderr: Buffer,
 }
@@ -158,7 +163,7 @@ impl Command {
             .as_ref()
             .ok_or_else(|| Error::from_reason("Sandbox already disposed"))?;
 
-        let mut cmd = sandbox.sandbox.command(&self.program);
+        let mut cmd = sandbox.command(self.program.clone());
 
         // Apply configuration
         cmd = cmd.args(&self.args);
@@ -185,7 +190,7 @@ impl Command {
             .as_ref()
             .ok_or_else(|| Error::from_reason("Sandbox already disposed"))?;
 
-        let mut cmd = sandbox.sandbox.command(&self.program);
+        let mut cmd = sandbox.command(self.program.clone());
 
         // Apply configuration
         cmd = cmd.args(&self.args);
@@ -215,7 +220,7 @@ impl Command {
             .as_ref()
             .ok_or_else(|| Error::from_reason("Sandbox already disposed"))?;
 
-        let mut cmd = sandbox.sandbox.command(&self.program);
+        let mut cmd = sandbox.command(self.program.clone());
 
         // Apply configuration
         cmd = cmd.args(&self.args);

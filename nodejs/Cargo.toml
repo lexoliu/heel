@@ -9,6 +9,9 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # Core heel library
 heel = { path = ".." }
@@ -26,18 +29,6 @@ napi-derive = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 executor-core = { version = "0.7", features = ["tokio"] }
 
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Error handling
-thiserror = "2"
-
 [build-dependencies]
 napi-build = "2"
 
-[profile.release]
-lto = true
-strip = "symbols"
-[package.metadata.cargo-machete]
-ignored = ["serde", "serde_json", "thiserror", "tracing"]

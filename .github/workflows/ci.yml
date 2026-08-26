@@ -10,6 +10,10 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  # A push whose webhook is dropped -- during a GitHub incident, say -- leaves a
+  # commit with no run and no way to ask for one. This makes CI startable by
+  # hand for any ref.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}

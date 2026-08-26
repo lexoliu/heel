@@ -1,46 +1,32 @@
-use std::future::Future;
-use std::process::{Output, Stdio};
+//! Windows backend.
+//!
+//! AppContainer support is not implemented yet. Construction fails rather than
+//! returning a backend whose every call errors: a sandbox that cannot isolate
+//! must not look like one that can.
 
-use crate::config::SandboxConfigData;
+use std::process::Output;
+
 use crate::error::{Error, Result};
-use crate::platform::{Backend, Child};
+use crate::platform::{Backend, Child, SpawnRequest};
 
-pub struct WindowsBackend;
+/// Windows sandbox backend.
+pub struct WindowsBackend {
+    _private: (),
+}
 
 impl WindowsBackend {
+    /// Fails until AppContainer support is implemented.
     pub fn new() -> Result<Self> {
-        Ok(Self)
+        Err(Error::UnsupportedPlatform)
     }
 }
 
 impl Backend for WindowsBackend {
-    fn execute(
-        &self,
-        _config: &SandboxConfigData,
-        _proxy_port: u16,
-        _program: &str,
-        _args: &[String],
-        _envs: &[(String, String)],
-        _current_dir: Option<&std::path::Path>,
-        _stdin: Stdio,
-        _stdout: Stdio,
-        _stderr: Stdio,
-    ) -> impl Future<Output = Result<Output>> + Send {
-        async { Err(Error::UnsupportedPlatform) }
+    async fn execute(&self, _request: SpawnRequest<'_>) -> Result<Output> {
+        Err(Error::UnsupportedPlatform)
     }
 
-    fn spawn(
-        &self,
-        _config: &SandboxConfigData,
-        _proxy_port: u16,
-        _program: &str,
-        _args: &[String],
-        _envs: &[(String, String)],
-        _current_dir: Option<&std::path::Path>,
-        _stdin: Stdio,
-        _stdout: Stdio,
-        _stderr: Stdio,
-    ) -> impl Future<Output = Result<Child>> + Send {
-        async { Err(Error::UnsupportedPlatform) }
+    async fn spawn(&self, _request: SpawnRequest<'_>) -> Result<Child> {
+        Err(Error::UnsupportedPlatform)
     }
 }

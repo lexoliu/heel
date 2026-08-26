@@ -13,10 +13,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # ubuntu-24.04 ships a kernel with Landlock ABI v4, which the Linux
+        # backend requires.
         os: [ubuntu-24.04, windows-latest, macos-latest]
-        include:
-          - os: ubuntu-24.04
-            is_linux: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -27,20 +26,11 @@ jobs:
       - name: Build
         run: cargo build --verbose --all-features
 
-      - name: System Environment Check (Linux)
-        if: matrix.is_linux
-        run: |
-          echo "=== Running System Check ==="
-          cargo run --example system_check
-
-      - name: Run unit tests
+      # The isolation suite runs real programs in real sandboxes and asserts
+      # that forbidden operations fail, so it is the check that matters most
+      # here; it is part of `cargo test` rather than a separate example.
+      - name: Test
         run: cargo test --verbose --all-features
 
-      - name: Run security test (Linux)
-        if: matrix.is_linux
-        run: cargo run --example security_test
-        continue-on-error: true
-
-      - name: Test sandbox isolation (Linux)
-        if: matrix.is_linux
-        run: cargo run --example debug_sandbox
+      - name: Examples build
+        run: cargo build --examples --all-features

@@ -1,42 +1,66 @@
-//! Inter-Process Communication (IPC) for sandbox
+//! Inter-process communication between sandboxed processes and the host.
 //!
-//! This module provides type-safe IPC between sandboxed processes and the host.
-//! Communication happens over loopback TCP using MessagePack serialization.
+//! Sandboxed code cannot reach the network or the host filesystem, but it often
+//! needs a narrow, audited escape hatch: a search API, a task registry, a
+//! secret it must never see the value of. IPC provides exactly that. The host
+//! registers typed commands; the sandbox sees them as ordinary executables on
+//! its `PATH`.
+//!
+//! Transport is a Unix domain socket inside the sandbox working directory,
+//! created with owner-only permissions. Messages are MessagePack.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use serde::{Serialize, Deserialize};
+//! use serde::Deserialize;
 //! use heel::ipc::{IpcCommand, IpcRouter};
 //!
-//! #[derive(Serialize, Deserialize, Default)]
-//! struct WebSearch { query: String }
+//! struct WebSearch {
+//!     client: SearchClient,
+//! }
 //!
-//! #[derive(Serialize, Deserialize)]
-//! struct WebSearchResult { items: Vec<String> }
+//! #[derive(Deserialize)]
+//! struct WebSearchArgs {
+//!     query: String,
+//! }
 //!
 //! impl IpcCommand for WebSearch {
-//!     type Response = WebSearchResult;
+//!     fn name(&self) -> Cow<'static, str> {
+//!         "web_search".into()
+//!     }
 //!
-//!     fn name(&self) -> String { "web_search".to_string() }
+//!     fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+//!         Cow::Borrowed(&[Cow::Borrowed("query")])
+//!     }
 //!
-//!     async fn handle(&mut self) -> WebSearchResult {
-//!         WebSearchResult { items: do_search(&self.query).await }
+//!     type Args = WebSearchArgs;
+//!     type Response = Vec<String>;
+//!
+//!     async fn handle(&self, args: WebSearchArgs) -> Vec<String> {
+//!         self.client.search(&args.query).await
 //!     }
 //! }
 //!
-//! let router = IpcRouter::new()
-//!     .register(WebSearch::default());
+//! let router = IpcRouter::new().register(WebSearch { client });
 //! ```
+//!
+//! Inside the sandbox, `web_search "rust sandboxing"` then reaches the host
+//! handler with `query` populated.
 
+mod client;
 mod command;
+mod endpoint;
 mod protocol;
 mod router;
 pub(crate) mod server;
+mod wrappers;
 
-pub use command::IpcCommand;
+pub use client::IpcClient;
+pub use command::{IpcCommand, NoArgs};
 pub use protocol::IpcError;
 pub use router::{CommandMeta, IpcRouter};
+pub use wrappers::{HEEL_DIR_NAME, SOCKET_NAME, WRAPPER_DIR_NAME};
 
-// IpcServer is internal - used by Sandbox, not exposed to users
+// Internal to the sandbox lifecycle, not part of the public surface.
 pub(crate) use server::IpcServer;
+pub(crate) use wrappers::{IpcLayout, socket_root};

@@ -1,14 +1,15 @@
-//! Working directory management for sandbox
+//! Working directory management for the sandbox.
 //!
-//! The sandbox operates within a dedicated working directory where it can
-//! freely read and write files. By default, a random directory name is
-//! generated using four English words connected by hyphens.
+//! The sandbox operates within a dedicated working directory it may freely read
+//! and write. By default the directory is generated under the system temporary
+//! directory from four English words plus a random suffix, and it is removed
+//! when the sandbox is dropped.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-/// Word list for generating random directory names
+/// Word list for generating readable directory names.
 const WORDS: &[&str] = &[
     "apple", "banana", "cherry", "dragon", "eagle", "falcon", "garden", "harbor", "island",
     "jungle", "kitten", "lemon", "mango", "night", "ocean", "planet", "queen", "river", "silver",
@@ -23,130 +24,123 @@ const WORDS: &[&str] = &[
     "wave", "azure", "breeze",
 ];
 
-/// Working directory for the sandbox
-#[derive(Debug, Clone)]
+/// Generate a directory name of four words and a random suffix.
+///
+/// The suffix makes collisions between concurrent sandboxes effectively
+/// impossible, which is what lets configuration building stay free of I/O.
+pub(crate) fn generate_working_dir_name() -> String {
+    use rand::Rng;
+    use rand::seq::SliceRandom;
+
+    let mut rng = rand::thread_rng();
+    let words: Vec<&str> = WORDS.choose_multiple(&mut rng, 4).copied().collect();
+    let suffix: u32 = rng.r#gen();
+
+    format!("heel-{}-{suffix:08x}", words.join("-"))
+}
+
+/// Generate a short directory name for an IPC socket.
+///
+/// Unix socket paths are limited to about a hundred bytes, so this stays terse
+/// where the working directory name can afford to be readable.
+pub(crate) fn generate_socket_dir_name() -> String {
+    use rand::Rng;
+
+    format!("heel-{:08x}", rand::thread_rng().r#gen::<u32>())
+}
+
+/// A sandbox working directory that cleans itself up when dropped.
+#[derive(Debug)]
 pub struct WorkingDir {
     path: PathBuf,
-    auto_created: bool,
+    remove_on_drop: bool,
 }
 
 impl WorkingDir {
-    /// Create a working directory at the specified path
+    /// Create the working directory and canonicalize its path.
     ///
-    /// The directory will be created if it doesn't exist.
-    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-
-        let auto_created = if !path.exists() {
-            std::fs::create_dir_all(&path).map_err(|e| {
-                Error::IoError(format!("Failed to create working directory: {}", e))
+    /// Canonicalization is required, not cosmetic: macOS sandbox profiles match
+    /// against resolved paths, so a rule naming `/tmp/x` never matches the
+    /// kernel's `/private/tmp/x`.
+    ///
+    /// `auto` marks a generated directory, which is removed on drop and must
+    /// not already exist. A caller-supplied directory is created if missing and
+    /// always preserved.
+    pub(crate) fn create(path: &Path, auto: bool) -> Result<Self> {
+        if auto {
+            std::fs::create_dir_all(path).map_err(|error| Error::WorkingDir {
+                path: path.to_path_buf(),
+                source: error,
+            })?;
+            // A directory the sandbox created for itself holds the sandboxed
+            // process's files and, for IPC, its socket. Neither is anyone
+            // else's business, and a shared temp root is world-readable by
+            // default.
+            restrict_to_owner(path)?;
+        } else if !path.exists() {
+            std::fs::create_dir_all(path).map_err(|error| Error::WorkingDir {
+                path: path.to_path_buf(),
+                source: error,
             })?;
             tracing::debug!(path = %path.display(), "created working directory");
-            true
-        } else {
-            false
-        };
-
-        Ok(Self { path, auto_created })
-    }
-
-    /// Create a working directory with a random name in the current directory
-    ///
-    /// The name is generated using four random English words connected by hyphens,
-    /// e.g., `./amber-forest-thunder-pearl`
-    pub fn random() -> Result<Self> {
-        let current_dir = std::env::current_dir().map_err(|e| Error::IoError(e.to_string()))?;
-        Self::random_in(&current_dir)
-    }
-
-    /// Create a working directory with a random name in the specified parent directory
-    ///
-    /// Will retry with different names if the generated path already exists.
-    pub fn random_in(parent: impl AsRef<Path>) -> Result<Self> {
-        let parent = parent.as_ref();
-        const MAX_ATTEMPTS: usize = 10;
-
-        for attempt in 0..MAX_ATTEMPTS {
-            let name = generate_random_name();
-            let path = parent.join(&name);
-
-            if !path.exists() {
-                tracing::debug!(name = %name, "generated random working directory name");
-                return Self::new(path);
-            }
-
-            tracing::debug!(
-                name = %name,
-                attempt = attempt + 1,
-                "working directory already exists, retrying"
-            );
         }
 
-        Err(Error::IoError(format!(
-            "Failed to generate unique working directory name after {} attempts",
-            MAX_ATTEMPTS
-        )))
+        let canonical = std::fs::canonicalize(path).map_err(|error| Error::WorkingDir {
+            path: path.to_path_buf(),
+            source: error,
+        })?;
+
+        tracing::debug!(path = %canonical.display(), auto, "working directory ready");
+
+        Ok(Self {
+            path: canonical,
+            remove_on_drop: auto,
+        })
     }
 
-    /// Get the path to the working directory
+    /// Create a working directory with a generated name inside `parent`.
+    ///
+    /// For hosts that manage their own sandbox roots rather than letting the
+    /// configuration pick one. The generated name carries a random suffix, so
+    /// this needs no collision retry, and the directory is removed when the
+    /// returned value is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created, restricted to its
+    /// owner, or canonicalized.
+    pub fn random_in(parent: impl AsRef<Path>) -> Result<Self> {
+        Self::create(&parent.as_ref().join(generate_working_dir_name()), true)
+    }
+
+    /// The canonical path of the working directory.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Check if the directory was auto-created
-    pub fn auto_created(&self) -> bool {
-        self.auto_created
+    /// Preserve the directory instead of removing it when the sandbox drops.
+    pub(crate) fn keep(&mut self) {
+        self.remove_on_drop = false;
     }
+}
 
-    /// Get the directory name (last component of the path)
-    pub fn name(&self) -> Option<&str> {
-        self.path.file_name().and_then(|s| s.to_str())
-    }
+/// Restrict a directory to its owner.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
 
-    /// Get metadata/stats for the working directory
-    pub fn stat(&self) -> Result<std::fs::Metadata> {
-        std::fs::metadata(&self.path)
-            .map_err(|e| Error::IoError(format!("Failed to stat working directory: {}", e)))
-    }
-
-    /// Get the size of the working directory in bytes
-    ///
-    /// This recursively calculates the total size of all files.
-    pub fn size(&self) -> Result<u64> {
-        fn dir_size(path: &Path) -> std::io::Result<u64> {
-            let mut size = 0;
-            if path.is_dir() {
-                for entry in std::fs::read_dir(path)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.is_dir() {
-                        size += dir_size(&path)?;
-                    } else {
-                        size += entry.metadata()?.len();
-                    }
-                }
-            }
-            Ok(size)
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
+        Error::WorkingDir {
+            path: path.to_path_buf(),
+            source: error,
         }
+    })
+}
 
-        dir_size(&self.path)
-            .map_err(|e| Error::IoError(format!("Failed to calculate directory size: {}", e)))
-    }
-
-    /// Remove the working directory and all its contents
-    pub fn remove(self) -> Result<()> {
-        remove_dir_all::remove_dir_all(&self.path)
-            .map_err(|e| Error::IoError(format!("Failed to remove working directory: {}", e)))?;
-        tracing::debug!(path = %self.path.display(), "removed working directory");
-        Ok(())
-    }
-
-    /// Check if the working directory is empty
-    pub fn is_empty(&self) -> Result<bool> {
-        let mut entries = std::fs::read_dir(&self.path)
-            .map_err(|e| Error::IoError(format!("Failed to read working directory: {}", e)))?;
-        Ok(entries.next().is_none())
-    }
+/// Restrict a directory to its owner.
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 impl AsRef<Path> for WorkingDir {
@@ -155,15 +149,22 @@ impl AsRef<Path> for WorkingDir {
     }
 }
 
-/// Generate a random name with four words connected by hyphens
-fn generate_random_name() -> String {
-    use rand::seq::SliceRandom;
-    use rand::thread_rng;
+impl Drop for WorkingDir {
+    fn drop(&mut self) {
+        if !self.remove_on_drop {
+            tracing::debug!(path = %self.path.display(), "keeping working directory");
+            return;
+        }
 
-    let mut rng = thread_rng();
-    let words: Vec<&str> = WORDS.choose_multiple(&mut rng, 4).copied().collect();
-
-    words.join("-")
+        match remove_dir_all::remove_dir_all(&self.path) {
+            Ok(()) => tracing::debug!(path = %self.path.display(), "removed working directory"),
+            Err(error) => tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "failed to remove working directory"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,45 +172,95 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_random_name() {
-        let name = generate_random_name();
-        let parts: Vec<&str> = name.split('-').collect();
-        assert_eq!(parts.len(), 4);
-        for part in parts {
-            assert!(WORDS.contains(&part));
+    fn generated_names_use_four_words_and_a_suffix() {
+        let name = generate_working_dir_name();
+        let rest = name.strip_prefix("heel-").expect("names are prefixed");
+        let parts: Vec<&str> = rest.split('-').collect();
+        assert_eq!(parts.len(), 5, "four words plus a suffix: {name}");
+        for word in &parts[..4] {
+            assert!(WORDS.contains(word), "unexpected word {word} in {name}");
         }
+        assert_eq!(parts[4].len(), 8, "suffix is eight hex digits: {name}");
     }
 
     #[test]
-    fn test_random_names_are_unique() {
+    fn socket_directory_names_are_short_and_unique() {
+        let name = generate_socket_dir_name();
+        assert!(name.len() <= 13, "{name} is too long for a socket path");
+
         let mut names = std::collections::HashSet::new();
-        for _ in 0..100 {
-            let name = generate_random_name();
-            names.insert(name);
+        for _ in 0..1000 {
+            names.insert(generate_socket_dir_name());
         }
-        // With 96 words and 4 choices, collision is extremely unlikely
-        assert!(names.len() >= 99, "Too many collisions in random names");
+        assert!(names.len() > 990, "too many collisions");
     }
 
     #[test]
-    fn test_working_dir_in_temp() {
-        let temp_dir = std::env::temp_dir();
-        let work_dir = WorkingDir::random_in(&temp_dir).unwrap();
-
-        assert!(work_dir.path().exists());
-        assert!(work_dir.path().starts_with(&temp_dir));
-        assert!(work_dir.auto_created());
-
-        // Cleanup
-        std::fs::remove_dir(work_dir.path()).ok();
+    fn generated_names_do_not_collide() {
+        let mut names = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(
+                names.insert(generate_working_dir_name()),
+                "generated a duplicate name"
+            );
+        }
     }
 
     #[test]
-    fn test_working_dir_existing() {
-        let temp_dir = std::env::temp_dir();
-        let work_dir = WorkingDir::new(&temp_dir).unwrap();
+    fn auto_directories_are_removed_on_drop() {
+        let path = std::env::temp_dir().join(generate_working_dir_name());
+        let dir = WorkingDir::create(&path, true).expect("creates");
+        let canonical = dir.path().to_path_buf();
+        assert!(canonical.exists());
+        drop(dir);
+        assert!(!canonical.exists());
+    }
 
-        assert!(!work_dir.auto_created());
-        assert_eq!(work_dir.path(), temp_dir);
+    #[test]
+    fn kept_directories_survive_drop() {
+        let path = std::env::temp_dir().join(generate_working_dir_name());
+        let mut dir = WorkingDir::create(&path, true).expect("creates");
+        dir.keep();
+        let canonical = dir.path().to_path_buf();
+        drop(dir);
+        assert!(canonical.exists());
+        std::fs::remove_dir_all(&canonical).ok();
+    }
+
+    #[test]
+    fn supplied_directories_are_preserved() {
+        let path = std::env::temp_dir().join(generate_working_dir_name());
+        std::fs::create_dir_all(&path).expect("creates");
+        let dir = WorkingDir::create(&path, false).expect("opens");
+        let canonical = dir.path().to_path_buf();
+        drop(dir);
+        assert!(canonical.exists());
+        std::fs::remove_dir_all(&canonical).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(generate_working_dir_name());
+        let dir = WorkingDir::create(&path, true).expect("creates");
+        let mode = std::fs::metadata(dir.path())
+            .expect("exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "a generated directory must be private");
+    }
+
+    #[test]
+    fn paths_are_canonicalized() {
+        // The system temp dir is a symlink on macOS; a profile built from the
+        // unresolved path would silently match nothing.
+        let path = std::env::temp_dir().join(generate_working_dir_name());
+        let dir = WorkingDir::create(&path, true).expect("creates");
+        assert_eq!(
+            dir.path(),
+            std::fs::canonicalize(dir.path()).expect("already canonical")
+        );
     }
 }

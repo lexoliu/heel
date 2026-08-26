@@ -1,4 +1,4 @@
-extern crate napi_build;
+//! Build script for the NAPI bindings.
 
 fn main() {
     napi_build::setup();

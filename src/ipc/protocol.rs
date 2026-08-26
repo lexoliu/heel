@@ -1,169 +1,153 @@
-//! Wire protocol types for IPC
-#![allow(dead_code)]
-
-//! Wire format:
-//! ```text
-//! Request:
-//!   [4 bytes: total length (u32 BE)]
-//!   [1 byte: method length (u8)]
-//!   [method bytes (UTF-8)]
-//!   [params bytes (MessagePack)]
+//! Wire protocol for IPC between a sandboxed process and the host.
 //!
-//! Response:
-//!   [4 bytes: total length (u32 BE)]
-//!   [1 byte: success flag (0 or 1)]
-//!   [payload bytes (MessagePack result or error string)]
+//! Both directions are length-prefixed frames carrying MessagePack:
+//!
+//! ```text
+//! Request:  [u32 BE body length][u8 method length][method UTF-8][params MessagePack]
+//! Response: [u32 BE body length][u8 success flag][payload MessagePack]
 //! ```
+//!
+//! On success the payload is the command's response; on failure it is a
+//! MessagePack string describing the error.
 
 use std::io;
 
-use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-/// Errors that can occur during IPC operations
+/// Largest frame either side will read, to bound the memory one request can
+/// make the peer allocate.
+pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Errors raised while serving or issuing an IPC request.
 #[derive(Debug, Error)]
 pub enum IpcError {
-    #[error("IPC not enabled")]
-    NotEnabled,
-
+    /// The requested method is not registered.
     #[error("unknown method: {0}")]
     UnknownMethod(String),
 
+    /// A response could not be encoded.
     #[error("serialization error: {0}")]
     Serialization(#[from] rmp_serde::encode::Error),
 
+    /// Request arguments could not be decoded.
     #[error("deserialization error: {0}")]
     Deserialization(#[from] rmp_serde::decode::Error),
 
+    /// The transport failed.
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
+    /// The peer sent something that is not a valid frame.
     #[error("invalid protocol: {0}")]
     InvalidProtocol(String),
 
-    #[error("handler error: {0}")]
-    Handler(String),
+    /// The host handler reported a failure.
+    #[error("{0}")]
+    Remote(String),
 }
 
-/// Request parsed from wire format
-#[derive(Debug)]
-pub struct IpcRequest {
-    /// Method name
+/// A decoded request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct IpcRequest {
+    /// Method name.
     pub method: String,
-    /// Raw MessagePack params (not yet deserialized)
+    /// MessagePack-encoded arguments.
     pub params: Vec<u8>,
 }
 
 impl IpcRequest {
-    /// Parse a request from raw bytes
-    ///
-    /// Format: [method_len: u8][method: bytes][params: bytes]
-    pub fn from_bytes(data: &[u8]) -> Result<Self, IpcError> {
-        if data.is_empty() {
-            return Err(IpcError::InvalidProtocol("empty request".to_string()));
-        }
+    /// Decode a request body, excluding the length prefix.
+    pub(crate) fn decode(body: &[u8]) -> Result<Self, IpcError> {
+        let (&method_len, rest) = body
+            .split_first()
+            .ok_or_else(|| IpcError::InvalidProtocol("empty request".to_string()))?;
+        let method_len = usize::from(method_len);
 
-        let method_len = data[0] as usize;
-        if data.len() < 1 + method_len {
+        if rest.len() < method_len {
             return Err(IpcError::InvalidProtocol("truncated method".to_string()));
         }
+        let (method, params) = rest.split_at(method_len);
 
-        let method = String::from_utf8(data[1..1 + method_len].to_vec())
-            .map_err(|e| IpcError::InvalidProtocol(format!("invalid method UTF-8: {e}")))?;
+        let method = std::str::from_utf8(method)
+            .map_err(|e| IpcError::InvalidProtocol(format!("invalid method UTF-8: {e}")))?
+            .to_string();
 
-        let params = data[1 + method_len..].to_vec();
-
-        Ok(Self { method, params })
+        Ok(Self {
+            method,
+            params: params.to_vec(),
+        })
     }
 
-    /// Serialize a request to wire format
-    pub fn to_bytes<T: Serialize>(method: &str, params: &T) -> Result<Vec<u8>, IpcError> {
-        let method_bytes = method.as_bytes();
-        if method_bytes.len() > 255 {
-            return Err(IpcError::InvalidProtocol(
-                "method name too long".to_string(),
-            ));
+    /// Encode a request frame, including the length prefix.
+    pub(crate) fn encode(method: &str, params: &[u8]) -> Result<Vec<u8>, IpcError> {
+        let method = method.as_bytes();
+        let method_len = u8::try_from(method.len())
+            .map_err(|_| IpcError::InvalidProtocol("method name too long".to_string()))?;
+
+        let body_len = 1 + method.len() + params.len();
+        if body_len > MAX_FRAME_BYTES {
+            return Err(IpcError::InvalidProtocol(format!(
+                "request of {body_len} bytes exceeds the {MAX_FRAME_BYTES} byte limit"
+            )));
         }
 
-        let params_bytes = rmp_serde::to_vec(params)?;
-
-        let total_len = 1 + method_bytes.len() + params_bytes.len();
-        let mut buf = Vec::with_capacity(4 + total_len);
-
-        // Total length (u32 BE)
-        buf.extend_from_slice(&(total_len as u32).to_be_bytes());
-        // Method length (u8)
-        buf.push(method_bytes.len() as u8);
-        // Method
-        buf.extend_from_slice(method_bytes);
-        // Params
-        buf.extend_from_slice(&params_bytes);
-
-        Ok(buf)
-    }
-
-    /// Deserialize params into a typed command
-    pub fn deserialize_params<T: DeserializeOwned>(&self) -> Result<T, IpcError> {
-        rmp_serde::from_slice(&self.params).map_err(IpcError::from)
+        let mut frame = Vec::with_capacity(4 + body_len);
+        frame.extend_from_slice(&(body_len as u32).to_be_bytes());
+        frame.push(method_len);
+        frame.extend_from_slice(method);
+        frame.extend_from_slice(params);
+        Ok(frame)
     }
 }
 
-/// Response to be sent over wire
-#[derive(Debug)]
-pub struct IpcResponse {
-    /// Whether the request succeeded
+/// A response to a request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct IpcResponse {
+    /// Whether the command succeeded.
     pub success: bool,
-    /// Raw MessagePack payload (result or error)
+    /// The command's response, or a MessagePack error string.
     pub payload: Vec<u8>,
 }
 
 impl IpcResponse {
-    /// Create a success response with the given result
-    pub fn success<T: Serialize>(result: &T) -> Result<Self, IpcError> {
-        Ok(Self {
+    /// A successful response carrying an already-encoded payload.
+    pub(crate) fn success(payload: Vec<u8>) -> Self {
+        Self {
             success: true,
-            payload: rmp_serde::to_vec(result)?,
-        })
-    }
-
-    /// Create an error response
-    pub fn error(message: &str) -> Result<Self, IpcError> {
-        Ok(Self {
-            success: false,
-            payload: rmp_serde::to_vec(&message)?,
-        })
-    }
-
-    /// Serialize to wire format
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let total_len = 1 + self.payload.len();
-        let mut buf = Vec::with_capacity(4 + total_len);
-
-        // Total length (u32 BE)
-        buf.extend_from_slice(&(total_len as u32).to_be_bytes());
-        // Success flag
-        buf.push(if self.success { 1 } else { 0 });
-        // Payload
-        buf.extend_from_slice(&self.payload);
-
-        buf
-    }
-
-    /// Parse a response from raw bytes (after length prefix)
-    pub fn from_bytes(data: &[u8]) -> Result<Self, IpcError> {
-        if data.is_empty() {
-            return Err(IpcError::InvalidProtocol("empty response".to_string()));
+            payload,
         }
-
-        let success = data[0] == 1;
-        let payload = data[1..].to_vec();
-
-        Ok(Self { success, payload })
     }
 
-    /// Deserialize the payload as the given type
-    pub fn deserialize_payload<T: DeserializeOwned>(&self) -> Result<T, IpcError> {
-        rmp_serde::from_slice(&self.payload).map_err(IpcError::from)
+    /// A failure response carrying `message`.
+    pub(crate) fn error(message: &str) -> Self {
+        Self {
+            success: false,
+            // Encoding a string cannot fail; an empty payload still decodes as
+            // a failure, so there is no error path worth propagating here.
+            payload: rmp_serde::to_vec(&message).unwrap_or_default(),
+        }
+    }
+
+    /// Encode a response frame, including the length prefix.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let body_len = 1 + self.payload.len();
+        let mut frame = Vec::with_capacity(4 + body_len);
+        frame.extend_from_slice(&(body_len as u32).to_be_bytes());
+        frame.push(u8::from(self.success));
+        frame.extend_from_slice(&self.payload);
+        frame
+    }
+
+    /// Decode a response body, excluding the length prefix.
+    pub(crate) fn decode(body: &[u8]) -> Result<Self, IpcError> {
+        let (&flag, payload) = body
+            .split_first()
+            .ok_or_else(|| IpcError::InvalidProtocol("empty response".to_string()))?;
+
+        Ok(Self {
+            success: flag != 0,
+            payload: payload.to_vec(),
+        })
     }
 }
 
@@ -173,55 +157,84 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct TestParams {
+    struct Params {
         query: String,
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct TestResult {
-        items: Vec<String>,
-    }
-
     #[test]
-    fn test_request_roundtrip() {
-        let params = TestParams {
+    fn requests_round_trip() {
+        let params = rmp_serde::to_vec_named(&Params {
             query: "hello".to_string(),
-        };
+        })
+        .unwrap();
 
-        let bytes = IpcRequest::to_bytes("search", &params).unwrap();
-        // Skip the 4-byte length prefix
-        let request = IpcRequest::from_bytes(&bytes[4..]).unwrap();
+        let frame = IpcRequest::encode("search", &params).unwrap();
+        let body_len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+        assert_eq!(body_len, frame.len() - 4);
 
+        let request = IpcRequest::decode(&frame[4..]).unwrap();
         assert_eq!(request.method, "search");
-        let decoded: TestParams = request.deserialize_params().unwrap();
-        assert_eq!(decoded, params);
+        assert_eq!(
+            rmp_serde::from_slice::<Params>(&request.params).unwrap(),
+            Params {
+                query: "hello".to_string()
+            }
+        );
     }
 
     #[test]
-    fn test_response_success_roundtrip() {
-        let result = TestResult {
-            items: vec!["a".to_string(), "b".to_string()],
-        };
+    fn responses_round_trip() {
+        let payload = rmp_serde::to_vec_named(&Params {
+            query: "ok".to_string(),
+        })
+        .unwrap();
+        let frame = IpcResponse::success(payload.clone()).encode();
+        let response = IpcResponse::decode(&frame[4..]).unwrap();
 
-        let response = IpcResponse::success(&result).unwrap();
-        let bytes = response.to_bytes();
-        // Skip the 4-byte length prefix
-        let parsed = IpcResponse::from_bytes(&bytes[4..]).unwrap();
-
-        assert!(parsed.success);
-        let decoded: TestResult = parsed.deserialize_payload().unwrap();
-        assert_eq!(decoded, result);
+        assert!(response.success);
+        assert_eq!(response.payload, payload);
     }
 
     #[test]
-    fn test_response_error_roundtrip() {
-        let response = IpcResponse::error("something went wrong").unwrap();
-        let bytes = response.to_bytes();
-        // Skip the 4-byte length prefix
-        let parsed = IpcResponse::from_bytes(&bytes[4..]).unwrap();
+    fn error_responses_round_trip() {
+        let frame = IpcResponse::error("something went wrong").encode();
+        let response = IpcResponse::decode(&frame[4..]).unwrap();
 
-        assert!(!parsed.success);
-        let message: String = parsed.deserialize_payload().unwrap();
-        assert_eq!(message, "something went wrong");
+        assert!(!response.success);
+        assert_eq!(
+            rmp_serde::from_slice::<String>(&response.payload).unwrap(),
+            "something went wrong"
+        );
+    }
+
+    #[test]
+    fn truncated_requests_are_rejected() {
+        assert!(matches!(
+            IpcRequest::decode(&[]),
+            Err(IpcError::InvalidProtocol(_))
+        ));
+        // Claims a 9-byte method but carries 3 bytes.
+        assert!(matches!(
+            IpcRequest::decode(&[9, b'a', b'b', b'c']),
+            Err(IpcError::InvalidProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn overlong_method_names_are_rejected() {
+        let method = "a".repeat(256);
+        assert!(matches!(
+            IpcRequest::encode(&method, &[]),
+            Err(IpcError::InvalidProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_requests_are_rejected() {
+        let params = vec![0u8; MAX_FRAME_BYTES];
+        assert!(matches!(
+            IpcRequest::encode("big", &params),
+            Err(IpcError::InvalidProtocol(_))
+        ));
     }
 }

@@ -310,17 +310,17 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { ChildProcessJs, StdioConfigJs, Command, presetStrict, presetPythonDev, presetPythonDataScience, IpcRouterJs, createIpcRouter, Sandbox, createSandbox, securityConfigStrict, securityConfigPermissive } = nativeBinding
+const { ChildProcessJs, StdioConfigJs, Command, IsolationJs, presetStrict, presetPythonDev, presetPythonDataScience, Sandbox, createSandbox, securityConfigStrict, securityConfigInteractive, securityConfigPermissive } = nativeBinding
 
 module.exports.ChildProcessJs = ChildProcessJs
 module.exports.StdioConfigJs = StdioConfigJs
 module.exports.Command = Command
+module.exports.IsolationJs = IsolationJs
 module.exports.presetStrict = presetStrict
 module.exports.presetPythonDev = presetPythonDev
 module.exports.presetPythonDataScience = presetPythonDataScience
-module.exports.IpcRouterJs = IpcRouterJs
-module.exports.createIpcRouter = createIpcRouter
 module.exports.Sandbox = Sandbox
 module.exports.createSandbox = createSandbox
 module.exports.securityConfigStrict = securityConfigStrict
+module.exports.securityConfigInteractive = securityConfigInteractive
 module.exports.securityConfigPermissive = securityConfigPermissive

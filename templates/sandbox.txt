@@ -2,9 +2,25 @@
 (deny default)
 
 ; =============================================================================
-; Mach IPC - Minimal services required for process execution
+; RULE ORDER MATTERS
+;
+; SBPL resolves an operation with the LAST matching rule, not the first. This
+; profile is therefore laid out in three passes:
+;
+;   1. baseline    - broad allows that make a process able to run at all
+;   2. protections - denies for sensitive data and for writable-then-executable
+;                    locations
+;   3. user rules  - explicitly configured paths, which come last so that an
+;                    explicit allow always beats a default protection
+;
+; Moving a rule between passes changes what the sandbox enforces.
 ; =============================================================================
-; Core system services for process execution and basic operations
+
+; =============================================================================
+; PASS 1: BASELINE
+; =============================================================================
+
+; --- Mach IPC: minimal services required for process execution ---
 (allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))  ; User/group lookups
 (allow mach-lookup (global-name "com.apple.system.logger"))                   ; Unified logging
 (allow mach-lookup (global-name "com.apple.system.notification_center"))      ; Notifications
@@ -28,13 +44,11 @@
 ; Dynamic linker
 (allow mach-lookup (global-name "com.apple.dyld.closured"))                   ; dyld closure daemon
 
-; XPC and launchd services (pattern match for essential XPC)
-
 ; Distributed notifications (various versions)
 (allow mach-lookup (global-name "com.apple.distributed_notifications@1v3"))
 (allow mach-lookup (global-name "com.apple.distributed_notifications@Vv3"))
 
-; Network configuration (required for proxy)
+; Network configuration (required for the proxy)
 (allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))     ; Network config
 (allow mach-lookup (global-name "com.apple.networkd"))                        ; Network daemon
 (allow mach-lookup (global-name "com.apple.symptomsd"))                       ; Network diagnostics
@@ -50,9 +64,7 @@
 ; Sysctl for system information
 (allow sysctl-read)
 
-; =============================================================================
-; Hardware access configuration
-; =============================================================================
+; --- Hardware ---
 {% if allow_gpu %}
 ; GPU access - Metal, OpenGL, OpenCL
 (allow iokit-open (iokit-user-client-class "IOAccelerator"))
@@ -60,15 +72,13 @@
 (allow iokit-open (iokit-user-client-class "AGXDeviceUserClient"))
 (allow iokit-open (iokit-user-client-class "IOSurfaceRootUserClient"))
 (allow iokit-open (iokit-user-client-class "IOSurfaceSendRight"))
-; GPU-related Mach services
 (allow mach-lookup (global-name "com.apple.gpumemd.source"))
 (allow mach-lookup (global-name "com.apple.MTLCompilerService"))
 {% endif %}
 {% if allow_npu %}
-; NPU/Neural Engine access - CoreML, ANE (Apple Neural Engine)
+; NPU/Neural Engine access - CoreML, ANE
 (allow iokit-open (iokit-user-client-class "H11ANEInDirectPathClient"))
 (allow iokit-open (iokit-user-client-class "AppleNeuralEngineUserClient"))
-; NPU-related Mach services
 (allow mach-lookup (global-name "com.apple.coreml.modelcompiler"))
 (allow mach-lookup (global-name "com.apple.coreml.mlmodelc"))
 {% endif %}
@@ -77,63 +87,36 @@
 (allow iokit-open)
 {% endif %}
 
-; =============================================================================
-; Process operations
-; =============================================================================
+; --- Process operations ---
 (allow process-fork)
-(allow process-exec)
 (allow signal)
 (allow ipc-posix*)
 (allow file-lock)
 (allow process-info-setcontrol)
 
-; =============================================================================
-; File system access
-; =============================================================================
-; Allow file reads broadly on macOS.
-; Modern macOS runtime dependencies are not stably enumerable across releases
-; because dyld, cryptexes, and other system resources move between sealed roots.
-; Sensitive paths are denied below with explicit rules, while writes stay scoped.
+; Baseline exec. Pass 2 removes exec from every location the sandboxed process
+; can write, which is what stops it from dropping a payload and running it.
+; Reads are needed to exec, and macOS's runtime layout (dyld caches, cryptexes,
+; sealed system volumes) is not stably enumerable across releases, so both start
+; broad and are narrowed by the denies below.
+(allow process-exec)
 (allow file-read*)
 
-    {% if writable_file_system %}
-    ; Permissive mode: Allow global write access
-    (allow file-write*)
-    {% endif %}
+{% if writable_file_system %}
+; Permissive mode: the whole filesystem is writable.
+(allow file-write*)
+{% endif %}
 
-; Process execution - restricted to known safe paths
-(allow process-exec (subpath "/bin"))
-(allow process-exec (subpath "/sbin"))
-(allow process-exec (subpath "/usr/bin"))
-(allow process-exec (subpath "/usr/sbin"))
-(allow process-exec (subpath "/usr/libexec"))
-(allow process-exec (subpath "/opt/homebrew"))
-(allow process-exec (subpath "/usr/local"))
-(allow process-exec (subpath "/Applications"))
-
-; =============================================================================
-; Temp directories (full read + write)
-; =============================================================================
+{% if !filesystem_strict %}
+; --- Shared temp directories ---
+; Readable outside strict mode, but writable only when the whole filesystem is.
+; The sandbox has its own writable directory, exported as TMPDIR, so nothing
+; needs to write here.
 (allow file-read* (subpath "/private/tmp"))
-(allow file-read* (subpath "/tmp"))
-(allow file-read* (subpath "/var/folders"))
 (allow file-read* (subpath "/private/var/folders"))
-(allow file-write* (subpath "/private/tmp"))
-(allow file-write* (subpath "/tmp"))
-(allow file-write* (subpath "/var/folders"))
-(allow file-write* (subpath "/private/var/folders"))
-(allow file-write-create (subpath "/private/tmp"))
-(allow file-write-create (subpath "/tmp"))
-(allow file-write-create (subpath "/var/folders"))
-(allow file-write-create (subpath "/private/var/folders"))
-(allow file-write-unlink (subpath "/private/tmp"))
-(allow file-write-unlink (subpath "/tmp"))
-(allow file-write-unlink (subpath "/var/folders"))
-(allow file-write-unlink (subpath "/private/var/folders"))
+{% endif %}
 
-; =============================================================================
-; Device access - minimal set for stdio and randomness
-; =============================================================================
+; --- Devices: minimal set for stdio and randomness ---
 (allow file-read* (literal "/dev/null"))
 (allow file-read* (literal "/dev/zero"))
 (allow file-read* (literal "/dev/random"))
@@ -156,67 +139,41 @@
 {% endif %}
 
 ; =============================================================================
-; User-configured paths
+; PASS 2: PROTECTIONS
+;
+; Patterns are anchored to directory or file boundaries so that "/\.ssh(/|$)"
+; matches "/.ssh/" and a trailing "/.ssh" but not "not.ssh.txt".
 ; =============================================================================
-; Configured readable paths
-{% for path in readable_paths %}
-(allow file-read* (subpath "{{ path }}"))
-{% endfor %}
-; Configured writable paths (includes all write operations)
-{% for path in writable_paths %}
-(allow file-read* (subpath "{{ path }}"))
-(allow file-write* (subpath "{{ path }}"))
-(allow file-write-create (subpath "{{ path }}"))
-(allow file-write-unlink (subpath "{{ path }}"))
-{% endfor %}
-; Configured executable paths
-{% for path in executable_paths %}
-(allow file-read* (literal "{{ path }}"))
-(allow process-exec (literal "{{ path }}"))
-{% endfor %}
 
-; Working directory (full read + write)
-(allow file-read* (subpath "{{ working_dir }}"))
-(allow file-write* (subpath "{{ working_dir }}"))
-(allow file-write-create (subpath "{{ working_dir }}"))
-(allow file-write-unlink (subpath "{{ working_dir }}"))
+; --- No exec from anywhere the sandboxed process can write ---
+; Without these, the baseline exec allow above would let sandboxed code write a
+; binary to a scratch directory and run it. Permissive mode makes the whole
+; filesystem writable and so gives up this guarantee by definition; the scratch
+; directories stay denied there anyway, since that costs nothing.
+(deny process-exec (subpath "/private/tmp"))
+(deny process-exec (subpath "/private/var/folders"))
 
-{% if let Some(venv_path) = python_venv_path %}
-; Python venv (full access)
-(allow file-read* (subpath "{{ venv_path }}"))
-(allow file-write* (subpath "{{ venv_path }}"))
-(allow file-write-create (subpath "{{ venv_path }}"))
-(allow file-write-unlink (subpath "{{ venv_path }}"))
-(allow process-exec (subpath "{{ venv_path }}"))
+{% if filesystem_strict %}
+; --- Strict mode: no reads of user data ---
+; System files stay readable because the macOS runtime layout is not stably
+; enumerable, but everything owned by a user is denied unless explicitly
+; allowed in pass 3.
+(deny file-read* (subpath "/Users") (with no-log))
+(deny file-read* (subpath "/home") (with no-log))
+(deny file-read* (subpath "/Volumes") (with no-log))
+(deny file-read* (subpath "/Network") (with no-log))
+(deny file-read* (subpath "/private/var/root") (with no-log))
+(deny file-read* (subpath "/private/tmp") (with no-log))
+(deny file-read* (subpath "/private/var/folders") (with no-log))
 {% endif %}
-
-; =============================================================================
-; Network: deny by default; optionally allow proxy port
-; =============================================================================
-(deny network*)
-{% if let Some(ipc_port) = ipc_port %}
-; Allow IPC endpoint only (sandbox-local heel IPC server)
-(allow network-outbound (remote ip "localhost:{{ ipc_port }}"))
-{% endif %}
-{% if !network_deny_all %}
-; Allow outbound network through proxy when network mode is enabled
-(allow network-outbound (remote ip "localhost:{{ proxy_port }}"))
-{% endif %}
-
-; =============================================================================
-; Security rules - DENY sensitive paths
-; Patterns are anchored to match directory/file boundaries to avoid false matches
-; e.g., "/\.ssh(/|$)" matches "/.ssh/" or "/.ssh" at end, not "not.ssh.txt"
-; =============================================================================
 {% if protect_user_home %}
-; Protect user home directories
 {% if allow_tcc_prompts %}
-; TCC prompts enabled - only block ~/Library (not TCC-protected)
-; TCC-protected folders (Desktop, Documents, Downloads, Pictures, Movies, Music)
-; are handled by macOS TCC, which will prompt the user for access
+; TCC prompts enabled: only ~/Library is blocked here. The TCC-protected
+; folders (Desktop, Documents, Downloads, Pictures, Movies, Music) are left to
+; macOS, which prompts the user for access.
 (deny file-read* (regex #"/Users/[^/]+/Library(/|$)") (with no-log))
 {% else %}
-; TCC prompts disabled (strict mode) - block all sensitive home subdirectories
+; TCC prompts disabled: block the sensitive home subdirectories outright.
 (deny file-read* (regex #"/Users/[^/]+/Documents(/|$)") (with no-log))
 (deny file-read* (regex #"/Users/[^/]+/Desktop(/|$)") (with no-log))
 (deny file-read* (regex #"/Users/[^/]+/Downloads(/|$)") (with no-log))
@@ -227,12 +184,12 @@
 {% endif %}
 {% endif %}
 {% if protect_credentials %}
-; Protect SSH/GPG credentials - anchored to directory boundaries
+; SSH/GPG credentials
 (deny file-read* (regex #"/\.ssh(/|$)") (with no-log))
 (deny file-read* (regex #"/\.gnupg(/|$)") (with no-log))
 {% endif %}
 {% if protect_cloud_config %}
-; Protect cloud provider configurations - anchored to directory boundaries
+; Cloud provider configuration
 (deny file-read* (regex #"/\.aws(/|$)") (with no-log))
 (deny file-read* (regex #"/\.kube(/|$)") (with no-log))
 (deny file-read* (regex #"/\.docker(/|$)") (with no-log))
@@ -240,7 +197,7 @@
 (deny file-read* (regex #"/\.azure(/|$)") (with no-log))
 {% endif %}
 {% if protect_browser_data %}
-; Protect browser data (cookies, history, passwords) - anchored patterns
+; Browser cookies, history and passwords
 (deny file-read* (regex #"/Library/Application Support/Google/Chrome(/|$)") (with no-log))
 (deny file-read* (regex #"/Library/Application Support/Firefox(/|$)") (with no-log))
 (deny file-read* (regex #"/Library/Application Support/Microsoft Edge(/|$)") (with no-log))
@@ -248,19 +205,110 @@
 (deny file-read* (regex #"/Library/Cookies(/|$)") (with no-log))
 {% endif %}
 {% if protect_keychain %}
-; Protect system keychain - anchored pattern
+; System keychain
 (deny file-read* (regex #"/Library/Keychains(/|$)") (with no-log))
 {% endif %}
 {% if protect_shell_history %}
-; Protect shell history files - anchored to match specific filenames
+; Shell history files
 (deny file-read* (regex #"/\.(bash_history|zsh_history|fish_history)$") (with no-log))
 (deny file-read* (regex #"/\.local/share/fish/fish_history$") (with no-log))
 {% endif %}
 {% if protect_package_credentials %}
-; Protect package manager credentials - anchored to file boundaries
+; Package manager credentials
 (deny file-read* (regex #"/\.netrc$") (with no-log))
 (deny file-read* (regex #"/\.npmrc$") (with no-log))
 (deny file-read* (regex #"/\.pypirc$") (with no-log))
 (deny file-read* (regex #"/\.cargo/credentials(\.toml)?$") (with no-log))
 (deny file-read* (regex #"/\.gem/credentials$") (with no-log))
+{% endif %}
+
+; =============================================================================
+; PASS 3: USER-CONFIGURED PATHS
+;
+; These come last so that an explicitly configured path always wins over the
+; protections above. Every path here has been canonicalized by the profile
+; generator: SBPL matches resolved paths, so "/tmp/x" would never match the
+; kernel's "/private/tmp/x".
+; =============================================================================
+
+; Ancestors of every granted path, so that resolving into an allowed directory
+; is not blocked by a protection rule covering one of its parents. These grant
+; the directory itself, not its other children.
+{% for path in traversal_paths %}
+(allow file-read* (literal "{{ path }}"))
+{% endfor %}
+
+; Readable paths
+{% for path in readable_paths %}
+(allow file-read* (subpath "{{ path }}"))
+{% endfor %}
+
+; Writable paths, with exec removed so they cannot be used to stage a payload
+{% for path in writable_paths %}
+(allow file-read* (subpath "{{ path }}"))
+(allow file-write* (subpath "{{ path }}"))
+(allow file-write-create (subpath "{{ path }}"))
+(allow file-write-unlink (subpath "{{ path }}"))
+(deny process-exec (subpath "{{ path }}"))
+{% endfor %}
+
+; Working directory: full read and write, no exec
+(allow file-read* (subpath "{{ working_dir }}"))
+(allow file-write* (subpath "{{ working_dir }}"))
+(allow file-write-create (subpath "{{ working_dir }}"))
+(allow file-write-unlink (subpath "{{ working_dir }}"))
+(deny process-exec (subpath "{{ working_dir }}"))
+
+{% if let Some(bin_dir) = ipc_bin_dir %}
+; IPC wrapper scripts are generated by the host before the sandbox starts and
+; are the one exception to the no-exec-in-the-working-directory rule.
+(allow process-exec (subpath "{{ bin_dir }}"))
+{% endif %}
+{% if let Some(socket_dir) = ipc_socket_dir %}
+; The IPC socket lives outside the working directory, so that a sandboxed
+; process cannot unlink the endpoint it depends on. Connecting to a Unix socket
+; needs read and write on the socket file itself.
+(allow file-read* (subpath "{{ socket_dir }}"))
+(allow file-write* (subpath "{{ socket_dir }}"))
+{% endif %}
+{% if let Some(socket) = ipc_socket %}
+; Connecting to a Unix socket is a network operation in SBPL, so file rules
+; alone are not enough to reach the IPC endpoint.
+(allow network-outbound (literal "{{ socket }}"))
+{% endif %}
+
+{% if let Some(venv) = python_venv %}
+; Python virtual environment
+(allow file-read* (subpath "{{ venv.path }}"))
+(allow process-exec (subpath "{{ venv.path }}"))
+{% if venv.writable %}
+(allow file-write* (subpath "{{ venv.path }}"))
+(allow file-write-create (subpath "{{ venv.path }}"))
+(allow file-write-unlink (subpath "{{ venv.path }}"))
+{% endif %}
+{% endif %}
+
+; Explicitly permitted executables
+{% for path in executable_paths %}
+(allow file-read* (literal "{{ path }}"))
+(allow process-exec (literal "{{ path }}"))
+{% endfor %}
+
+; =============================================================================
+; Network
+;
+; The IPC endpoint is a Unix socket, and connecting to one is a network
+; operation in SBPL, so it is granted in pass 3 and not here. That grant
+; survives the blanket deny below, which only governs IP sockets: removing it
+; breaks IPC with EPERM even though it looks redundant next to this rule.
+; =============================================================================
+(deny network*)
+; Sandboxed tools may host ephemeral loopback services for local previews,
+; language servers and similar terminal-first workflows. macOS requires
+; network-inbound here; that operation also grants the bind.
+(allow network-inbound (local tcp "localhost:*"))
+{% if let Some(port) = proxy_port %}
+; Outbound traffic is restricted to the sandbox proxy, which applies the
+; configured network policy to every request.
+(allow network-outbound (remote ip "localhost:{{ port }}"))
 {% endif %}

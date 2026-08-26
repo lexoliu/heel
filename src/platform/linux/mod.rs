@@ -1,46 +1,27 @@
-//! Linux sandbox backend using Landlock + Seccomp
+//! Linux sandbox backend, built on Landlock and Seccomp.
 
 mod landlock_rules;
 mod seccomp_filter;
 
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use blocking::unblock;
 
-use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
-use crate::platform::linux::landlock_rules::LandlockConfig;
-use crate::platform::{Backend, Child};
+use crate::platform::rlimit::PreparedLimits;
+use crate::platform::{Backend, Child, SpawnRequest};
 
-/// Minimum required kernel version for full security (Landlock ABI v4)
+/// Lowest kernel version with Landlock ABI v4.
 const MIN_KERNEL_VERSION: KernelVersion = KernelVersion::new(6, 7, 0);
 
-/// Minimum required Landlock ABI version (v4 adds network restrictions)
-const MIN_LANDLOCK_ABI: i32 = 4;
-
-fn pre_exec_write(msg: &[u8]) {
-    unsafe {
-        libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const _, msg.len());
-    }
-}
-
-/// Linux sandbox backend using Landlock (filesystem + network) and Seccomp (syscall filtering)
+/// Linux sandbox backend using Landlock for files and network, Seccomp for
+/// syscalls.
 pub struct LinuxBackend {
     _private: (),
 }
 
-struct CommandLaunch<'a> {
-    program: &'a str,
-    args: &'a [String],
-    envs: &'a [(String, String)],
-    current_dir: Option<&'a std::path::Path>,
-    stdin: Stdio,
-    stdout: Stdio,
-    stderr: Stdio,
-}
-
-/// Parsed kernel version
+/// A parsed kernel release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct KernelVersion {
     major: u32,
@@ -57,31 +38,21 @@ impl KernelVersion {
         }
     }
 
+    /// Parse the numeric prefix of a release string such as `6.8.1-generic`.
     fn parse(release: &str) -> Result<Self> {
-        // Parse "6.7.0-generic" or "6.7.0" -> (6, 7, 0)
-        let version_part = release.split('-').next().unwrap_or(release);
-        let parts: Vec<&str> = version_part.split('.').collect();
+        let numeric = release.split('-').next().unwrap_or(release);
+        let mut parts = numeric.split('.');
 
-        if parts.len() < 2 {
-            return Err(Error::InitFailed(format!(
-                "Invalid kernel version format: {}",
-                release
-            )));
+        let major = parts.next().and_then(|part| part.parse().ok());
+        let minor = parts.next().and_then(|part| part.parse().ok());
+        let patch = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+
+        match (major, minor) {
+            (Some(major), Some(minor)) => Ok(Self::new(major, minor, patch)),
+            _ => Err(Error::InitFailed(format!(
+                "unrecognized kernel version: {release}"
+            ))),
         }
-
-        let major: u32 = parts[0]
-            .parse()
-            .map_err(|_| Error::InitFailed(format!("Invalid major version: {}", parts[0])))?;
-        let minor: u32 = parts[1]
-            .parse()
-            .map_err(|_| Error::InitFailed(format!("Invalid minor version: {}", parts[1])))?;
-        let patch: u32 = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
-
-        Ok(Self {
-            major,
-            minor,
-            patch,
-        })
     }
 }
 
@@ -92,266 +63,73 @@ impl std::fmt::Display for KernelVersion {
 }
 
 impl LinuxBackend {
-    /// Create a new Linux sandbox backend
+    /// Create the backend, verifying that the kernel can enforce the sandbox.
     ///
-    /// Fails if:
-    /// - Kernel version < 6.7 (required for Landlock ABI v4)
-    /// - Landlock is not available or ABI < v4
+    /// Both checks are cheap syscalls. In particular, support is probed by
+    /// creating a ruleset rather than by forking a child and applying one:
+    /// forking a multi-threaded process and then allocating in the child is
+    /// unsound.
     pub fn new() -> Result<Self> {
-        // Check kernel version
-        let kernel_version = Self::detect_kernel_version()?;
-        if kernel_version < MIN_KERNEL_VERSION {
+        let kernel = detect_kernel_version()?;
+        if kernel < MIN_KERNEL_VERSION {
             return Err(Error::UnsupportedPlatformVersion {
                 platform: "Linux",
                 minimum: "6.7",
-                current: kernel_version.to_string(),
+                current: kernel.to_string(),
             });
         }
 
-        // Check Landlock ABI version
-        let landlock_abi = Self::detect_landlock_abi()?;
-        if landlock_abi < MIN_LANDLOCK_ABI {
-            return Err(Error::UnsupportedPlatformVersion {
-                platform: "Linux (Landlock ABI)",
-                minimum: "4",
-                current: landlock_abi.to_string(),
-            });
-        }
+        landlock_rules::probe_support()?;
 
-        tracing::info!(
-            kernel = %kernel_version,
-            landlock_abi = landlock_abi,
-            "Linux sandbox backend initialized"
-        );
-
+        tracing::info!(%kernel, "Linux sandbox backend initialized");
         Ok(Self { _private: () })
     }
 
-    fn detect_kernel_version() -> Result<KernelVersion> {
-        let utsname = nix::sys::utsname::uname()
-            .map_err(|e| Error::InitFailed(format!("uname failed: {}", e)))?;
-        let release = utsname.release().to_string_lossy();
-        KernelVersion::parse(&release)
-    }
+    /// Turn a spawn request into a configured command.
+    fn build_command(&self, request: &SpawnRequest<'_>) -> Result<Command> {
+        // Both are built here, on the host, so that the post-fork path only
+        // issues syscalls.
+        let ruleset = landlock_rules::build_ruleset(request.config, request.proxy_port)?;
+        let allow_tcp = request.proxy_port.is_some() || request.config.ipc_socket().is_some();
+        let filter = seccomp_filter::build_filter(allow_tcp)?;
+        let limits = PreparedLimits::new(request.config.limits());
 
-    fn detect_landlock_abi() -> Result<i32> {
-        use landlock::{ABI, Access, RulesetAttr};
+        let mut cmd = Command::new(request.program);
+        cmd.args(request.args);
+        cmd.current_dir(request.working_dir());
 
-        // Try to detect the best available ABI
-        // We test by creating a ruleset - restrict_self() is tested in a forked child
-        // to avoid restricting the main process
-        let abi = ABI::V4; // We require V4
-
-        // Create a minimal ruleset to check if this ABI is supported
-        let ruleset =
-            match landlock::Ruleset::default().handle_access(landlock::AccessFs::from_all(abi)) {
-                Ok(r) => r,
-                Err(_) => {
-                    // Try to detect what version is actually available
-                    return if landlock::Ruleset::default()
-                        .handle_access(landlock::AccessFs::from_all(ABI::V3))
-                        .is_ok()
-                    {
-                        Err(Error::UnsupportedPlatformVersion {
-                            platform: "Linux (Landlock ABI)",
-                            minimum: "4",
-                            current: "3".to_string(),
-                        })
-                    } else if landlock::Ruleset::default()
-                        .handle_access(landlock::AccessFs::from_all(ABI::V2))
-                        .is_ok()
-                    {
-                        Err(Error::UnsupportedPlatformVersion {
-                            platform: "Linux (Landlock ABI)",
-                            minimum: "4",
-                            current: "2".to_string(),
-                        })
-                    } else if landlock::Ruleset::default()
-                        .handle_access(landlock::AccessFs::from_all(ABI::V1))
-                        .is_ok()
-                    {
-                        Err(Error::UnsupportedPlatformVersion {
-                            platform: "Linux (Landlock ABI)",
-                            minimum: "4",
-                            current: "1".to_string(),
-                        })
-                    } else {
-                        Err(Error::NotEnforced("Landlock not available in kernel"))
-                    };
-                }
-            };
-
-        // Actually create the ruleset to verify it works
-        let _created = ruleset.create().map_err(|e| {
-            Error::NotEnforced(Box::leak(
-                format!("Landlock ruleset creation failed: {}", e).into_boxed_str(),
-            ))
-        })?;
-
-        // Test restrict_self() in a forked child process to avoid restricting the main process
-        // This is critical because Landlock restrictions are inherited by child processes
-        // We must test with actual path rules, not just an empty ruleset
-        match unsafe { libc::fork() } {
-            -1 => Err(Error::InitFailed(
-                "fork failed for Landlock test".to_string(),
-            )),
-            0 => {
-                // Child process - test restrict_self() with real rules and exit with status code
-                use landlock::{PathBeneath, PathFd, RulesetCreatedAttr, RulesetStatus};
-
-                let test_ruleset = landlock::Ruleset::default()
-                    .handle_access(landlock::AccessFs::from_all(ABI::V4))
-                    .and_then(|r| r.create());
-
-                let exit_code = match test_ruleset {
-                    Ok(r) => {
-                        // Add at least one real path rule to properly test Landlock functionality
-                        // An empty ruleset might succeed even when Landlock isn't working
-                        let r = if let Ok(path_fd) = PathFd::new("/tmp") {
-                            match r.add_rule(PathBeneath::new(
-                                path_fd,
-                                landlock::AccessFs::from_all(ABI::V4),
-                            )) {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    unsafe { libc::_exit(1) };
-                                }
-                            }
-                        } else {
-                            r
-                        };
-
-                        match r.restrict_self() {
-                            Ok(status) => match status.ruleset {
-                                RulesetStatus::FullyEnforced => 0,
-                                RulesetStatus::PartiallyEnforced => 2,
-                                RulesetStatus::NotEnforced => 3,
-                            },
-                            Err(_) => 1, // restrict_self failed
-                        }
-                    }
-                    Err(_) => 1,
-                };
-                unsafe { libc::_exit(exit_code) };
-            }
-            pid => {
-                // Parent process - wait for child and check result
-                let mut status: libc::c_int = 0;
-                unsafe { libc::waitpid(pid, &mut status, 0) };
-
-                if libc::WIFEXITED(status) {
-                    match libc::WEXITSTATUS(status) {
-                        0 => Ok(4), // FullyEnforced
-                        1 => Err(Error::NotEnforced(
-                            "Landlock restrict_self failed - kernel may not support Landlock",
-                        )),
-                        2 => Err(Error::NotEnforced(
-                            "Landlock only partially enforced - refusing to run with reduced security",
-                        )),
-                        3 => Err(Error::NotEnforced("Landlock not enforced by kernel")),
-                        _ => Err(Error::InitFailed(
-                            "Landlock test child exited with unexpected status".to_string(),
-                        )),
-                    }
-                } else {
-                    Err(Error::InitFailed(
-                        "Landlock test child terminated abnormally".to_string(),
-                    ))
-                }
-            }
-        }
-    }
-
-    fn build_command(
-        &self,
-        config: &SandboxConfigData,
-        proxy_port: u16,
-        launch: CommandLaunch<'_>,
-    ) -> Result<Command> {
-        // Build Landlock ruleset (validated at creation time)
-        let landlock_config = LandlockConfig::from_config(config);
-        let landlock_ruleset = landlock_rules::build_ruleset(&landlock_config, proxy_port)?;
-
-        // Build Seccomp BPF filter
-        let security = config.security().clone();
-        let seccomp_filter = seccomp_filter::build_filter(
-            &security,
-            config.network_deny_all(),
-            config.ipc_port().is_some(),
-        )?;
-
-        let mut cmd = Command::new(launch.program);
-        cmd.args(launch.args);
-
-        // Set working directory
-        let work_dir = launch.current_dir.unwrap_or(config.working_dir());
-        cmd.current_dir(work_dir);
-
-        // Clear environment and set allowed vars
         cmd.env_clear();
-        for var in config.env_passthrough() {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
+        for var in request.config.env_passthrough() {
+            if let Ok(value) = std::env::var(var) {
+                cmd.env(var, value);
             }
         }
-
-        // Add custom environment variables (includes proxy vars from Command)
-        for (key, val) in launch.envs {
-            cmd.env(key, val);
+        for (key, value) in request.envs {
+            cmd.env(key, value);
         }
 
-        // Set stdio
-        cmd.stdin(launch.stdin);
-        cmd.stdout(launch.stdout);
-        cmd.stderr(launch.stderr);
+        let mut ruleset = Some(ruleset);
+        let mut filter = Some(filter);
 
-        // CRITICAL: Apply sandbox restrictions after fork, before exec
-        // Keep pre_exec minimal and async-signal-safe: only apply pre-built rulesets/filters.
-        let mut landlock_ruleset = Some(landlock_ruleset);
-        let mut seccomp_filter = Some(seccomp_filter);
-
+        // SAFETY: the closure only applies pre-built rulesets and filters and
+        // installs resource limits, all of which are plain syscalls. Nothing
+        // here allocates or takes a lock, as `pre_exec` requires.
         unsafe {
             cmd.pre_exec(move || {
-                #[cfg(debug_assertions)]
-                pre_exec_write(b"heel: pre_exec start\n");
+                limits.apply()?;
 
-                let ruleset = landlock_ruleset
+                // Both values are consumed on first use; a second call would
+                // mean the command was spawned twice from one builder, which
+                // must fail rather than silently run unsandboxed.
+                ruleset
                     .take()
-                    .ok_or_else(|| std::io::Error::other("Landlock ruleset already used"))?;
+                    .ok_or_else(|| std::io::Error::other("Landlock ruleset already applied"))?
+                    .restrict_self()?;
 
-                if let Err(err) = ruleset.restrict_self() {
-                    pre_exec_write(b"heel: landlock restrict_self failed\n");
-                    let errno = err
-                        .raw_os_error()
-                        .map(|code| format!(" (errno {code})"))
-                        .unwrap_or_default();
-                    return Err(std::io::Error::new(
-                        err.kind(),
-                        format!("landlock restrict_self failed: {err}{errno}"),
-                    ));
-                }
-
-                #[cfg(debug_assertions)]
-                pre_exec_write(b"heel: landlock applied\n");
-
-                let filter = seccomp_filter
+                filter
                     .take()
-                    .ok_or_else(|| std::io::Error::other("Seccomp filter already used"))?;
-
-                if let Err(err) = filter.apply() {
-                    pre_exec_write(b"heel: seccomp apply failed\n");
-                    let errno = err
-                        .raw_os_error()
-                        .map(|code| format!(" (errno {code})"))
-                        .unwrap_or_default();
-                    return Err(std::io::Error::new(
-                        err.kind(),
-                        format!("seccomp apply failed: {err}{errno}"),
-                    ));
-                }
-
-                #[cfg(debug_assertions)]
-                pre_exec_write(b"heel: seccomp applied\n");
+                    .ok_or_else(|| std::io::Error::other("seccomp filter already applied"))?
+                    .apply()?;
 
                 Ok(())
             });
@@ -361,48 +139,33 @@ impl LinuxBackend {
     }
 }
 
+/// Where the kernel publishes its release string.
+const KERNEL_RELEASE_PATH: &str = "/proc/sys/kernel/osrelease";
+
+/// Read the running kernel's version.
+///
+/// Read from procfs rather than through `uname`, which keeps this free of both
+/// a dependency and an unsafe block for a value the kernel already exposes as
+/// text.
+fn detect_kernel_version() -> Result<KernelVersion> {
+    let release = std::fs::read_to_string(KERNEL_RELEASE_PATH)
+        .map_err(|error| Error::path(KERNEL_RELEASE_PATH, error))?;
+    KernelVersion::parse(release.trim())
+}
+
 impl Backend for LinuxBackend {
-    async fn execute(
-        &self,
-        config: &SandboxConfigData,
-        proxy_port: u16,
-        program: &str,
-        args: &[String],
-        envs: &[(String, String)],
-        current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
-    ) -> Result<Output> {
-        tracing::debug!(program = %program, args = ?args, "sandbox: executing command");
+    async fn execute(&self, request: SpawnRequest<'_>) -> Result<Output> {
+        tracing::debug!(program = %request.program, args = ?request.args, "sandbox: executing");
 
-        let mut cmd = self.build_command(
-            config,
-            proxy_port,
-            CommandLaunch {
-                program,
-                args,
-                envs,
-                current_dir,
-                stdin,
-                stdout,
-                stderr,
-            },
-        )?;
-
-        // DEBUG: Print command details before spawn
-        tracing::info!(
-            program = %program,
-            args = ?args,
-            working_dir = ?current_dir.map(|p| p.display()),
-            config_working_dir = %config.working_dir().display(),
-            "About to spawn command"
-        );
+        let mut cmd = self.build_command(&request)?;
+        cmd.stdin(request.stdin);
+        cmd.stdout(request.stdout);
+        cmd.stderr(request.stderr);
 
         let output = unblock(move || cmd.output()).await?;
 
         tracing::debug!(
-            program = %program,
+            program = %request.program,
             exit_code = ?output.status.code(),
             success = output.status.success(),
             "sandbox: command completed"
@@ -411,37 +174,18 @@ impl Backend for LinuxBackend {
         Ok(output)
     }
 
-    async fn spawn(
-        &self,
-        config: &SandboxConfigData,
-        proxy_port: u16,
-        program: &str,
-        args: &[String],
-        envs: &[(String, String)],
-        current_dir: Option<&std::path::Path>,
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
-    ) -> Result<Child> {
-        tracing::debug!(program = %program, args = ?args, "sandbox: spawning command");
+    async fn spawn(&self, request: SpawnRequest<'_>) -> Result<Child> {
+        tracing::debug!(program = %request.program, args = ?request.args, "sandbox: spawning");
 
-        let mut cmd = self.build_command(
-            config,
-            proxy_port,
-            CommandLaunch {
-                program,
-                args,
-                envs,
-                current_dir,
-                stdin,
-                stdout,
-                stderr,
-            },
-        )?;
+        let mut cmd = self.build_command(&request)?;
+        cmd.stdin(request.stdin);
+        cmd.stdout(request.stdout);
+        cmd.stderr(request.stderr);
+        // Its own process group, so the whole tree can be killed at once.
+        cmd.process_group(0);
 
         let child = cmd.spawn()?;
-
-        tracing::debug!(program = %program, pid = child.id(), "sandbox: command spawned");
+        tracing::debug!(program = %request.program, pid = child.id(), "sandbox: spawned");
 
         Ok(Child::new(child))
     }
@@ -452,7 +196,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_kernel_version_parsing() {
+    fn kernel_versions_parse() {
         assert_eq!(
             KernelVersion::parse("6.7.0").unwrap(),
             KernelVersion::new(6, 7, 0)
@@ -465,12 +209,23 @@ mod tests {
             KernelVersion::parse("5.15.0-91-generic").unwrap(),
             KernelVersion::new(5, 15, 0)
         );
+        assert_eq!(
+            KernelVersion::parse("6.12").unwrap(),
+            KernelVersion::new(6, 12, 0)
+        );
     }
 
     #[test]
-    fn test_kernel_version_comparison() {
-        assert!(KernelVersion::new(6, 7, 0) >= KernelVersion::new(6, 7, 0));
-        assert!(KernelVersion::new(6, 8, 0) > KernelVersion::new(6, 7, 0));
-        assert!(KernelVersion::new(5, 15, 0) < KernelVersion::new(6, 7, 0));
+    fn unparsable_kernel_versions_are_rejected() {
+        assert!(KernelVersion::parse("").is_err());
+        assert!(KernelVersion::parse("linux").is_err());
+    }
+
+    #[test]
+    fn kernel_versions_order_by_component() {
+        assert!(KernelVersion::new(6, 7, 0) >= MIN_KERNEL_VERSION);
+        assert!(KernelVersion::new(6, 8, 0) > MIN_KERNEL_VERSION);
+        assert!(KernelVersion::new(5, 15, 0) < MIN_KERNEL_VERSION);
+        assert!(KernelVersion::new(6, 6, 9) < MIN_KERNEL_VERSION);
     }
 }

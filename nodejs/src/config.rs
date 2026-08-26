@@ -1,101 +1,137 @@
+//! Sandbox configuration from JavaScript.
+
 use std::path::PathBuf;
 
+use heel::{NetworkPolicy, SandboxConfig, SandboxConfigBuilder, SecurityConfig};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use crate::error::IntoNapiResult;
-use crate::network::{NetworkPolicyConfig, NetworkPolicyWrapper};
+use crate::policy::NetworkPolicyConfig;
 use crate::python::{PythonConfigJs, VenvConfigJs};
 use crate::security::SecurityConfigJs;
 
-/// Resource limits for sandboxed processes
+/// Resource limits for sandboxed processes.
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct ResourceLimitsJs {
-    /// Maximum memory in bytes
+    /// Maximum address space, in bytes.
     pub max_memory_bytes: Option<i64>,
-    /// Maximum CPU time in seconds
+    /// Maximum CPU time, in seconds.
     pub max_cpu_time_secs: Option<i64>,
-    /// Maximum file size in bytes
+    /// Maximum size of a file the process may create, in bytes.
     pub max_file_size_bytes: Option<i64>,
-    /// Maximum number of processes
-    pub max_processes: Option<u32>,
+    /// Maximum number of processes.
+    pub max_processes: Option<i64>,
 }
 
 impl ResourceLimitsJs {
-    pub fn into_rust(self) -> heel::ResourceLimits {
+    fn into_rust(self) -> Result<heel::ResourceLimits> {
         let mut builder = heel::ResourceLimits::builder();
 
-        if let Some(v) = self.max_memory_bytes
-            && v > 0
-        {
-            builder = builder.max_memory_bytes(v as u64);
-        }
-        if let Some(v) = self.max_cpu_time_secs
-            && v > 0
-        {
-            builder = builder.max_cpu_time_secs(v as u64);
-        }
-        if let Some(v) = self.max_file_size_bytes
-            && v > 0
-        {
-            builder = builder.max_file_size_bytes(v as u64);
-        }
-        if let Some(v) = self.max_processes {
-            builder = builder.max_processes(v);
+        // A limit is a promise about what the sandbox enforces, so a value that
+        // cannot be enforced is rejected rather than quietly dropped.
+        for (name, value) in [
+            ("maxMemoryBytes", self.max_memory_bytes),
+            ("maxCpuTimeSecs", self.max_cpu_time_secs),
+            ("maxFileSizeBytes", self.max_file_size_bytes),
+            ("maxProcesses", self.max_processes),
+        ] {
+            if let Some(value) = value
+                && value < 0
+            {
+                return Err(Error::from_reason(format!(
+                    "{name} must not be negative, got {value}"
+                )));
+            }
         }
 
-        builder.build()
+        if let Some(value) = self.max_memory_bytes {
+            builder = builder.max_memory_bytes(value as u64);
+        }
+        if let Some(value) = self.max_cpu_time_secs {
+            builder = builder.max_cpu_time_secs(value as u64);
+        }
+        if let Some(value) = self.max_file_size_bytes {
+            builder = builder.max_file_size_bytes(value as u64);
+        }
+        if let Some(value) = self.max_processes {
+            builder = builder.max_processes(value as u64);
+        }
+
+        Ok(builder.build())
     }
 }
 
-/// Main sandbox configuration from JavaScript
+/// How much of the host the sandbox can see.
+#[napi(string_enum)]
+pub enum IsolationJs {
+    /// Only the working directory is readable or writable.
+    Strict,
+    /// The working directory is writable; the rest of the system is readable.
+    Default,
+    /// The whole filesystem is readable and writable.
+    Permissive,
+}
+
+impl IsolationJs {
+    fn security_preset(self) -> SecurityConfig {
+        match self {
+            Self::Strict | Self::Default => SecurityConfig::strict(),
+            Self::Permissive => SecurityConfig::permissive(),
+        }
+    }
+
+    fn filesystem_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    fn writable_file_system(self) -> bool {
+        matches!(self, Self::Permissive)
+    }
+}
+
+/// Sandbox configuration.
 #[napi(object)]
 pub struct SandboxConfigJs {
-    /// Network policy configuration
+    /// Network policy; defaults to denying everything.
     pub network: Option<NetworkPolicyConfig>,
-    /// Security configuration
+    /// Isolation level; defaults to `default`.
+    pub isolation: Option<IsolationJs>,
+    /// Security toggles layered onto the isolation level's preset.
     pub security: Option<SecurityConfigJs>,
-    /// Enable strict filesystem mode (deny reads outside sandbox/allowlist)
-    pub filesystem_strict: Option<bool>,
-    /// Paths with write access
+    /// Paths the sandbox may write.
     pub writable_paths: Option<Vec<String>>,
-    /// Paths with read-only access
+    /// Paths the sandbox may read.
     pub readable_paths: Option<Vec<String>>,
-    /// Paths with execute access
+    /// Paths the sandbox may execute.
     pub executable_paths: Option<Vec<String>>,
-    /// Python configuration
+    /// Python configuration.
     pub python: Option<PythonConfigJs>,
-    /// Working directory path
+    /// Working directory; generated when omitted.
     pub working_dir: Option<String>,
-    /// Environment variables to pass through
+    /// Host environment variables to forward.
     pub env_passthrough: Option<Vec<String>>,
-    /// Resource limits
+    /// Resource limits.
     pub limits: Option<ResourceLimitsJs>,
-    // Note: IPC is handled separately at a higher level
 }
 
 impl SandboxConfigJs {
-    /// Convert to Rust SandboxConfig with NetworkPolicyWrapper
-    pub fn into_rust_config(self) -> Result<heel::SandboxConfig<NetworkPolicyWrapper>> {
-        // Parse network policy
-        let network_policy = match self.network {
-            Some(config) => NetworkPolicyWrapper::from_config(config)?,
-            None => NetworkPolicyWrapper::deny_all(),
-        };
+    /// Apply this configuration to a builder of the chosen policy type.
+    pub fn apply<N: NetworkPolicy>(
+        self,
+        builder: SandboxConfigBuilder<N>,
+    ) -> Result<SandboxConfig<N>> {
+        let isolation = self.isolation.unwrap_or(IsolationJs::Default);
+        let security = self
+            .security
+            .unwrap_or_default()
+            .apply_to(isolation.security_preset());
 
-        // Start building the config
-        let mut builder = heel::SandboxConfig::builder().network(network_policy);
+        let mut builder = builder
+            .security(security)
+            .filesystem_strict(isolation.filesystem_strict())
+            .writable_file_system(isolation.writable_file_system());
 
-        // Security config
-        if let Some(security) = self.security {
-            builder = builder.security(security.into_rust());
-        }
-        if let Some(strict_fs) = self.filesystem_strict {
-            builder = builder.filesystem_strict(strict_fs);
-        }
-
-        // Path configurations
         if let Some(paths) = self.writable_paths {
             builder = builder.writable_paths(paths.iter().map(PathBuf::from));
         }
@@ -105,38 +141,30 @@ impl SandboxConfigJs {
         if let Some(paths) = self.executable_paths {
             builder = builder.executable_paths(paths.iter().map(PathBuf::from));
         }
-
-        // Python config
         if let Some(python) = self.python {
-            builder = builder.python(python.into_rust());
+            builder = builder.python(python.into_rust()?);
         }
-
-        // Working directory
         if let Some(dir) = self.working_dir {
             builder = builder.working_dir(dir);
         }
-
-        // Environment passthrough
         if let Some(vars) = self.env_passthrough {
             builder = builder.env_passthroughs(vars);
         }
-
-        // Resource limits
         if let Some(limits) = self.limits {
-            builder = builder.limits(limits.into_rust());
+            builder = builder.limits(limits.into_rust()?);
         }
 
-        builder.build().into_napi()
+        Ok(builder.build())
     }
 }
 
-/// Get strict sandbox preset configuration
+/// A sandbox that exposes only its own working directory, with no network.
 #[napi]
 pub fn preset_strict() -> SandboxConfigJs {
     SandboxConfigJs {
-        network: None,  // DenyAll
-        security: None, // Strict by default
-        filesystem_strict: Some(true),
+        network: None,
+        isolation: Some(IsolationJs::Strict),
+        security: None,
         writable_paths: None,
         readable_paths: None,
         executable_paths: None,
@@ -147,43 +175,25 @@ pub fn preset_strict() -> SandboxConfigJs {
     }
 }
 
-/// Get Python dev sandbox preset configuration
+/// A sandbox for Python development, with writes to the virtual environment.
 #[napi]
 pub fn preset_python_dev() -> SandboxConfigJs {
     SandboxConfigJs {
-        network: None,
-        security: None,
-        filesystem_strict: None,
-        writable_paths: None,
-        readable_paths: None,
-        executable_paths: None,
         python: Some(PythonConfigJs {
             venv: None,
             allow_pip_install: Some(true),
         }),
-        working_dir: None,
-        env_passthrough: None,
-        limits: None,
+        ..preset_strict()
     }
 }
 
-/// Get Python data science sandbox preset configuration
+/// A sandbox for Python data science, with the usual toolchain preinstalled.
 #[napi]
 pub fn preset_python_data_science() -> SandboxConfigJs {
     SandboxConfigJs {
-        network: None,
-        security: None,
-        filesystem_strict: None,
-        writable_paths: None,
-        readable_paths: Some(vec!["/usr/share".to_string()]),
-        executable_paths: Some(vec![
-            "/usr/bin/ffmpeg".to_string(),
-            "/usr/local/bin/ffmpeg".to_string(),
-        ]),
+        isolation: Some(IsolationJs::Default),
         python: Some(PythonConfigJs {
             venv: Some(VenvConfigJs {
-                path: None,
-                python: None,
                 packages: Some(vec![
                     "numpy".to_string(),
                     "pandas".to_string(),
@@ -191,12 +201,10 @@ pub fn preset_python_data_science() -> SandboxConfigJs {
                     "scikit-learn".to_string(),
                 ]),
                 system_site_packages: Some(true),
-                use_uv: Some(true),
+                ..VenvConfigJs::default()
             }),
             allow_pip_install: Some(true),
         }),
-        working_dir: None,
-        env_passthrough: None,
-        limits: None,
+        ..preset_strict()
     }
 }

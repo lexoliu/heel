@@ -1,84 +1,124 @@
-use std::any::TypeId;
+//! Sandbox configuration.
+//!
+//! [`SandboxConfig`] pairs a [`NetworkPolicy`] with the policy-independent
+//! [`SandboxConfigData`] that platform backends consume. Building a config is
+//! pure: no directories are created and no other I/O happens until
+//! [`Sandbox`](crate::Sandbox) is constructed.
+
 use std::path::{Path, PathBuf};
 
-use crate::error::{Error, Result};
 use crate::ipc::IpcRouter;
 use crate::network::{DenyAll, NetworkPolicy};
 use crate::security::SecurityConfig;
-use crate::workdir::WorkingDir;
+use crate::workdir::generate_working_dir_name;
 
-/// Resource limits for sandboxed processes
+/// Resource limits applied to sandboxed processes.
+///
+/// Limits are enforced with `setrlimit` after fork and before exec, so they
+/// apply to the sandboxed process and everything it spawns.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceLimits {
     max_memory_bytes: Option<u64>,
     max_cpu_time_secs: Option<u64>,
     max_file_size_bytes: Option<u64>,
-    max_processes: Option<u32>,
+    max_processes: Option<u64>,
 }
 
 impl ResourceLimits {
-    /// Create a new builder for resource limits
+    /// Create a new builder for resource limits.
     pub fn builder() -> ResourceLimitsBuilder {
         ResourceLimitsBuilder::default()
     }
 
+    /// Maximum address space, in bytes (`RLIMIT_AS`).
     pub fn max_memory_bytes(&self) -> Option<u64> {
         self.max_memory_bytes
     }
 
+    /// Maximum CPU time, in seconds (`RLIMIT_CPU`).
     pub fn max_cpu_time_secs(&self) -> Option<u64> {
         self.max_cpu_time_secs
     }
 
+    /// Maximum size of a file the process may create, in bytes (`RLIMIT_FSIZE`).
     pub fn max_file_size_bytes(&self) -> Option<u64> {
         self.max_file_size_bytes
     }
 
-    pub fn max_processes(&self) -> Option<u32> {
+    /// Maximum number of processes for the sandboxed user (`RLIMIT_NPROC`).
+    pub fn max_processes(&self) -> Option<u64> {
         self.max_processes
+    }
+
+    /// Whether any limit is set.
+    pub fn is_empty(&self) -> bool {
+        self.max_memory_bytes.is_none()
+            && self.max_cpu_time_secs.is_none()
+            && self.max_file_size_bytes.is_none()
+            && self.max_processes.is_none()
     }
 }
 
-/// Builder for ResourceLimits
+/// Builder for [`ResourceLimits`].
 #[derive(Debug, Default)]
 pub struct ResourceLimitsBuilder {
     inner: ResourceLimits,
 }
 
 impl ResourceLimitsBuilder {
+    /// Limit the address space the sandboxed process may map.
     pub fn max_memory_bytes(mut self, bytes: u64) -> Self {
         self.inner.max_memory_bytes = Some(bytes);
         self
     }
 
+    /// Limit CPU time; the process is killed with `SIGKILL` past the hard limit.
     pub fn max_cpu_time_secs(mut self, secs: u64) -> Self {
         self.inner.max_cpu_time_secs = Some(secs);
         self
     }
 
+    /// Limit the size of files the sandboxed process may create.
     pub fn max_file_size_bytes(mut self, bytes: u64) -> Self {
         self.inner.max_file_size_bytes = Some(bytes);
         self
     }
 
-    pub fn max_processes(mut self, count: u32) -> Self {
+    /// Limit the number of processes the sandboxed user may run.
+    pub fn max_processes(mut self, count: u64) -> Self {
         self.inner.max_processes = Some(count);
         self
     }
 
+    /// Finish building.
     pub fn build(self) -> ResourceLimits {
         self.inner
     }
 }
 
-/// Configuration for Python virtual environment
+/// The tool used to create a virtual environment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VenvBackend {
+    /// Use `uv` when it is installed, and `python -m venv` otherwise.
+    ///
+    /// Either tool produces an environment that satisfies the configuration, so
+    /// this picks the faster one when it is available rather than failing.
+    #[default]
+    Auto,
+    /// Require `uv`, failing if it is not installed.
+    Uv,
+    /// Use `python -m venv`.
+    Python,
+}
+
+/// Configuration for a Python virtual environment.
 #[derive(Debug, Clone)]
 pub struct VenvConfig {
     path: PathBuf,
     python: Option<PathBuf>,
     packages: Vec<String>,
     system_site_packages: bool,
-    use_uv: bool,
+    backend: VenvBackend,
 }
 
 impl Default for VenvConfig {
@@ -88,224 +128,154 @@ impl Default for VenvConfig {
             python: None,
             packages: Vec::new(),
             system_site_packages: true,
-            use_uv: true,
+            backend: VenvBackend::default(),
         }
     }
 }
 
 impl VenvConfig {
-    /// Create a new builder for VenvConfig
+    /// Create a new builder for [`VenvConfig`].
     pub fn builder() -> VenvConfigBuilder {
         VenvConfigBuilder::default()
     }
 
+    /// Where the virtual environment lives.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// The interpreter used to create the environment, if pinned.
     pub fn python(&self) -> Option<&Path> {
         self.python.as_deref()
     }
 
+    /// Packages installed when the environment is created.
     pub fn packages(&self) -> &[String] {
         &self.packages
     }
 
+    /// Whether the environment sees the system's site-packages.
     pub fn system_site_packages(&self) -> bool {
         self.system_site_packages
     }
 
-    pub fn use_uv(&self) -> bool {
-        self.use_uv
+    /// The tool used to create the environment.
+    pub fn backend(&self) -> VenvBackend {
+        self.backend
     }
 }
 
-/// Builder for VenvConfig
+/// Builder for [`VenvConfig`].
 #[derive(Debug, Default)]
 pub struct VenvConfigBuilder {
     inner: VenvConfig,
 }
 
 impl VenvConfigBuilder {
+    /// Set where the environment lives.
     pub fn path(mut self, path: impl AsRef<Path>) -> Self {
         self.inner.path = path.as_ref().to_path_buf();
         self
     }
 
+    /// Pin the interpreter used to create the environment.
     pub fn python(mut self, python: impl AsRef<Path>) -> Self {
         self.inner.python = Some(python.as_ref().to_path_buf());
         self
     }
 
+    /// Install one package.
     pub fn package(mut self, pkg: impl Into<String>) -> Self {
         self.inner.packages.push(pkg.into());
         self
     }
 
+    /// Install several packages.
     pub fn packages(mut self, pkgs: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.inner.packages.extend(pkgs.into_iter().map(Into::into));
         self
     }
 
+    /// Expose the system's site-packages to the environment.
     pub fn system_site_packages(mut self, enabled: bool) -> Self {
         self.inner.system_site_packages = enabled;
         self
     }
 
-    pub fn use_uv(mut self, enabled: bool) -> Self {
-        self.inner.use_uv = enabled;
+    /// Choose the tool used to create the environment.
+    pub fn backend(mut self, backend: VenvBackend) -> Self {
+        self.inner.backend = backend;
         self
     }
 
+    /// Finish building.
     pub fn build(self) -> VenvConfig {
         self.inner
     }
 }
 
-/// Python sandbox configuration
-#[derive(Debug, Clone)]
+/// Python configuration for a sandbox.
+#[derive(Debug, Clone, Default)]
 pub struct PythonConfig {
     venv: VenvConfig,
+    /// Writes are off by default: an environment the sandbox can change
+    /// outlives the sandbox.
     allow_pip_install: bool,
 }
 
-impl Default for PythonConfig {
-    fn default() -> Self {
-        Self {
-            venv: VenvConfig::default(),
-            allow_pip_install: true,
-        }
-    }
-}
-
 impl PythonConfig {
-    /// Create a new builder for PythonConfig
+    /// Create a new builder for [`PythonConfig`].
     pub fn builder() -> PythonConfigBuilder {
         PythonConfigBuilder::default()
     }
 
+    /// The virtual environment configuration.
     pub fn venv(&self) -> &VenvConfig {
         &self.venv
     }
 
+    /// Whether the sandboxed process may write to the virtual environment.
+    ///
+    /// When `false` the environment is mounted read-and-execute only, so
+    /// `pip install` from inside the sandbox fails instead of mutating an
+    /// environment that outlives the sandbox.
     pub fn allow_pip_install(&self) -> bool {
         self.allow_pip_install
     }
 }
 
-/// Builder for PythonConfig
+/// Builder for [`PythonConfig`].
 #[derive(Debug, Default)]
 pub struct PythonConfigBuilder {
     inner: PythonConfig,
 }
 
 impl PythonConfigBuilder {
+    /// Set the virtual environment configuration.
     pub fn venv(mut self, config: VenvConfig) -> Self {
         self.inner.venv = config;
         self
     }
 
+    /// Let the sandboxed process write to the virtual environment.
     pub fn allow_pip_install(mut self, enabled: bool) -> Self {
         self.inner.allow_pip_install = enabled;
         self
     }
 
+    /// Finish building.
     pub fn build(self) -> PythonConfig {
         self.inner
     }
 }
 
-/// Sandbox configuration data (without network policy)
+/// Sandbox configuration without the network policy.
 ///
-/// This is used internally after the network policy has been extracted
-/// for the NetworkProxy.
+/// The policy is generic over the sandbox type, so it is split out before the
+/// configuration reaches the platform backends. Everything a backend needs to
+/// build a profile lives here.
+#[derive(Debug, Clone)]
 pub struct SandboxConfigData {
-    pub(crate) security: SecurityConfig,
-    pub(crate) writable_paths: Vec<PathBuf>,
-    pub(crate) readable_paths: Vec<PathBuf>,
-    pub(crate) executable_paths: Vec<PathBuf>,
-    pub(crate) network_deny_all: bool,
-    pub(crate) python: Option<PythonConfig>,
-    pub(crate) working_dir: PathBuf,
-    pub(crate) working_dir_auto_created: bool,
-    pub(crate) filesystem_strict: bool,
-    pub(crate) writable_file_system: bool,
-    pub(crate) env_passthrough: Vec<String>,
-    pub(crate) limits: ResourceLimits,
-    pub(crate) ipc: Option<IpcRouter>,
-    /// Runtime IPC TCP port selected by the sandbox server.
-    /// `None` means IPC is disabled.
-    pub(crate) ipc_port: Option<u16>,
-    /// Whether to allow writing to /dev/tty (controlling terminal).
-    /// When false, all output must go through stdout/stderr pipes.
-    pub(crate) allow_tty_write: bool,
-}
-
-impl SandboxConfigData {
-    pub fn writable_file_system(&self) -> bool {
-        self.writable_file_system
-    }
-
-    pub fn security(&self) -> &SecurityConfig {
-        &self.security
-    }
-
-    pub fn writable_paths(&self) -> &[PathBuf] {
-        &self.writable_paths
-    }
-
-    pub fn readable_paths(&self) -> &[PathBuf] {
-        &self.readable_paths
-    }
-
-    pub fn executable_paths(&self) -> &[PathBuf] {
-        &self.executable_paths
-    }
-
-    pub fn network_deny_all(&self) -> bool {
-        self.network_deny_all
-    }
-
-    pub fn python(&self) -> Option<&PythonConfig> {
-        self.python.as_ref()
-    }
-
-    pub fn working_dir(&self) -> &Path {
-        &self.working_dir
-    }
-
-    pub fn filesystem_strict(&self) -> bool {
-        self.filesystem_strict
-    }
-
-    pub fn env_passthrough(&self) -> &[String] {
-        &self.env_passthrough
-    }
-
-    pub fn limits(&self) -> &ResourceLimits {
-        &self.limits
-    }
-
-    pub fn ipc(&self) -> Option<&IpcRouter> {
-        self.ipc.as_ref()
-    }
-
-    pub fn ipc_port(&self) -> Option<u16> {
-        self.ipc_port
-    }
-
-    pub fn allow_tty_write(&self) -> bool {
-        self.allow_tty_write
-    }
-
-    pub(crate) fn set_ipc_port(&mut self, port: Option<u16>) {
-        self.ipc_port = port;
-    }
-}
-
-/// Main sandbox configuration
-pub struct SandboxConfig<N: NetworkPolicy = DenyAll> {
-    network: N,
     security: SecurityConfig,
     writable_paths: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
@@ -313,327 +283,363 @@ pub struct SandboxConfig<N: NetworkPolicy = DenyAll> {
     network_deny_all: bool,
     python: Option<PythonConfig>,
     working_dir: PathBuf,
-    working_dir_auto_created: bool,
+    working_dir_auto: bool,
     filesystem_strict: bool,
     writable_file_system: bool,
     env_passthrough: Vec<String>,
     limits: ResourceLimits,
-    ipc: Option<IpcRouter>,
+    /// Path of the IPC socket, once the server is listening. `None` disables IPC.
+    ipc_socket: Option<PathBuf>,
+    /// Explicit path to the `heel` binary that IPC shims execute.
+    heel_binary: Option<PathBuf>,
     allow_tty_write: bool,
 }
 
+impl SandboxConfigData {
+    /// Whether the whole filesystem is writable (permissive mode).
+    pub fn writable_file_system(&self) -> bool {
+        self.writable_file_system
+    }
+
+    /// Fine-grained protection toggles.
+    pub fn security(&self) -> &SecurityConfig {
+        &self.security
+    }
+
+    /// Paths the sandboxed process may write.
+    pub fn writable_paths(&self) -> &[PathBuf] {
+        &self.writable_paths
+    }
+
+    /// Paths the sandboxed process may read.
+    pub fn readable_paths(&self) -> &[PathBuf] {
+        &self.readable_paths
+    }
+
+    /// Paths the sandboxed process may execute.
+    pub fn executable_paths(&self) -> &[PathBuf] {
+        &self.executable_paths
+    }
+
+    /// Whether the network policy rejects everything, letting the backend deny
+    /// outbound traffic in the kernel instead of in the proxy.
+    pub fn network_deny_all(&self) -> bool {
+        self.network_deny_all
+    }
+
+    /// Python configuration, if any.
+    pub fn python(&self) -> Option<&PythonConfig> {
+        self.python.as_ref()
+    }
+
+    /// The sandbox working directory.
+    pub fn working_dir(&self) -> &Path {
+        &self.working_dir
+    }
+
+    /// Whether the working directory path was generated rather than supplied.
+    pub fn working_dir_is_auto(&self) -> bool {
+        self.working_dir_auto
+    }
+
+    /// Whether reads outside the working directory and allow list are denied.
+    pub fn filesystem_strict(&self) -> bool {
+        self.filesystem_strict
+    }
+
+    /// Host environment variables forwarded into the sandbox.
+    pub fn env_passthrough(&self) -> &[String] {
+        &self.env_passthrough
+    }
+
+    /// Resource limits applied to sandboxed processes.
+    pub fn limits(&self) -> &ResourceLimits {
+        &self.limits
+    }
+
+    /// The IPC socket path, once the IPC server is listening.
+    pub fn ipc_socket(&self) -> Option<&Path> {
+        self.ipc_socket.as_deref()
+    }
+
+    /// The configured `heel` binary that IPC shims execute, if one was set.
+    pub fn heel_binary(&self) -> Option<&Path> {
+        self.heel_binary.as_deref()
+    }
+
+    /// Whether the sandboxed process may write to the controlling terminal.
+    pub fn allow_tty_write(&self) -> bool {
+        self.allow_tty_write
+    }
+
+    /// Replace the working directory with its canonical, created form.
+    pub(crate) fn set_working_dir(&mut self, path: PathBuf) {
+        self.working_dir = path;
+    }
+
+    /// Record the IPC socket the server bound.
+    pub(crate) fn set_ipc_socket(&mut self, path: Option<PathBuf>) {
+        self.ipc_socket = path;
+    }
+
+    /// Register a path the sandboxed process must be able to execute.
+    pub(crate) fn push_executable_path(&mut self, path: PathBuf) {
+        if !self.executable_paths.contains(&path) {
+            self.executable_paths.push(path);
+        }
+    }
+}
+
+/// A sandbox configuration: a network policy plus everything else.
+pub struct SandboxConfig<N: NetworkPolicy = DenyAll> {
+    network: N,
+    data: SandboxConfigData,
+    ipc: Option<IpcRouter>,
+}
+
 impl SandboxConfig<DenyAll> {
-    /// Create a new SandboxConfig with default settings
-    ///
-    /// This creates a random working directory in the current directory
-    /// using four English words connected by hyphens.
-    pub fn new() -> Result<Self> {
+    /// Create a configuration with default settings and no network access.
+    pub fn new() -> Self {
         SandboxConfigBuilder::default().build()
     }
 
-    /// Create a new builder for SandboxConfig
+    /// Create a new builder.
     pub fn builder() -> SandboxConfigBuilder<DenyAll> {
         SandboxConfigBuilder::default()
     }
 }
 
+impl Default for SandboxConfig<DenyAll> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<N: NetworkPolicy> SandboxConfig<N> {
-    /// Consume the config and return the network policy and remaining config data
-    ///
-    /// This is used internally by Sandbox to extract the policy for the NetworkProxy.
-    pub(crate) fn into_parts(self) -> (N, SandboxConfigData) {
-        (
-            self.network,
-            SandboxConfigData {
-                security: self.security,
-                writable_paths: self.writable_paths,
-                readable_paths: self.readable_paths,
-                executable_paths: self.executable_paths,
-                network_deny_all: self.network_deny_all,
-                python: self.python,
-                working_dir: self.working_dir,
-                working_dir_auto_created: self.working_dir_auto_created,
-                filesystem_strict: self.filesystem_strict,
-                writable_file_system: self.writable_file_system,
-                env_passthrough: self.env_passthrough,
-                limits: self.limits,
-                ipc: self.ipc,
-                ipc_port: None,
-                allow_tty_write: self.allow_tty_write,
-            },
-        )
+    /// Split the configuration into its policy, its data, and its IPC router.
+    pub(crate) fn into_parts(self) -> (N, SandboxConfigData, Option<IpcRouter>) {
+        (self.network, self.data, self.ipc)
     }
 
-    pub fn writable_file_system(&self) -> bool {
-        self.writable_file_system
-    }
-
+    /// The network policy.
     pub fn network(&self) -> &N {
         &self.network
     }
 
-    pub fn security(&self) -> &SecurityConfig {
-        &self.security
+    /// The policy-independent configuration.
+    pub fn data(&self) -> &SandboxConfigData {
+        &self.data
     }
 
-    pub fn writable_paths(&self) -> &[PathBuf] {
-        &self.writable_paths
-    }
-
-    pub fn readable_paths(&self) -> &[PathBuf] {
-        &self.readable_paths
-    }
-
-    pub fn executable_paths(&self) -> &[PathBuf] {
-        &self.executable_paths
-    }
-
-    pub fn python(&self) -> Option<&PythonConfig> {
-        self.python.as_ref()
-    }
-
-    pub fn working_dir(&self) -> &Path {
-        &self.working_dir
-    }
-
-    pub fn filesystem_strict(&self) -> bool {
-        self.filesystem_strict
-    }
-
-    pub fn env_passthrough(&self) -> &[String] {
-        &self.env_passthrough
-    }
-
-    pub fn limits(&self) -> &ResourceLimits {
-        &self.limits
-    }
-
+    /// The IPC router, if one is registered.
     pub fn ipc(&self) -> Option<&IpcRouter> {
         self.ipc.as_ref()
     }
 }
 
-/// Builder for SandboxConfig
+/// Builder for [`SandboxConfig`].
 pub struct SandboxConfigBuilder<N: NetworkPolicy = DenyAll> {
     network: N,
-    security: SecurityConfig,
-    writable_paths: Vec<PathBuf>,
-    readable_paths: Vec<PathBuf>,
-    executable_paths: Vec<PathBuf>,
-    network_deny_all: bool,
-    python: Option<PythonConfig>,
-    working_dir: Option<PathBuf>,
-    filesystem_strict: bool,
-    writable_file_system: bool,
-    env_passthrough: Vec<String>,
-    limits: ResourceLimits,
+    data: SandboxConfigData,
     ipc: Option<IpcRouter>,
-    allow_tty_write: bool,
 }
 
 impl Default for SandboxConfigBuilder<DenyAll> {
     fn default() -> Self {
         Self {
             network: DenyAll,
-            security: SecurityConfig::default(),
-            writable_paths: Vec::new(),
-            readable_paths: Vec::new(),
-            executable_paths: Vec::new(),
-            network_deny_all: true,
-            python: None,
-            working_dir: None, // Will generate random name on build()
-            filesystem_strict: true,
-            writable_file_system: false,
-            env_passthrough: Vec::new(),
-            limits: ResourceLimits::default(),
+            data: SandboxConfigData {
+                security: SecurityConfig::default(),
+                writable_paths: Vec::new(),
+                readable_paths: Vec::new(),
+                executable_paths: Vec::new(),
+                network_deny_all: DenyAll::DENIES_ALL,
+                python: None,
+                // Resolved on build(); replaced by the canonical path when the
+                // sandbox creates it.
+                working_dir: PathBuf::new(),
+                working_dir_auto: true,
+                filesystem_strict: true,
+                writable_file_system: false,
+                env_passthrough: Vec::new(),
+                limits: ResourceLimits::default(),
+                ipc_socket: None,
+                heel_binary: None,
+                // Deny /dev/tty writes by default so all output is captured.
+                allow_tty_write: false,
+            },
             ipc: None,
-            allow_tty_write: false, // Default: deny /dev/tty writes to capture all output
         }
     }
 }
 
 impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
-    /// Set the network policy (changes the generic type)
+    /// Set the network policy, changing the configuration's type.
     pub fn network<M: NetworkPolicy>(self, policy: M) -> SandboxConfigBuilder<M> {
+        let mut data = self.data;
+        data.network_deny_all = M::DENIES_ALL;
         SandboxConfigBuilder {
             network: policy,
-            security: self.security,
-            writable_paths: self.writable_paths,
-            readable_paths: self.readable_paths,
-            executable_paths: self.executable_paths,
-            network_deny_all: TypeId::of::<M>() == TypeId::of::<DenyAll>(),
-            python: self.python,
-            working_dir: self.working_dir,
-            filesystem_strict: self.filesystem_strict,
-            writable_file_system: self.writable_file_system,
-            env_passthrough: self.env_passthrough,
-            limits: self.limits,
+            data,
             ipc: self.ipc,
-            allow_tty_write: self.allow_tty_write,
         }
     }
 
-    /// Set the security configuration
+    /// Set the fine-grained protection toggles.
     pub fn security(mut self, security: SecurityConfig) -> Self {
-        self.security = security;
+        self.data.security = security;
         self
     }
 
+    /// Allow writing one path.
     pub fn writable_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.writable_paths.push(path.as_ref().to_path_buf());
+        self.data.writable_paths.push(path.as_ref().to_path_buf());
         self
     }
 
+    /// Allow writing several paths.
     pub fn writable_paths(mut self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
-        self.writable_paths
+        self.data
+            .writable_paths
             .extend(paths.into_iter().map(|p| p.as_ref().to_path_buf()));
         self
     }
 
+    /// Allow reading one path.
     pub fn readable_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.readable_paths.push(path.as_ref().to_path_buf());
+        self.data.readable_paths.push(path.as_ref().to_path_buf());
         self
     }
 
+    /// Allow reading several paths.
     pub fn readable_paths(mut self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
-        self.readable_paths
+        self.data
+            .readable_paths
             .extend(paths.into_iter().map(|p| p.as_ref().to_path_buf()));
         self
     }
 
+    /// Allow executing one path.
     pub fn executable_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.executable_paths.push(path.as_ref().to_path_buf());
+        self.data.executable_paths.push(path.as_ref().to_path_buf());
         self
     }
 
+    /// Allow executing several paths.
     pub fn executable_paths(mut self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
-        self.executable_paths
+        self.data
+            .executable_paths
             .extend(paths.into_iter().map(|p| p.as_ref().to_path_buf()));
         self
     }
 
+    /// Configure Python support.
     pub fn python(mut self, config: PythonConfig) -> Self {
-        self.python = Some(config);
+        self.data.python = Some(config);
         self
     }
 
-    /// Enable strict filesystem mode (deny reads outside sandbox/allowlist).
+    /// Deny reads outside the working directory and the allow list.
     pub fn filesystem_strict(mut self, enabled: bool) -> Self {
-        self.filesystem_strict = enabled;
+        self.data.filesystem_strict = enabled;
         self
     }
 
-    /// Enable globally writable filesystem
+    /// Make the whole filesystem writable (permissive mode).
     pub fn writable_file_system(mut self, enabled: bool) -> Self {
-        self.writable_file_system = enabled;
+        self.data.writable_file_system = enabled;
         self
     }
 
-    /// Set the working directory path
+    /// Use a specific working directory instead of a generated one.
     ///
-    /// If not set, a random directory name will be generated in the current directory.
-    /// The directory will be created if it doesn't exist.
+    /// The directory is created when the sandbox starts if it does not exist.
+    /// A directory supplied here is never deleted when the sandbox is dropped.
     pub fn working_dir(mut self, path: impl AsRef<Path>) -> Self {
-        self.working_dir = Some(path.as_ref().to_path_buf());
+        self.data.working_dir = path.as_ref().to_path_buf();
+        self.data.working_dir_auto = false;
         self
     }
 
+    /// Forward one host environment variable into the sandbox.
     pub fn env_passthrough(mut self, var: impl Into<String>) -> Self {
-        self.env_passthrough.push(var.into());
+        self.data.env_passthrough.push(var.into());
         self
     }
 
+    /// Forward several host environment variables into the sandbox.
     pub fn env_passthroughs(mut self, vars: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.env_passthrough
+        self.data
+            .env_passthrough
             .extend(vars.into_iter().map(Into::into));
         self
     }
 
+    /// Apply resource limits to sandboxed processes.
     pub fn limits(mut self, limits: ResourceLimits) -> Self {
-        self.limits = limits;
+        self.data.limits = limits;
         self
     }
 
-    /// Set the IPC router for handling commands from sandboxed processes
+    /// Expose host-side commands to sandboxed processes over IPC.
     pub fn ipc(mut self, router: IpcRouter) -> Self {
         self.ipc = Some(router);
         self
     }
 
-    /// Allow writing to /dev/tty (controlling terminal)
+    /// Use a specific `heel` binary for the generated IPC command shims.
     ///
-    /// When false (default), sandboxed processes cannot write directly to the terminal,
-    /// ensuring all output goes through captured stdout/stderr.
-    /// Enable this for interactive sessions that need terminal access.
-    pub fn allow_tty_write(mut self, enabled: bool) -> Self {
-        self.allow_tty_write = enabled;
+    /// Without this the binary is found through `HEEL_BIN`, the running
+    /// executable, or `PATH`. Set it when embedding heel in an application that
+    /// ships its own copy.
+    pub fn heel_binary(mut self, path: impl AsRef<Path>) -> Self {
+        self.data.heel_binary = Some(path.as_ref().to_path_buf());
         self
     }
 
-    pub fn build(self) -> Result<SandboxConfig<N>> {
-        // Resolve working directory: use specified path or create random one
-        let working_dir_auto_created = self.working_dir.is_none();
-        let working_dir = match self.working_dir {
-            Some(path) => {
-                // User specified a path - create if needed
-                if !path.exists() {
-                    std::fs::create_dir_all(&path).map_err(|e| {
-                        Error::IoError(format!(
-                            "Failed to create working directory '{}': {}",
-                            path.display(),
-                            e
-                        ))
-                    })?;
-                    tracing::debug!(path = %path.display(), "created working directory");
-                }
-                path
-            }
-            None => {
-                // Generate random working directory
-                let work_dir = WorkingDir::random()?;
-                tracing::info!(path = %work_dir.path().display(), "created random working directory");
-                work_dir.path().to_path_buf()
-            }
-        };
+    /// Let the sandboxed process write to the controlling terminal.
+    ///
+    /// When `false` (the default), output must go through the captured
+    /// stdout/stderr pipes. Interactive sessions need this enabled.
+    pub fn allow_tty_write(mut self, enabled: bool) -> Self {
+        self.data.allow_tty_write = enabled;
+        self
+    }
 
-        Ok(SandboxConfig {
+    /// Finish building.
+    ///
+    /// This performs no I/O: the working directory is created when the sandbox
+    /// is constructed.
+    pub fn build(self) -> SandboxConfig<N> {
+        let mut data = self.data;
+        if data.working_dir_auto {
+            data.working_dir = std::env::temp_dir().join(generate_working_dir_name());
+        }
+
+        SandboxConfig {
             network: self.network,
-            security: self.security,
-            writable_paths: self.writable_paths,
-            readable_paths: self.readable_paths,
-            executable_paths: self.executable_paths,
-            network_deny_all: self.network_deny_all,
-            python: self.python,
-            working_dir,
-            working_dir_auto_created,
-            filesystem_strict: self.filesystem_strict,
-            writable_file_system: self.writable_file_system,
-            env_passthrough: self.env_passthrough,
-            limits: self.limits,
+            data,
             ipc: self.ipc,
-            allow_tty_write: self.allow_tty_write,
-        })
+        }
     }
 }
 
-/// Create a strict sandbox config with no network and minimal access
-///
-/// Strict mode denies filesystem reads outside the sandbox/allowlist.
-pub fn strict_preset() -> Result<SandboxConfig<DenyAll>> {
+/// A sandbox that only exposes its own working directory, with no network.
+pub fn strict_preset() -> SandboxConfig<DenyAll> {
     SandboxConfigBuilder::default()
         .filesystem_strict(true)
         .build()
 }
 
-/// Create a sandbox config for Python development with pip install capability
-pub fn python_dev_preset() -> Result<SandboxConfig<DenyAll>> {
+/// A sandbox for Python development, with writes to the virtual environment.
+pub fn python_dev_preset() -> SandboxConfig<DenyAll> {
     SandboxConfigBuilder::default()
         .python(PythonConfig::builder().allow_pip_install(true).build())
         .build()
 }
 
-/// Create a sandbox config for Python data science with common tools
-pub fn python_data_science_preset() -> Result<SandboxConfig<DenyAll>> {
+/// A sandbox for Python data science, with the usual toolchain preinstalled.
+pub fn python_data_science_preset() -> SandboxConfig<DenyAll> {
     SandboxConfigBuilder::default()
         .python(
             PythonConfig::builder()
@@ -646,8 +652,55 @@ pub fn python_data_science_preset() -> Result<SandboxConfig<DenyAll>> {
                 .allow_pip_install(true)
                 .build(),
         )
-        .executable_path("/usr/bin/ffmpeg")
-        .executable_path("/usr/local/bin/ffmpeg")
         .readable_path("/usr/share")
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::{AllowAll, AllowList};
+
+    #[test]
+    fn default_config_denies_network_without_a_runtime_type_check() {
+        let config = SandboxConfig::new();
+        assert!(config.data().network_deny_all());
+    }
+
+    #[test]
+    fn setting_a_permissive_policy_clears_the_deny_all_marker() {
+        let config = SandboxConfig::builder().network(AllowAll).build();
+        assert!(!config.data().network_deny_all());
+
+        let config = SandboxConfig::builder()
+            .network(AllowList::new(["example.com"]))
+            .build();
+        assert!(!config.data().network_deny_all());
+    }
+
+    #[test]
+    fn building_creates_no_directories() {
+        let config = SandboxConfig::new();
+        assert!(config.data().working_dir_is_auto());
+        assert!(
+            !config.data().working_dir().exists(),
+            "build() must not touch the filesystem"
+        );
+    }
+
+    #[test]
+    fn explicit_working_dir_is_not_auto() {
+        let config = SandboxConfig::builder()
+            .working_dir("/tmp/heel-fixed")
+            .build();
+        assert!(!config.data().working_dir_is_auto());
+        assert_eq!(config.data().working_dir(), Path::new("/tmp/heel-fixed"));
+    }
+
+    #[test]
+    fn generated_working_dirs_are_unique() {
+        let first = SandboxConfig::new();
+        let second = SandboxConfig::new();
+        assert_ne!(first.data().working_dir(), second.data().working_dir());
+    }
 }

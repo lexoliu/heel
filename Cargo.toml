@@ -1,6 +1,29 @@
 [workspace]
 members = [".", "nodejs"]
 
+# Lints are configured once for the workspace so the library, the CLI and the
+# Node bindings are all held to the same standard.
+# Release profile lives at the workspace root; cargo ignores profiles declared
+# by non-root members.
+[profile.release]
+lto = true
+strip = "symbols"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+# Correctness and clarity, tuned for a crate whose job is enforcing boundaries.
+undocumented_unsafe_blocks = "warn"
+missing_panics_doc = "warn"
+unwrap_used = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
 [package]
 name = "heel"
 version = "0.1.1"
@@ -19,6 +42,9 @@ path = "src/bin/heel/main.rs"
 default = ["python"]
 python = ["which"]
 
+[lints]
+workspace = true
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 # Serialization for IPC
@@ -33,6 +59,8 @@ thiserror = "2"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+humantime = "2"
 
 # HTTP proxy
 hyper = { version = "1", features = ["http1", "server", "client"] }
@@ -42,7 +70,6 @@ bytes = "1.11.1"
 # Runtime-agnostic async (smol-based by default)
 executor-core = { version = "0.7", features = ["async-executor", "std"] }
 async-net = "2"
-async-io = "2"
 futures-lite = "2"
 blocking = "1"
 smol = "2"
@@ -62,6 +89,9 @@ rand = "0.8"
 
 # Directory operations
 remove_dir_all = "0.8"
+smol-hyper = "0.1.1"
+async-channel = "2.5.0"
+interprocess = { version = "2", default-features = false }
 
 # Unix process management
 [target.'cfg(unix)'.dependencies]
@@ -80,7 +110,6 @@ optional = true
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.4"
-nix = { version = "0.29", features = ["process", "feature"] }
 
 # Windows-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -92,5 +121,6 @@ windows = { version = "0.58", features = [
 ] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 executor-core = { version = "0.7", features = ["tokio"] }
+tempfile = "3"

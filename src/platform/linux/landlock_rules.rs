@@ -1,113 +1,55 @@
-//! Landlock ruleset generation for Linux sandbox
+//! Landlock ruleset generation for the Linux sandbox.
 //!
-//! Landlock provides kernel-level filesystem and network access control.
-//! We use Landlock ABI v4 which supports:
-//! - Filesystem access control (read, write, execute, etc.)
-//! - Network TCP connection restrictions
+//! Landlock is default-deny for every access right the ruleset *handles*: a
+//! right that is not handled is left entirely unrestricted. Both the filesystem
+//! rights and TCP connections are therefore always handled, and permissions are
+//! granted back one path or port at a time.
 
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, BitFlags, NetPort, PathBeneath, PathFd, RestrictSelfError,
-    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus,
-    make_bitflags,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
+    PathFd, RestrictSelfError, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    RulesetError, RulesetStatus, make_bitflags,
 };
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
-use crate::security::SecurityConfig;
 
-/// Minimal config snapshot for building Landlock rulesets
-#[derive(Clone)]
-pub struct LandlockConfig {
-    security: SecurityConfig,
-    writable_paths: Vec<PathBuf>,
-    readable_paths: Vec<PathBuf>,
-    executable_paths: Vec<PathBuf>,
-    network_deny_all: bool,
-    ipc_port: Option<u16>,
-    python_venv_path: Option<PathBuf>,
-    working_dir: PathBuf,
-    filesystem_strict: bool,
-    writable_file_system: bool,
-}
+/// The Landlock ABI this backend requires.
+///
+/// v4 is the first version that can restrict TCP connections, which the network
+/// policy depends on.
+pub(crate) const REQUIRED_ABI: ABI = ABI::V4;
 
-impl LandlockConfig {
-    pub fn from_config(config: &SandboxConfigData) -> Self {
-        Self {
-            security: config.security().clone(),
-            writable_paths: config.writable_paths().to_vec(),
-            readable_paths: config.readable_paths().to_vec(),
-            executable_paths: config.executable_paths().to_vec(),
-            network_deny_all: config.network_deny_all(),
-            ipc_port: config.ipc_port(),
-            python_venv_path: config.python().map(|p| p.venv().path().to_path_buf()),
-            working_dir: config.working_dir().to_path_buf(),
-            filesystem_strict: config.filesystem_strict(),
-            writable_file_system: config.writable_file_system(),
-        }
-    }
-
-    pub fn security(&self) -> &SecurityConfig {
-        &self.security
-    }
-
-    pub fn writable_paths(&self) -> &[PathBuf] {
-        &self.writable_paths
-    }
-
-    pub fn readable_paths(&self) -> &[PathBuf] {
-        &self.readable_paths
-    }
-
-    pub fn executable_paths(&self) -> &[PathBuf] {
-        &self.executable_paths
-    }
-
-    pub fn network_deny_all(&self) -> bool {
-        self.network_deny_all
-    }
-
-    pub fn ipc_port(&self) -> Option<u16> {
-        self.ipc_port
-    }
-
-    pub fn python_venv_path(&self) -> Option<&Path> {
-        self.python_venv_path.as_deref()
-    }
-
-    pub fn working_dir(&self) -> &Path {
-        &self.working_dir
-    }
-
-    pub fn filesystem_strict(&self) -> bool {
-        self.filesystem_strict
-    }
-
-    pub fn writable_file_system(&self) -> bool {
-        self.writable_file_system
-    }
-}
-
-/// A prepared Landlock ruleset ready to be applied in pre_exec
-pub struct PreparedRuleset {
+/// A ruleset built on the host, ready to be applied after fork.
+pub(crate) struct PreparedRuleset {
     inner: RulesetCreated,
 }
 
+// `RulesetCreated` is an opaque kernel handle with no `Debug` of its own, but
+// callers still need to format a `Result` holding one.
+impl std::fmt::Debug for PreparedRuleset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRuleset").finish_non_exhaustive()
+    }
+}
+
 impl PreparedRuleset {
-    /// Apply the ruleset to the current process (call in pre_exec)
+    /// Apply the ruleset to the current process. Called from `pre_exec`.
     ///
-    /// Fails fast if the ruleset is not fully enforced.
-    pub fn restrict_self(self) -> std::io::Result<()> {
+    /// Anything short of full enforcement is an error: a partially applied
+    /// sandbox looks like a sandbox but does not act like one.
+    pub(crate) fn restrict_self(self) -> std::io::Result<()> {
         let status = self.inner.restrict_self().map_err(landlock_error_to_io)?;
 
-        // Fast-fail if not fully enforced
         match status.ruleset {
             RulesetStatus::FullyEnforced => Ok(()),
-            RulesetStatus::PartiallyEnforced => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
-            RulesetStatus::NotEnforced => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            RulesetStatus::PartiallyEnforced | RulesetStatus::NotEnforced => {
+                Err(std::io::Error::from_raw_os_error(libc::EPERM))
+            }
         }
     }
 }
@@ -120,32 +62,74 @@ fn landlock_error_to_io(error: RulesetError) -> std::io::Error {
     }
 }
 
-/// Build a Landlock ruleset from sandbox configuration
-pub fn build_ruleset(config: &LandlockConfig, proxy_port: u16) -> Result<PreparedRuleset> {
-    // We require ABI v4 for network restrictions
-    let abi = ABI::V4;
+/// Verify that the running kernel supports the ABI this backend requires.
+///
+/// Creating a ruleset is a single syscall, so this is a cheap, side-effect-free
+/// probe. It replaces testing the sandbox in a forked child, which is unsound
+/// in a multi-threaded process.
+pub(crate) fn probe_support() -> Result<()> {
+    Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(REQUIRED_ABI))
+        .and_then(|ruleset| ruleset.handle_access(AccessNet::ConnectTcp))
+        .and_then(|ruleset| ruleset.create())
+        .map(|_ruleset| ())
+        .map_err(|error| {
+            Error::NotEnforced(format!(
+                "Landlock ABI v{} is required but unavailable: {error}",
+                REQUIRED_ABI as i32
+            ))
+        })
+}
 
-    // Start with all filesystem access rights handled (deny by default)
-    let fs_access = AccessFs::from_all(abi);
-    let net_access = AccessNet::ConnectTcp;
+/// Build the ruleset for a sandbox configuration.
+///
+/// `proxy_port` is `Some` only when the network policy permits traffic.
+pub(crate) fn build_ruleset(
+    config: &SandboxConfigData,
+    proxy_port: Option<u16>,
+) -> Result<PreparedRuleset> {
+    let abi = REQUIRED_ABI;
 
+    // Both filesystem access and TCP connections are always handled. Handling
+    // TCP unconditionally is what makes a deny-all policy actually deny: an
+    // unhandled right is not restricted at all.
     let mut ruleset = Ruleset::default()
-        .handle_access(fs_access)
-        .map_err(|e| Error::InvalidProfile(format!("Landlock fs access error: {}", e)))?;
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(abi))
+        .and_then(|ruleset| ruleset.handle_access(AccessNet::ConnectTcp))
+        .and_then(|ruleset| ruleset.create())
+        .map_err(|error| Error::InvalidProfile(format!("Landlock ruleset error: {error}")))?;
 
-    if !config.network_deny_all() || config.ipc_port().is_some() {
+    add_system_rules(&mut ruleset, config, abi)?;
+    add_device_rules(&mut ruleset, config, abi)?;
+    add_configured_rules(&mut ruleset, config, abi)?;
+
+    // Outbound TCP is denied except to the proxy, which applies the policy.
+    if let Some(port) = proxy_port {
         ruleset = ruleset
-            .handle_access(net_access)
-            .map_err(|e| Error::InvalidProfile(format!("Landlock net access error: {}", e)))?;
+            .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+            .map_err(|e| Error::InvalidProfile(format!("Landlock proxy rule error: {e}")))?;
     }
 
-    let mut ruleset = ruleset
-        .create()
-        .map_err(|e| Error::InvalidProfile(format!("Landlock ruleset create error: {}", e)))?;
+    tracing::debug!(
+        proxy_port,
+        working_dir = %config.working_dir().display(),
+        strict = config.filesystem_strict(),
+        "landlock: ruleset built"
+    );
 
-    // --- System paths (read + execute for binaries/libraries) ---
-    // These paths need both read and execute for running programs
-    let system_exec_paths: &[&str] = if config.filesystem_strict() {
+    Ok(PreparedRuleset { inner: ruleset })
+}
+
+/// Grant access to the system paths any process needs to start.
+fn add_system_rules(
+    ruleset: &mut RulesetCreated,
+    config: &SandboxConfigData,
+    abi: ABI,
+) -> Result<()> {
+    // Executables and shared libraries.
+    let exec_paths: &[&str] = if config.filesystem_strict() {
         &[
             "/bin",
             "/sbin",
@@ -163,138 +147,259 @@ pub fn build_ruleset(config: &LandlockConfig, proxy_port: u16) -> Result<Prepare
     } else {
         &["/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin"]
     };
-    let system_exec_access = make_bitflags!(AccessFs::{
-        ReadFile | ReadDir | Execute
-    });
 
-    for path in system_exec_paths {
-        add_path_rule(&mut ruleset, path, system_exec_access, abi)?;
+    // Permissive mode makes the system directories writable as well; otherwise
+    // they are read and execute only.
+    let exec_access = if config.writable_file_system() {
+        AccessFs::from_all(abi)
+    } else {
+        make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute })
+    };
+    for path in exec_paths {
+        add_system_path(ruleset, path, exec_access, abi)?;
     }
 
-    // System config and pseudo-filesystems (read-only, no execute needed)
-    //
-    // These are required even in strict mode:
-    // - dynamic loaders and libc consult files under /etc
-    // - procfs/sysfs expose kernel and process metadata many tools rely on
-    // - /run holds runtime resolver and system state
-    //
-    // They remain read-only, so strict mode still blocks writes and user-owned secrets.
-    let system_read_paths = ["/etc", "/proc", "/sys", "/run"];
-
-    for path in &system_read_paths {
-        add_path_rule(&mut ruleset, path, AccessFs::from_read(abi), abi)?;
+    // Read-only system state. Required even in strict mode: the dynamic loader
+    // and libc consult /etc, and many tools read process metadata from /proc.
+    for path in ["/etc", "/proc", "/sys", "/run"] {
+        add_system_path(ruleset, path, AccessFs::from_read(abi), abi)?;
     }
 
-    // --- Temp directories (read + write) ---
-    let temp_paths = ["/tmp", "/var/tmp"];
-    for path in &temp_paths {
-        add_path_rule(&mut ruleset, path, AccessFs::from_all(abi), abi)?;
+    // Shared temp directories are readable outside strict mode, and writable
+    // only when the whole filesystem is. They are never executable: giving up
+    // isolation is what permissive mode is for, but a payload dropped in shared
+    // temp still must not be runnable, and that costs nothing to keep.
+    if !config.filesystem_strict() {
+        let access = if config.writable_file_system() {
+            writable_access(abi)
+        } else {
+            AccessFs::from_read(abi)
+        };
+        for path in ["/tmp", "/var/tmp"] {
+            add_system_path(ruleset, path, access, abi)?;
+        }
     }
 
-    // --- Device access ---
-    add_device_rules(&mut ruleset, config.security(), abi)?;
-
-    // --- Working directory (full access) ---
-    add_path_rule(
-        &mut ruleset,
-        config.working_dir(),
-        AccessFs::from_all(abi),
-        abi,
-    )?;
-
-    // --- User-configured paths ---
-
-    // Readable paths
-    for path in config.readable_paths() {
-        add_path_rule(&mut ruleset, path, AccessFs::from_read(abi), abi)?;
-    }
-
-    // Writable paths
-    for path in config.writable_paths() {
-        add_path_rule(&mut ruleset, path, AccessFs::from_all(abi), abi)?;
-    }
-
-    // Executable paths (read + execute)
-    for path in config.executable_paths() {
-        let exec_access = make_bitflags!(AccessFs::{ReadFile | Execute});
-        add_path_rule(&mut ruleset, path, exec_access, abi)?;
-    }
-
-    // --- Python venv if configured ---
-    if let Some(venv_path) = config.python_venv_path() {
-        add_path_rule(&mut ruleset, venv_path, AccessFs::from_all(abi), abi)?;
-    }
-
-    // --- Global Write Access (Permissive Mode) ---
     if config.writable_file_system() {
-        add_path_rule(&mut ruleset, "/", AccessFs::from_all(abi), abi)?;
+        // Not `from_all`: Landlock cannot carve an exception out of a granted
+        // hierarchy, so granting execute on `/` here would silently re-grant it
+        // to shared temp and to the working directory. Execute is granted above,
+        // to the system directories that need it, and nowhere else.
+        add_system_path(ruleset, "/", writable_access(abi), abi)?;
     }
 
-    // --- Apply security restrictions ---
-    // Note: Landlock is additive-only, so we implement restrictions by
-    // NOT adding rules for protected paths. Since we only add specific
-    // allowed paths above, sensitive paths are denied by default.
-    //
-    // However, if protect_user_home is false, we need to add home access
-    apply_security_config(&mut ruleset, config.security(), abi)?;
-
-    // --- Network: Only allow TCP connections to proxy port ---
-    if !config.network_deny_all() {
-        ruleset = ruleset
-            .add_rule(NetPort::new(proxy_port, AccessNet::ConnectTcp))
-            .map_err(|e| Error::InvalidProfile(format!("Landlock network rule error: {}", e)))?;
-    }
-    if let Some(ipc_port) = config.ipc_port() {
-        ruleset = ruleset
-            .add_rule(NetPort::new(ipc_port, AccessNet::ConnectTcp))
-            .map_err(|e| Error::InvalidProfile(format!("Landlock IPC rule error: {}", e)))?;
+    // Landlock is default-deny, so the protections that macOS expresses as
+    // explicit denies are the absence of a rule here. Home directories are the
+    // one case that needs a rule, to grant access when protection is off.
+    if !config.security().protect_user_home() {
+        if let Some(home) = std::env::var_os("HOME") {
+            add_system_path(ruleset, Path::new(&home), AccessFs::from_all(abi), abi)?;
+        }
+        add_system_path(ruleset, "/home", AccessFs::from_all(abi), abi)?;
     }
 
-    tracing::debug!(
-        proxy_port = proxy_port,
-        ipc_port = config.ipc_port(),
-        working_dir = %config.working_dir().display(),
-        "landlock: ruleset built"
-    );
-
-    Ok(PreparedRuleset { inner: ruleset })
+    Ok(())
 }
 
-/// Add a path rule to the ruleset, handling non-existent paths gracefully
-fn add_path_rule(
+/// Grant access to device nodes.
+fn add_device_rules(
+    ruleset: &mut RulesetCreated,
+    config: &SandboxConfigData,
+    abi: ABI,
+) -> Result<()> {
+    // /dev/stdin and friends are symlinks into /proc/self/fd and work through
+    // inherited descriptors rather than through a rule.
+    for device in [
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/fd",
+    ] {
+        add_system_path(ruleset, device, AccessFs::from_all(abi), abi)?;
+    }
+
+    // Terminals are readable so interactive programs can query them, and
+    // writable only when the configuration allows terminal output.
+    let tty_access = if config.allow_tty_write() {
+        AccessFs::from_all(abi)
+    } else {
+        AccessFs::from_read(abi)
+    };
+    for device in ["/dev/tty", "/dev/ptmx", "/dev/pts"] {
+        add_system_path(ruleset, device, tty_access, abi)?;
+    }
+
+    let security = config.security();
+    if security.allow_gpu() {
+        for device in [
+            "/dev/dri",
+            "/dev/nvidia0",
+            "/dev/nvidiactl",
+            "/dev/nvidia-modeset",
+            "/dev/nvidia-uvm",
+        ] {
+            add_system_path(ruleset, device, AccessFs::from_all(abi), abi)?;
+        }
+        tracing::debug!("landlock: GPU access enabled");
+    }
+
+    if security.allow_npu() {
+        for device in ["/dev/accel", "/dev/accel0"] {
+            add_system_path(ruleset, device, AccessFs::from_all(abi), abi)?;
+        }
+        tracing::debug!("landlock: NPU access enabled");
+    }
+
+    if security.allow_hardware() {
+        for device in [
+            "/dev/bus/usb",
+            "/dev/input",
+            "/dev/video0",
+            "/dev/video1",
+            "/dev/snd",
+        ] {
+            add_system_path(ruleset, device, AccessFs::from_all(abi), abi)?;
+        }
+        tracing::debug!("landlock: general hardware access enabled");
+    }
+
+    Ok(())
+}
+
+/// Everything a writable location may do, except execute.
+///
+/// Landlock has no deny rule: a path gets exactly the rights granted to it, so
+/// withholding `Execute` here is what stops a sandboxed process from writing a
+/// payload into a directory it controls and then running it. The macOS profile
+/// enforces the same invariant with explicit `(deny process-exec ...)` rules,
+/// and `tests/isolation.rs` asserts it on both platforms.
+fn writable_access(abi: ABI) -> BitFlags<AccessFs> {
+    AccessFs::from_all(abi) & !BitFlags::from(AccessFs::Execute)
+}
+
+/// Grant access to the paths the caller configured.
+fn add_configured_rules(
+    ruleset: &mut RulesetCreated,
+    config: &SandboxConfigData,
+    abi: ABI,
+) -> Result<()> {
+    add_required_path(ruleset, config.working_dir(), writable_access(abi), abi)?;
+
+    // The generated IPC shims live inside the working directory and are written
+    // by the host before the sandbox starts, so they are the one place in it
+    // that may be executed. This mirrors the macOS profile, which carves out the
+    // same directory.
+    if config.ipc_socket().is_some() {
+        let layout = crate::ipc::IpcLayout::new(config.working_dir());
+        add_required_path(
+            ruleset,
+            layout.bin_dir(),
+            make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute }),
+            abi,
+        )?;
+    }
+
+    for path in config.readable_paths() {
+        add_required_path(ruleset, path, AccessFs::from_read(abi), abi)?;
+    }
+    for path in config.writable_paths() {
+        add_required_path(ruleset, path, writable_access(abi), abi)?;
+    }
+
+    let exec_access = make_bitflags!(AccessFs::{ ReadFile | Execute });
+    for path in config.executable_paths() {
+        add_required_path(ruleset, path, exec_access, abi)?;
+    }
+
+    // The IPC socket lives outside the working directory; connecting needs
+    // read and write on the socket file.
+    if let Some(socket) = config.ipc_socket()
+        && let Some(dir) = socket.parent()
+    {
+        add_required_path(ruleset, dir, writable_access(abi), abi)?;
+    }
+
+    if let Some(python) = config.python() {
+        // Without pip installs the environment is read and execute only, so a
+        // sandboxed process cannot mutate an environment that outlives it.
+        let access = if python.allow_pip_install() {
+            AccessFs::from_all(abi)
+        } else {
+            make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute })
+        };
+        add_required_path(ruleset, python.venv().path(), access, abi)?;
+    }
+
+    Ok(())
+}
+
+/// Add a rule for a path the sandbox needs but that may legitimately be absent.
+///
+/// Distributions differ in which system paths exist, so a missing one is
+/// skipped. A rule that the kernel rejects is still an error: it would silently
+/// change what the sandbox enforces.
+fn add_system_path(
     ruleset: &mut RulesetCreated,
     path: impl AsRef<Path>,
     access: BitFlags<AccessFs>,
     abi: ABI,
 ) -> Result<()> {
     let path = path.as_ref();
-
     match PathFd::new(path) {
-        Ok(path_fd) => {
-            let effective_access = effective_path_access(&path_fd, path, access, abi)?;
-
-            if let Err(e) = ruleset.add_rule(PathBeneath::new(path_fd, effective_access)) {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "landlock: failed to add path rule"
-                );
-            } else {
-                tracing::trace!(path = %path.display(), "landlock: added path rule");
-            }
-        }
-        Err(e) => {
-            // Path doesn't exist - this is not an error, just skip
-            tracing::trace!(
-                path = %path.display(),
-                error = %e,
-                "landlock: skipping non-existent path"
-            );
+        Ok(fd) => add_rule(ruleset, path, fd, access, abi),
+        Err(error) => {
+            tracing::trace!(path = %path.display(), %error, "landlock: skipping absent system path");
+            Ok(())
         }
     }
-    Ok(())
 }
 
+/// Add a rule for a path the caller explicitly configured.
+///
+/// A missing path is an error here: silently dropping it would produce a
+/// sandbox that denies exactly the access the caller asked to grant.
+fn add_required_path(
+    ruleset: &mut RulesetCreated,
+    path: &Path,
+    access: BitFlags<AccessFs>,
+    abi: ABI,
+) -> Result<()> {
+    let fd = PathFd::new(path).map_err(|error| {
+        Error::path(
+            path,
+            std::io::Error::other(format!("cannot open configured path: {error}")),
+        )
+    })?;
+    add_rule(ruleset, path, fd, access, abi)
+}
+
+/// Add one rule, narrowing directory-only rights on non-directories.
+fn add_rule(
+    ruleset: &mut RulesetCreated,
+    path: &Path,
+    fd: PathFd,
+    access: BitFlags<AccessFs>,
+    abi: ABI,
+) -> Result<()> {
+    let access = effective_path_access(&fd, path, access, abi)?;
+
+    ruleset
+        .add_rule(PathBeneath::new(fd, access))
+        .map(|_| ())
+        .map_err(|error| {
+            Error::InvalidProfile(format!(
+                "Landlock rejected the rule for {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+/// Reduce a request to the rights that make sense for the target.
+///
+/// Landlock rejects directory-only rights on a regular file, so a rule naming a
+/// file keeps only the file rights.
 fn effective_path_access(
     path_fd: &PathFd,
     path: &Path,
@@ -308,17 +413,17 @@ fn effective_path_access(
     let file_access = access & AccessFs::from_file(abi);
     if file_access.is_empty() {
         return Err(Error::InvalidProfile(format!(
-            "Landlock path {} is not a directory, but requested access {:?} requires directory semantics",
+            "Landlock path {} is not a directory, but the requested access {access:?} requires \
+             directory semantics",
             path.display(),
-            access,
         )));
     }
 
     if file_access != access {
         tracing::trace!(
             path = %path.display(),
-            requested_access = ?access,
-            effective_access = ?file_access,
+            requested = ?access,
+            effective = ?file_access,
             "landlock: narrowed non-directory path access"
         );
     }
@@ -328,183 +433,134 @@ fn effective_path_access(
 
 fn path_is_directory(path_fd: &PathFd) -> Result<bool> {
     let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the descriptor is open and `stat` is a valid destination.
     let rc = unsafe { libc::fstat(path_fd.as_fd().as_raw_fd(), stat.as_mut_ptr()) };
     if rc != 0 {
         return Err(Error::InvalidProfile(format!(
-            "Landlock failed to inspect rule path: {}",
+            "Landlock failed to inspect a rule path: {}",
             std::io::Error::last_os_error(),
         )));
     }
 
+    // SAFETY: `fstat` succeeded, so the value is initialized.
     let stat = unsafe { stat.assume_init() };
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR)
 }
 
-/// Add device access rules
-fn add_device_rules(
-    ruleset: &mut RulesetCreated,
-    security: &SecurityConfig,
-    abi: ABI,
-) -> Result<()> {
-    // Basic device access for stdio and randomness
-    // Note: /dev/stdin, /dev/stdout, /dev/stderr are symlinks to /proc/self/fd/*
-    // and can't be added as Landlock rules. They work via inherited file descriptors.
-    let basic_devices = [
-        "/dev/null",
-        "/dev/zero",
-        "/dev/full",
-        "/dev/random",
-        "/dev/urandom",
-        "/dev/fd",
-        "/dev/tty",
-        "/dev/ptmx",
-        "/dev/pts",
-    ];
-
-    for device in &basic_devices {
-        add_path_rule(ruleset, device, AccessFs::from_all(abi), abi)?;
-    }
-
-    // GPU access (/dev/dri for DRM)
-    if security.allow_gpu {
-        add_path_rule(ruleset, "/dev/dri", AccessFs::from_all(abi), abi)?;
-        // NVIDIA devices
-        add_path_rule(ruleset, "/dev/nvidia0", AccessFs::from_all(abi), abi)?;
-        add_path_rule(ruleset, "/dev/nvidiactl", AccessFs::from_all(abi), abi)?;
-        add_path_rule(ruleset, "/dev/nvidia-modeset", AccessFs::from_all(abi), abi)?;
-        add_path_rule(ruleset, "/dev/nvidia-uvm", AccessFs::from_all(abi), abi)?;
-        tracing::debug!("landlock: GPU access enabled");
-    }
-
-    // NPU access (/dev/accel for Intel/AMD accelerators)
-    if security.allow_npu {
-        add_path_rule(ruleset, "/dev/accel", AccessFs::from_all(abi), abi)?;
-        // Intel NPU
-        add_path_rule(ruleset, "/dev/accel0", AccessFs::from_all(abi), abi)?;
-        tracing::debug!("landlock: NPU access enabled");
-    }
-
-    // General hardware access
-    if security.allow_hardware {
-        // USB devices
-        add_path_rule(ruleset, "/dev/bus/usb", AccessFs::from_all(abi), abi)?;
-        // Input devices
-        add_path_rule(ruleset, "/dev/input", AccessFs::from_all(abi), abi)?;
-        // Video devices (webcams)
-        add_path_rule(ruleset, "/dev/video0", AccessFs::from_all(abi), abi)?;
-        add_path_rule(ruleset, "/dev/video1", AccessFs::from_all(abi), abi)?;
-        // Audio devices
-        add_path_rule(ruleset, "/dev/snd", AccessFs::from_all(abi), abi)?;
-        tracing::debug!("landlock: general hardware access enabled");
-    }
-
-    Ok(())
-}
-
-/// Apply SecurityConfig by adding access to home if not protected
-fn apply_security_config(
-    ruleset: &mut RulesetCreated,
-    security: &SecurityConfig,
-    abi: ABI,
-) -> Result<()> {
-    // Landlock is default-deny. We only need to ADD paths when protection is disabled.
-
-    if !security.protect_user_home {
-        // Allow access to home directory
-        if let Ok(home) = std::env::var("HOME") {
-            add_path_rule(ruleset, &home, AccessFs::from_all(abi), abi)?;
-            tracing::debug!(home = %home, "landlock: home access enabled");
-        }
-        // Also try /home for other users
-        add_path_rule(ruleset, "/home", AccessFs::from_all(abi), abi)?;
-    }
-
-    // Note: For the other protection flags (protect_credentials, protect_cloud_config, etc.),
-    // since Landlock is default-deny and we're not adding those paths above,
-    // they are automatically protected.
-    //
-    // The macOS SBPL uses explicit deny rules because SBPL has broader allow rules.
-    // With Landlock, we only whitelist specific paths, so sensitive paths are denied by default.
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::config::SandboxConfig;
     use std::fs::{self, File};
 
-    use rand::random;
-
-    use super::*;
-
-    struct TestPath {
-        path: PathBuf,
-    }
-
-    impl TestPath {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "heel-landlock-rules-{}-{}",
-                std::process::id(),
-                random::<u64>()
-            ));
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TestPath {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
+    /// A configuration whose working directory exists, as it would at runtime.
+    fn prepared(config: SandboxConfig) -> (SandboxConfigData, crate::workdir::WorkingDir) {
+        let (_policy, mut data, _ipc) = config.into_parts();
+        let dir = crate::workdir::WorkingDir::create(data.working_dir(), true).expect("creates");
+        data.set_working_dir(dir.path().to_path_buf());
+        (data, dir)
     }
 
     #[test]
     fn non_directory_rules_are_narrowed_to_file_access() {
-        let test_path = TestPath::new();
-        fs::create_dir_all(test_path.path()).unwrap();
-        let file_path = test_path.path().join("device");
-        File::create(&file_path).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("device");
+        File::create(&file_path).expect("creates");
 
-        let path_fd = PathFd::new(&file_path).unwrap();
+        let path_fd = PathFd::new(&file_path).expect("opens");
         let access =
             effective_path_access(&path_fd, &file_path, AccessFs::from_all(ABI::V4), ABI::V4)
-                .unwrap();
+                .expect("narrows");
 
         assert_eq!(access, AccessFs::from_file(ABI::V4));
     }
 
     #[test]
     fn directory_rules_keep_directory_access() {
-        let test_path = TestPath::new();
-        fs::create_dir_all(test_path.path()).unwrap();
-
-        let path_fd = PathFd::new(test_path.path()).unwrap();
-        let access = effective_path_access(
-            &path_fd,
-            test_path.path(),
-            AccessFs::from_all(ABI::V4),
-            ABI::V4,
-        )
-        .unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_fd = PathFd::new(dir.path()).expect("opens");
+        let access =
+            effective_path_access(&path_fd, dir.path(), AccessFs::from_all(ABI::V4), ABI::V4)
+                .expect("keeps");
 
         assert_eq!(access, AccessFs::from_all(ABI::V4));
     }
 
     #[test]
     fn file_rules_reject_directory_only_access() {
-        let test_path = TestPath::new();
-        fs::create_dir_all(test_path.path()).unwrap();
-        let file_path = test_path.path().join("file");
-        File::create(&file_path).unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("file");
+        File::create(&file_path).expect("creates");
 
-        let path_fd = PathFd::new(&file_path).unwrap();
+        let path_fd = PathFd::new(&file_path).expect("opens");
         let error = effective_path_access(&path_fd, &file_path, AccessFs::ReadDir.into(), ABI::V4)
-            .unwrap_err();
+            .expect_err("rejects");
 
         assert!(matches!(error, Error::InvalidProfile(_)));
+    }
+
+    #[test]
+    fn missing_configured_paths_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent");
+        let (data, _dir) = prepared(SandboxConfig::builder().readable_path(&missing).build());
+
+        let error = build_ruleset(&data, None).expect_err("must fail");
+        assert!(
+            matches!(error, Error::Path { .. }),
+            "a configured path that cannot be granted must be an error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn absent_system_paths_are_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (data, _dir) = prepared(SandboxConfig::new());
+        // /lib32 and friends are absent on most hosts, and building must still
+        // succeed.
+        assert!(build_ruleset(&data, None).is_ok());
+        drop(dir);
+    }
+
+    #[test]
+    fn strict_mode_does_not_grant_shared_temp_directories() {
+        // Landlock has no rule inspection API, so this checks the decision the
+        // ruleset builder makes rather than the resulting kernel state.
+        let (strict, _a) = prepared(SandboxConfig::builder().filesystem_strict(true).build());
+        let (relaxed, _b) = prepared(SandboxConfig::builder().filesystem_strict(false).build());
+
+        assert!(strict.filesystem_strict());
+        assert!(!relaxed.filesystem_strict());
+        assert!(build_ruleset(&strict, None).is_ok());
+        assert!(build_ruleset(&relaxed, None).is_ok());
+    }
+
+    #[test]
+    fn venv_is_read_only_without_pip_installs() {
+        let venv = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(venv.path().join("bin")).expect("creates");
+
+        for (allow, expected_write) in [(false, false), (true, true)] {
+            let (data, _dir) = prepared(
+                SandboxConfig::builder()
+                    .python(
+                        crate::config::PythonConfig::builder()
+                            .venv(
+                                crate::config::VenvConfig::builder()
+                                    .path(venv.path())
+                                    .build(),
+                            )
+                            .allow_pip_install(allow)
+                            .build(),
+                    )
+                    .build(),
+            );
+
+            assert_eq!(
+                data.python().expect("configured").allow_pip_install(),
+                expected_write
+            );
+            assert!(build_ruleset(&data, None).is_ok());
+        }
     }
 }

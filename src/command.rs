@@ -1,30 +1,38 @@
+//! Builder for commands executed inside a sandbox.
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
 
 use crate::config::SandboxConfigData;
 use crate::error::Result;
-use crate::network::NetworkPolicy;
-use crate::network::NetworkProxy;
-use crate::platform::{Backend, Child};
+use crate::ipc::IpcLayout;
+use crate::platform::{Backend, Child, NativeBackend, SpawnRequest};
 use crate::sandbox::ProcessTracker;
 
+/// The `PATH` a sandboxed process gets when nothing else specifies one.
+///
+/// The host's `PATH` is deliberately not inherited: the backend clears the
+/// environment, and silently re-importing the host's search path would both
+/// undo that and make behaviour depend on the shell the sandbox was launched
+/// from. Callers that want the host's `PATH` ask for it with
+/// [`SandboxConfigBuilder::env_passthrough`](crate::SandboxConfigBuilder::env_passthrough).
 #[cfg(target_os = "macos")]
-type NativeBackend = crate::platform::macos::MacOSBackend;
+pub const DEFAULT_SANDBOX_PATH: &str =
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+/// The `PATH` a sandboxed process gets when nothing else specifies one.
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_SANDBOX_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-#[cfg(target_os = "linux")]
-type NativeBackend = crate::platform::linux::LinuxBackend;
-
-#[cfg(target_os = "windows")]
-type NativeBackend = crate::platform::windows::WindowsBackend;
-
-/// Standard I/O configuration for a sandboxed command
-#[derive(Debug, Clone, Copy)]
+/// Standard I/O configuration for a sandboxed command.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StdioConfig {
-    /// Inherit from parent process
+    /// Inherit the corresponding stream from the parent process.
+    #[default]
     Inherit,
-    /// Create a new pipe
+    /// Connect the stream to a pipe.
     Piped,
-    /// Redirect to null
+    /// Connect the stream to the null device.
     Null,
 }
 
@@ -38,80 +46,79 @@ impl From<StdioConfig> for Stdio {
     }
 }
 
-/// A builder for sandboxed commands, similar to smol::process::Command
+/// A command to run inside a sandbox.
 ///
-/// All network traffic from the command is routed through the sandbox's proxy.
-/// HTTP_PROXY and HTTPS_PROXY environment variables are automatically injected.
-/// If IPC is configured, HEEL_IPC_ENDPOINT is also injected.
+/// The sandbox injects the environment a sandboxed process needs to reach the
+/// facilities it is allowed to use: proxy variables when network access is
+/// configured, and the IPC endpoint plus its command shims when IPC is.
 pub struct Command<'a> {
     config: &'a SandboxConfigData,
     backend: &'a NativeBackend,
     process_tracker: &'a ProcessTracker,
-    proxy_url: Option<String>,
-    proxy_port: u16,
-    ipc_endpoint: Option<String>,
+    proxy: Option<ProxyEndpoint>,
     program: String,
     args: Vec<String>,
     envs: Vec<(String, String)>,
     current_dir: Option<PathBuf>,
-    stdin: StdioConfig,
-    stdout: StdioConfig,
-    stderr: StdioConfig,
+    /// `None` until the caller chooses, so each run mode can pick the default
+    /// that suits it.
+    stdin: Option<StdioConfig>,
+    stdout: Option<StdioConfig>,
+    stderr: Option<StdioConfig>,
+}
+
+/// Where the sandbox proxy is listening.
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyEndpoint {
+    pub(crate) url: String,
+    pub(crate) port: u16,
 }
 
 impl<'a> Command<'a> {
-    /// Create a new command builder (internal use)
-    pub(crate) fn new<N: NetworkPolicy>(
+    /// Create a command builder. Called by [`Sandbox`](crate::Sandbox).
+    pub(crate) fn new(
         config: &'a SandboxConfigData,
         backend: &'a NativeBackend,
         process_tracker: &'a ProcessTracker,
-        proxy: Option<&NetworkProxy<N>>,
-        ipc_endpoint: Option<String>,
+        proxy: Option<ProxyEndpoint>,
         program: impl Into<String>,
     ) -> Self {
-        let (proxy_url, proxy_port) = match proxy {
-            Some(proxy) => (Some(proxy.proxy_url()), proxy.addr().port()),
-            None => (None, 0),
-        };
-
         Self {
             config,
             backend,
             process_tracker,
-            proxy_url,
-            proxy_port,
-            ipc_endpoint,
+            proxy,
             program: program.into(),
             args: Vec::new(),
             envs: Vec::new(),
             current_dir: None,
-            stdin: StdioConfig::Inherit,
-            stdout: StdioConfig::Inherit,
-            stderr: StdioConfig::Inherit,
+            stdin: None,
+            stdout: None,
+            stderr: None,
         }
     }
 
-    /// Add a single argument
+    /// Add one argument.
     pub fn arg(mut self, arg: impl AsRef<str>) -> Self {
         self.args.push(arg.as_ref().to_string());
         self
     }
 
-    /// Add multiple arguments
+    /// Add several arguments.
     pub fn args(mut self, args: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         self.args
             .extend(args.into_iter().map(|a| a.as_ref().to_string()));
         self
     }
 
-    /// Set an environment variable
+    /// Set an environment variable, overriding anything the sandbox injects.
     pub fn env(mut self, key: impl AsRef<str>, val: impl AsRef<str>) -> Self {
         self.envs
             .push((key.as_ref().to_string(), val.as_ref().to_string()));
         self
     }
 
-    /// Set multiple environment variables
+    /// Set several environment variables.
     pub fn envs(
         mut self,
         envs: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
@@ -123,129 +130,193 @@ impl<'a> Command<'a> {
         self
     }
 
-    /// Set the working directory
+    /// Run in a directory other than the sandbox working directory.
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.current_dir = Some(dir.as_ref().to_path_buf());
         self
     }
 
-    /// Configure stdin
+    /// Configure standard input.
     pub fn stdin(mut self, cfg: StdioConfig) -> Self {
-        self.stdin = cfg;
+        self.stdin = Some(cfg);
         self
     }
 
-    /// Configure stdout
+    /// Configure standard output.
     pub fn stdout(mut self, cfg: StdioConfig) -> Self {
-        self.stdout = cfg;
+        self.stdout = Some(cfg);
         self
     }
 
-    /// Configure stderr
+    /// Configure standard error.
     pub fn stderr(mut self, cfg: StdioConfig) -> Self {
-        self.stderr = cfg;
+        self.stderr = Some(cfg);
         self
     }
 
-    /// Build the final environment variables list, including proxy settings
+    /// Build the environment the sandboxed process starts with.
     fn build_envs(&self) -> Vec<(String, String)> {
-        let mut envs = self.envs.clone();
-
-        if let Some(ref proxy_url) = self.proxy_url {
-            // Auto-inject proxy environment variables
-            // These ensure all network traffic goes through our proxy
-            let proxy_vars = [
-                ("HTTP_PROXY", proxy_url),
-                ("HTTPS_PROXY", proxy_url),
-                ("http_proxy", proxy_url),
-                ("https_proxy", proxy_url),
-            ];
-
-            for (key, val) in proxy_vars {
-                // Only add if user hasn't explicitly set it
-                if !envs.iter().any(|(k, _)| k == key) {
-                    envs.push((key.to_string(), val.clone()));
-                }
-            }
-        }
-
-        // Inject IPC endpoint and update PATH if configured
-        if let Some(ref endpoint) = self.ipc_endpoint {
-            if !envs.iter().any(|(k, _)| k == "HEEL_IPC_ENDPOINT") {
-                envs.push(("HEEL_IPC_ENDPOINT".to_string(), endpoint.clone()));
-            }
-
-            // Add .heel/bin to PATH for IPC wrapper scripts
-            let heel_bin = self.config.working_dir().join(".heel").join("bin");
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{}:{}", heel_bin.display(), current_path);
-            // Remove any existing PATH entry and add the new one
-            envs.retain(|(k, _)| k != "PATH");
-            envs.push(("PATH".to_string(), new_path));
-        }
-
-        envs
+        sandbox_environment(
+            self.config,
+            self.proxy.as_ref().map(|proxy| proxy.url.as_str()),
+            &self.envs,
+        )
     }
 
-    /// Run the command and wait for completion, collecting all output
+    /// Assemble the platform request for this command.
+    fn request<'r>(
+        &'r self,
+        envs: &'r [(String, String)],
+        stdin: Stdio,
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> SpawnRequest<'r> {
+        SpawnRequest {
+            config: self.config,
+            proxy_port: self.proxy.as_ref().map(|proxy| proxy.port),
+            program: &self.program,
+            args: &self.args,
+            envs,
+            current_dir: self.current_dir.as_deref(),
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// Run to completion and collect all output.
+    ///
+    /// Standard output and error are captured. Standard input defaults to the
+    /// null device rather than the caller's: a command that reads from an
+    /// inherited stream would block until that stream closed, which for a
+    /// long-lived parent means forever.
     pub async fn output(self) -> Result<Output> {
         let envs = self.build_envs();
         self.backend
-            .execute(
-                self.config,
-                self.proxy_port,
-                &self.program,
-                &self.args,
+            .execute(self.request(
                 &envs,
-                self.current_dir.as_deref(),
-                Stdio::null(),
+                self.stdin.unwrap_or(StdioConfig::Null).into(),
                 Stdio::piped(),
                 Stdio::piped(),
-            )
+            ))
             .await
     }
 
-    /// Run the command and wait for completion, returning only the exit status
+    /// Run to completion and return only the exit status.
+    ///
+    /// The standard streams are inherited unless configured otherwise.
     pub async fn status(self) -> Result<ExitStatus> {
         let envs = self.build_envs();
         let output = self
             .backend
-            .execute(
-                self.config,
-                self.proxy_port,
-                &self.program,
-                &self.args,
+            .execute(self.request(
                 &envs,
-                self.current_dir.as_deref(),
-                self.stdin.into(),
-                self.stdout.into(),
-                self.stderr.into(),
-            )
+                self.stdio(self.stdin),
+                self.stdio(self.stdout),
+                self.stdio(self.stderr),
+            ))
             .await?;
         Ok(output.status)
     }
 
-    /// Spawn the command as a child process for streaming I/O
+    /// Resolve one stream, defaulting to an inherited stream.
+    fn stdio(&self, config: Option<StdioConfig>) -> Stdio {
+        config.unwrap_or(StdioConfig::Inherit).into()
+    }
+
+    /// Spawn the command for streaming I/O.
     pub async fn spawn(self) -> Result<Child> {
         let envs = self.build_envs();
         let child = self
             .backend
-            .spawn(
-                self.config,
-                self.proxy_port,
-                &self.program,
-                &self.args,
+            .spawn(self.request(
                 &envs,
-                self.current_dir.as_deref(),
-                self.stdin.into(),
-                self.stdout.into(),
-                self.stderr.into(),
-            )
+                self.stdio(self.stdin),
+                self.stdio(self.stdout),
+                self.stdio(self.stderr),
+            ))
             .await?;
 
-        // Register the child process for tracking
         self.process_tracker.register(child.id());
-
         Ok(child.with_tracker(self.process_tracker.clone()))
+    }
+}
+
+/// Build the environment a sandboxed process starts with.
+///
+/// The sandbox injects what a process needs to reach the facilities it is
+/// allowed to use; `user_envs` is applied last, so an explicit setting always
+/// wins over an injected one. Shared by piped commands and interactive
+/// sessions, which must not drift apart in what they expose.
+pub(crate) fn sandbox_environment(
+    config: &SandboxConfigData,
+    proxy_url: Option<&str>,
+    user_envs: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut envs: BTreeMap<String, String> = BTreeMap::new();
+
+    if let Some(url) = proxy_url {
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            envs.insert(key.to_string(), url.to_string());
+        }
+    }
+
+    // The working directory is the one place a sandboxed process can always
+    // write, so it is also where temporary files belong. Strict mode denies the
+    // shared temp directories outright.
+    envs.insert(
+        "TMPDIR".to_string(),
+        config.working_dir().display().to_string(),
+    );
+
+    envs.insert("PATH".to_string(), sandbox_path(config, user_envs));
+
+    if let Some(socket) = config.ipc_socket() {
+        envs.insert(
+            "HEEL_IPC_ENDPOINT".to_string(),
+            socket.display().to_string(),
+        );
+    }
+
+    for (key, value) in user_envs {
+        envs.insert(key.clone(), value.clone());
+    }
+
+    envs.into_iter().collect()
+}
+
+/// Determine the sandboxed `PATH`.
+///
+/// The IPC shim directory is prepended so command shims resolve; the rest comes
+/// from the caller, then the passthrough list, then the built-in default.
+fn sandbox_path(config: &SandboxConfigData, user_envs: &[(String, String)]) -> String {
+    let base = user_envs
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.clone())
+        .or_else(|| {
+            config
+                .env_passthrough()
+                .iter()
+                .any(|var| var == "PATH")
+                .then(|| std::env::var("PATH").ok())
+                .flatten()
+        })
+        .unwrap_or_else(|| DEFAULT_SANDBOX_PATH.to_string());
+
+    if config.ipc_socket().is_none() {
+        return base;
+    }
+
+    let bin_dir = IpcLayout::new(config.working_dir()).bin_dir().to_path_buf();
+    let entries = std::iter::once(bin_dir).chain(std::env::split_paths(&base));
+    match std::env::join_paths(entries) {
+        Ok(joined) => joined.to_string_lossy().into_owned(),
+        Err(error) => {
+            // Only possible if a PATH entry contains the separator itself.
+            tracing::warn!(%error, "failed to extend PATH with the IPC shim directory");
+            base
+        }
     }
 }
