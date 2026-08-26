@@ -48,6 +48,19 @@ const MACHINE_FACTS: &[&str] = &[
     "CommonProgramW6432",
 ];
 
+/// Variables naming the user's own directories.
+///
+/// An AppContainer's per-container profile lives under
+/// `%LOCALAPPDATA%\Packages`, and Windows resolves it from the environment of
+/// the process being created, so a container started without these cannot be
+/// given a profile to run in.
+///
+/// They name the user, which a sandbox would rather not disclose, but nothing
+/// is disclosed that was not already: the working directory sits inside the
+/// user's temp directory and is handed to the process as `TEMP`, so its path
+/// carries the user's name regardless.
+const USER_DIRECTORIES: &[&str] = &["USERPROFILE", "LOCALAPPDATA", "APPDATA", "ALLUSERSPROFILE"];
+
 /// Windows sandbox backend.
 #[derive(Debug)]
 pub struct WindowsBackend {
@@ -167,7 +180,7 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(std::ffi::OsString, std::ffi:
         .map(|(key, value)| (key.into(), value.into()))
         .collect();
 
-    for name in MACHINE_FACTS {
+    for name in MACHINE_FACTS.iter().chain(USER_DIRECTORIES) {
         if let Some(value) = std::env::var_os(name)
             && !env.iter().any(|(existing, _)| existing == name)
         {
