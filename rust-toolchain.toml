@@ -1,0 +1,11 @@
+# Pins the toolchain so that what runs here is what runs in CI.
+#
+# The crate needs nothing from nightly, and a floating nightly broke this
+# repository's lint job for weeks over a clippy false positive that no change
+# in this codebase caused. Stable moves slowly enough that such a break is a
+# normal event rather than a standing risk, and pinning the channel here means
+# a local `cargo clippy` cannot silently disagree with the one that gates
+# merges.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

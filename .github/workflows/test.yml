@@ -15,10 +15,15 @@ jobs:
       matrix:
         # ubuntu-24.04 ships a kernel with Landlock ABI v4, which the Linux
         # backend requires.
-        os: [ubuntu-24.04, windows-latest, macos-latest]
+        #
+        # Both Linux architectures run, because the seccomp filter is written
+        # per architecture: a rule compiled in on x86_64 and compiled out on
+        # aarch64 leaves a hole that nothing else here would show. That is not
+        # hypothetical -- `clone3` went unfiltered on aarch64 exactly that way.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
@@ -29,8 +34,16 @@ jobs:
       # The isolation suite runs real programs in real sandboxes and asserts
       # that forbidden operations fail, so it is the check that matters most
       # here; it is part of `cargo test` rather than a separate example.
+      # `--no-fail-fast` so every suite reports. Without it `cargo test` stops
+      # at the first binary that fails, and the suites that assert what the
+      # sandbox denies are the last to run, so a single unrelated failure hides
+      # all of them.
       - name: Test
-        run: cargo test --verbose --all-features
+        run: cargo test --verbose --all-features --no-fail-fast
+        env:
+          # The backends report a refused launch through one opaque error; their
+          # traces name the step that actually failed.
+          RUST_LOG: heel=debug,rappct=trace
 
       - name: Examples build
         run: cargo build --examples --all-features
