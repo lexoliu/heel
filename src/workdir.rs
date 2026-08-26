@@ -85,7 +85,9 @@ impl WorkingDir {
             tracing::debug!(path = %path.display(), "created working directory");
         }
 
-        let canonical = std::fs::canonicalize(path).map_err(|error| Error::WorkingDir {
+        // `dunce` avoids the `\\?\` verbatim prefix that `std` returns on
+        // Windows, which many Win32 APIs and child processes do not accept.
+        let canonical = dunce::canonicalize(path).map_err(|error| Error::WorkingDir {
             path: path.to_path_buf(),
             source: error,
         })?;

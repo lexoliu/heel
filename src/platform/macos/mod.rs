@@ -10,6 +10,7 @@ use std::process::{Command, Output};
 use blocking::unblock;
 
 use crate::error::{Error, Result};
+use crate::platform::child::unix::UnixChild;
 use crate::platform::rlimit::PreparedLimits;
 use crate::platform::{Backend, Child, SpawnRequest};
 
@@ -99,9 +100,9 @@ impl Backend for MacOSBackend {
         tracing::debug!(program = %request.program, args = ?request.args, "sandbox: executing");
 
         let mut cmd = self.build_command(&request)?;
-        cmd.stdin(request.stdin);
-        cmd.stdout(request.stdout);
-        cmd.stderr(request.stderr);
+        cmd.stdin(std::process::Stdio::from(request.stdin));
+        cmd.stdout(std::process::Stdio::from(request.stdout));
+        cmd.stderr(std::process::Stdio::from(request.stderr));
 
         let output = unblock(move || cmd.output()).await?;
 
@@ -119,16 +120,16 @@ impl Backend for MacOSBackend {
         tracing::debug!(program = %request.program, args = ?request.args, "sandbox: spawning");
 
         let mut cmd = self.build_command(&request)?;
-        cmd.stdin(request.stdin);
-        cmd.stdout(request.stdout);
-        cmd.stderr(request.stderr);
+        cmd.stdin(std::process::Stdio::from(request.stdin));
+        cmd.stdout(std::process::Stdio::from(request.stdout));
+        cmd.stderr(std::process::Stdio::from(request.stderr));
         // Its own process group, so the whole tree can be killed at once.
         cmd.process_group(0);
 
         let child = cmd.spawn()?;
         tracing::debug!(program = %request.program, pid = child.id(), "sandbox: spawned");
 
-        Ok(Child::new(child))
+        Ok(Child::new(UnixChild::new(child)))
     }
 }
 

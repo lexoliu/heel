@@ -395,13 +395,41 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
     }
 }
 
-// Every test here starts a real sandbox, which needs an implemented backend.
-// Windows has none yet and `WindowsBackend::new` refuses to construct, so these
-// are compiled only where there is something to exercise, matching how
-// `tests/isolation.rs` and `tests/ipc.rs` are gated.
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shell and the flag that makes it run one command string.
+    #[cfg(windows)]
+    const SHELL: (&str, &str) = ("cmd.exe", "/C");
+    /// A shell and the flag that makes it run one command string.
+    #[cfg(not(windows))]
+    const SHELL: (&str, &str) = ("/bin/sh", "-c");
+
+    /// Print the working directory.
+    #[cfg(windows)]
+    const PRINT_WORKING_DIR: &str = "cd";
+    /// Print the working directory.
+    #[cfg(not(windows))]
+    const PRINT_WORKING_DIR: &str = "pwd";
+
+    /// Print the directory the sandbox nominates for temporary files.
+    #[cfg(windows)]
+    const PRINT_TEMP_DIR: &str = "echo %TEMP%";
+    /// Print the directory the sandbox nominates for temporary files.
+    #[cfg(not(windows))]
+    const PRINT_TEMP_DIR: &str = "printf %s \"$TMPDIR\"";
+
+    /// Run one command string through the platform's shell.
+    async fn shell(sandbox: &Sandbox, script: &str) -> std::process::Output {
+        sandbox
+            .command(SHELL.0)
+            .arg(SHELL.1)
+            .arg(script)
+            .output()
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn working_directory_is_removed_on_drop() {
@@ -439,13 +467,7 @@ mod tests {
     fn commands_run_inside_the_sandbox() {
         smol::block_on(async {
             let sandbox = Sandbox::new().await.unwrap();
-            let output = sandbox
-                .command("/bin/sh")
-                .arg("-c")
-                .arg("pwd")
-                .output()
-                .await
-                .unwrap();
+            let output = shell(&sandbox, PRINT_WORKING_DIR).await;
 
             assert!(output.status.success(), "unexpected output: {output:?}");
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -457,16 +479,10 @@ mod tests {
     fn tmpdir_points_at_the_working_directory() {
         smol::block_on(async {
             let sandbox = Sandbox::new().await.unwrap();
-            let output = sandbox
-                .command("/bin/sh")
-                .arg("-c")
-                .arg("printf %s \"$TMPDIR\"")
-                .output()
-                .await
-                .unwrap();
+            let output = shell(&sandbox, PRINT_TEMP_DIR).await;
 
             assert_eq!(
-                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stdout).trim(),
                 sandbox.working_dir().to_string_lossy()
             );
         });

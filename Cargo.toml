@@ -92,6 +92,7 @@ remove_dir_all = "0.8"
 smol-hyper = "0.1.1"
 async-channel = "2.5.0"
 interprocess = { version = "2", default-features = false }
+dunce = "1.0.5"
 
 # Unix process management
 [target.'cfg(unix)'.dependencies]
@@ -113,11 +114,16 @@ seccompiler = "0.4"
 
 # Windows-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = [
-    "Win32_Security_Isolation",
+# AppContainer profiles, capability SIDs, ACL grants, container launch and the
+# loopback exemption the proxy needs.
+rappct = { version = "0.13.3", features = ["net"] }
+# Kept on the version rappct exposes in its own API: a handle from one version
+# of the `windows` crate is a different type from the same handle in another.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
-    "Win32_Foundation",
 ] }
 
 [dev-dependencies]

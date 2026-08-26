@@ -167,9 +167,9 @@ impl<'a> Command<'a> {
     fn request<'r>(
         &'r self,
         envs: &'r [(String, String)],
-        stdin: Stdio,
-        stdout: Stdio,
-        stderr: Stdio,
+        stdin: StdioConfig,
+        stdout: StdioConfig,
+        stderr: StdioConfig,
     ) -> SpawnRequest<'r> {
         SpawnRequest {
             config: self.config,
@@ -195,9 +195,9 @@ impl<'a> Command<'a> {
         self.backend
             .execute(self.request(
                 &envs,
-                self.stdin.unwrap_or(StdioConfig::Null).into(),
-                Stdio::piped(),
-                Stdio::piped(),
+                self.stdin.unwrap_or(StdioConfig::Null),
+                StdioConfig::Piped,
+                StdioConfig::Piped,
             ))
             .await
     }
@@ -220,8 +220,8 @@ impl<'a> Command<'a> {
     }
 
     /// Resolve one stream, defaulting to an inherited stream.
-    fn stdio(&self, config: Option<StdioConfig>) -> Stdio {
-        config.unwrap_or(StdioConfig::Inherit).into()
+    fn stdio(&self, config: Option<StdioConfig>) -> StdioConfig {
+        config.unwrap_or(StdioConfig::Inherit)
     }
 
     /// Spawn the command for streaming I/O.
@@ -241,6 +241,19 @@ impl<'a> Command<'a> {
         Ok(child.with_tracker(self.process_tracker.clone()))
     }
 }
+
+/// The variables that name the directory for temporary files.
+///
+/// Unix programs read `TMPDIR`; the Windows runtimes read `TEMP` and `TMP`, and
+/// a sandboxed process that consulted the host's would be writing where it has
+/// no permission. `TMPDIR` is set on Windows too, for ported tools that look
+/// for it.
+#[cfg(windows)]
+const TEMP_DIR_VARS: &[&str] = &["TEMP", "TMP", "TMPDIR"];
+
+/// The variables that name the directory for temporary files.
+#[cfg(not(windows))]
+const TEMP_DIR_VARS: &[&str] = &["TMPDIR"];
 
 /// Build the environment a sandboxed process starts with.
 ///
@@ -264,10 +277,10 @@ pub(crate) fn sandbox_environment(
     // The working directory is the one place a sandboxed process can always
     // write, so it is also where temporary files belong. Strict mode denies the
     // shared temp directories outright.
-    envs.insert(
-        "TMPDIR".to_string(),
-        config.working_dir().display().to_string(),
-    );
+    let working_dir = config.working_dir().display().to_string();
+    for key in TEMP_DIR_VARS {
+        envs.insert((*key).to_string(), working_dir.clone());
+    }
 
     envs.insert("PATH".to_string(), sandbox_path(config, user_envs));
 

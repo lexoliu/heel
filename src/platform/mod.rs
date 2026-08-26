@@ -1,18 +1,19 @@
 use std::future::Future;
 use std::path::Path;
-use std::process::{ExitStatus, Output, Stdio};
+use std::process::Output;
 
-use blocking::unblock;
-
+use crate::command::StdioConfig;
 use crate::config::SandboxConfigData;
 use crate::error::Result;
-use crate::sandbox::ProcessTracker;
+pub use child::Child;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+pub(crate) mod child;
 
 #[cfg(unix)]
 pub(crate) mod rlimit;
@@ -44,11 +45,15 @@ pub(crate) struct SpawnRequest<'a> {
     /// Working directory override; defaults to the sandbox working directory.
     pub current_dir: Option<&'a Path>,
     /// Standard input configuration.
-    pub stdin: Stdio,
+    ///
+    /// Carried as the crate's own type rather than a `std::process::Stdio`,
+    /// which is opaque: the Windows backend does not spawn through
+    /// `std::process` and has to know what was asked for.
+    pub stdin: StdioConfig,
     /// Standard output configuration.
-    pub stdout: Stdio,
+    pub stdout: StdioConfig,
     /// Standard error configuration.
-    pub stderr: Stdio,
+    pub stderr: StdioConfig,
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]
@@ -56,160 +61,6 @@ impl SpawnRequest<'_> {
     /// The directory the process starts in.
     pub(crate) fn working_dir(&self) -> &Path {
         self.current_dir.unwrap_or(self.config.working_dir())
-    }
-}
-
-/// A spawned child process in the sandbox.
-pub struct Child {
-    inner: Option<std::process::Child>,
-    tracker: Option<ProcessTracker>,
-    pid: u32,
-}
-
-impl Child {
-    /// Wrap a freshly spawned process. Only backends call this, so it is unused
-    /// on Windows, where no backend is implemented yet.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    pub(crate) fn new(inner: std::process::Child) -> Self {
-        let pid = inner.id();
-        Self {
-            inner: Some(inner),
-            tracker: None,
-            pid,
-        }
-    }
-
-    pub(crate) fn with_tracker(mut self, tracker: ProcessTracker) -> Self {
-        self.tracker = Some(tracker);
-        self
-    }
-
-    /// The `std` handle, which is present until the child has been waited on.
-    fn handle(&mut self) -> Result<&mut std::process::Child> {
-        self.inner.as_mut().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "child process has already been consumed",
-            )
-            .into()
-        })
-    }
-
-    fn unregister(&mut self) {
-        if let Some(tracker) = self.tracker.take() {
-            tracker.unregister(self.pid);
-        }
-    }
-
-    /// Access the child's stdin.
-    pub fn stdin(&mut self) -> Option<&mut std::process::ChildStdin> {
-        self.inner.as_mut().and_then(|child| child.stdin.as_mut())
-    }
-
-    /// Access the child's stdout.
-    pub fn stdout(&mut self) -> Option<&mut std::process::ChildStdout> {
-        self.inner.as_mut().and_then(|child| child.stdout.as_mut())
-    }
-
-    /// Access the child's stderr.
-    pub fn stderr(&mut self) -> Option<&mut std::process::ChildStderr> {
-        self.inner.as_mut().and_then(|child| child.stderr.as_mut())
-    }
-
-    /// Take ownership of the child's stdin.
-    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.inner.as_mut().and_then(|child| child.stdin.take())
-    }
-
-    /// Take ownership of the child's stdout.
-    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.inner.as_mut().and_then(|child| child.stdout.take())
-    }
-
-    /// Take ownership of the child's stderr.
-    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.inner.as_mut().and_then(|child| child.stderr.take())
-    }
-
-    /// The process ID.
-    pub fn id(&self) -> u32 {
-        self.pid
-    }
-
-    /// Wait for the child to exit.
-    pub async fn wait(&mut self) -> Result<ExitStatus> {
-        let mut inner = self.inner.take().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "child process has already been consumed",
-            )
-        })?;
-        let (inner, status) = unblock(move || {
-            let status = inner.wait();
-            (inner, status)
-        })
-        .await;
-        self.inner = Some(inner);
-        let status = status?;
-        self.unregister();
-        Ok(status)
-    }
-
-    /// Wait for the child to exit and collect all output.
-    pub async fn wait_with_output(mut self) -> Result<Output> {
-        let inner = self.inner.take().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "child process has already been consumed",
-            )
-        })?;
-        let output = unblock(move || inner.wait_with_output()).await?;
-        self.unregister();
-        Ok(output)
-    }
-
-    /// Kill the child and everything it spawned, then reap it.
-    ///
-    /// Sandboxed processes run in their own process group, so the whole group
-    /// is signalled; the child is then waited on so it does not linger as a
-    /// zombie. Killing an already-exited child succeeds.
-    pub fn kill(&mut self) -> Result<()> {
-        #[cfg(unix)]
-        {
-            // SAFETY: a negative PID targets the process group created at
-            // spawn, which is this child and its descendants.
-            let result = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
-                // ESRCH means the group is already gone, which is success here.
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error.into());
-                }
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            if let Ok(handle) = self.handle() {
-                handle.kill()?;
-            }
-        }
-
-        // Reap so the kernel releases the entry rather than leaving a zombie.
-        if let Some(handle) = self.inner.as_mut() {
-            handle.wait()?;
-        }
-        self.unregister();
-        Ok(())
-    }
-
-    /// Check whether the child has exited, without blocking.
-    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-        let status = self.handle()?.try_wait()?;
-        if status.is_some() {
-            self.unregister();
-        }
-        Ok(status)
     }
 }
 
