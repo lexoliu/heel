@@ -95,34 +95,37 @@ async fn a_program_written_inside_the_sandbox_cannot_be_executed() {
     // Write-then-execute is the escape a scratch directory would otherwise hand
     // to sandboxed code. A real executable is required: `cmd.exe` interprets a
     // batch file after merely reading it, which execute rights do not govern.
+    //
+    // The host stages the source inside the working directory because the
+    // container cannot read the system's own binaries, so copying one from
+    // System32 fails before it proves anything.
     let sandbox = default_sandbox().await;
 
-    let output = cmd(
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let source = sandbox.working_dir().join("source.exe");
+    std::fs::copy(format!("{system_root}\\System32\\whoami.exe"), &source)
+        .expect("the host stages an executable the sandbox can read");
+
+    // The sandbox writes the payload itself, so what governs it is what a file
+    // created in the working directory inherits.
+    let copied = cmd(
         &sandbox,
-        "copy /Y %SystemRoot%\\System32\\whoami.exe payload.exe >nul && payload.exe",
+        "copy /Y source.exe payload.exe >nul && if exist payload.exe echo COPIED",
     )
     .await;
-
-    assert!(
-        !output.status.success(),
-        "a program written into the working directory must not run, but it printed {:?}",
-        stdout(&output)
+    assert_eq!(
+        stdout(&copied),
+        "COPIED",
+        "the sandbox must be able to write the payload, or running it proves nothing: {}",
+        stderr(&copied)
     );
-}
 
-#[tokio::test]
-async fn the_working_directory_is_writable_but_not_executable() {
-    // The copy has to succeed, or the test above would pass because the sandbox
-    // could not write the payload rather than because it could not run it.
-    let sandbox = default_sandbox().await;
-
-    let output = cmd(
-        &sandbox,
-        "copy /Y %SystemRoot%\\System32\\whoami.exe payload.exe >nul && if exist payload.exe echo COPIED",
-    )
-    .await;
-
-    assert_eq!(stdout(&output), "COPIED", "{}", stderr(&output));
+    let ran = cmd(&sandbox, "payload.exe").await;
+    assert!(
+        !ran.status.success(),
+        "a program the sandbox wrote must not run, but it printed {:?}",
+        stdout(&ran)
+    );
 }
 
 #[tokio::test]
