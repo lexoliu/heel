@@ -106,8 +106,35 @@ async fn a_program_written_inside_the_sandbox_cannot_be_executed() {
     std::fs::copy(format!("{system_root}\\System32\\whoami.exe"), &source)
         .expect("the host stages an executable the sandbox can read");
 
-    // The sandbox writes the payload itself, so what governs it is what a file
-    // created in the working directory inherits.
+    // Each step is checked on its own: "access is denied" from `copy` does not
+    // say whether the source could not be read or the destination could not be
+    // written, and the difference decides what is actually enforced here.
+    let readable = cmd(
+        &sandbox,
+        "if exist source.exe (type source.exe >nul && echo READABLE) else (echo MISSING)",
+    )
+    .await;
+    assert_eq!(
+        stdout(&readable),
+        "READABLE",
+        "the sandbox must be able to read a file staged in its working directory: {}",
+        stderr(&readable)
+    );
+
+    let created = cmd(
+        &sandbox,
+        "echo placeholder> payload.exe && if exist payload.exe echo CREATED",
+    )
+    .await;
+    assert_eq!(
+        stdout(&created),
+        "CREATED",
+        "the sandbox must be able to create a file named like a program: {}",
+        stderr(&created)
+    );
+
+    // The sandbox writes the payload itself, so what governs running it is what
+    // a file created in the working directory inherits.
     let copied = cmd(
         &sandbox,
         "copy /Y source.exe payload.exe >nul && if exist payload.exe echo COPIED",
