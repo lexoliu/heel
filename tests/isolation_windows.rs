@@ -126,15 +126,26 @@ async fn the_working_directory_is_writable_but_not_executable() {
 }
 
 #[tokio::test]
-async fn temp_dir_is_inside_the_sandbox() {
+async fn the_temp_directory_is_private_to_the_container() {
+    // Windows gives each AppContainer its own temp directory inside its package
+    // folder and redirects `TEMP` there, overriding whatever the sandbox sets.
+    // That is stronger than pointing at the working directory, not weaker: no
+    // other container and no other user can read it.
     let sandbox = default_sandbox().await;
-    let output = cmd(&sandbox, "echo %TEMP%").await;
 
-    assert_eq!(
-        stdout(&output),
-        sandbox.working_dir().to_string_lossy(),
-        "temporary files must land where the sandbox can write"
+    let output = cmd(&sandbox, "echo %TEMP%").await;
+    let temp = stdout(&output);
+    assert!(
+        temp.contains("\\Packages\\"),
+        "temp must be the container's own, got {temp:?}"
     );
+
+    let written = cmd(
+        &sandbox,
+        "echo written> %TEMP%\\probe.txt && type %TEMP%\\probe.txt",
+    )
+    .await;
+    assert_eq!(stdout(&written), "written", "{}", stderr(&written));
 }
 
 #[tokio::test]

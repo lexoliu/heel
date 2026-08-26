@@ -413,12 +413,16 @@ mod tests {
     #[cfg(not(windows))]
     const PRINT_WORKING_DIR: &str = "pwd";
 
-    /// Print the directory the sandbox nominates for temporary files.
+    /// Write a file into the directory nominated for temporary files, and read
+    /// it back.
     #[cfg(windows)]
-    const PRINT_TEMP_DIR: &str = "echo %TEMP%";
-    /// Print the directory the sandbox nominates for temporary files.
+    const ROUND_TRIP_THROUGH_TEMP: &str =
+        "echo written> %TEMP%\\probe.txt && type %TEMP%\\probe.txt";
+    /// Write a file into the directory nominated for temporary files, and read
+    /// it back.
     #[cfg(not(windows))]
-    const PRINT_TEMP_DIR: &str = "printf %s \"$TMPDIR\"";
+    const ROUND_TRIP_THROUGH_TEMP: &str =
+        "printf %s written > \"$TMPDIR/probe.txt\" && cat \"$TMPDIR/probe.txt\"";
 
     /// Show the backend's own diagnostics when a test fails.
     ///
@@ -488,10 +492,34 @@ mod tests {
     }
 
     #[test]
+    fn temporary_files_land_somewhere_the_sandbox_can_write() {
+        // The guarantee is that temporary files have a writable home inside the
+        // sandbox, not that it sits at a particular path. On Unix the sandbox
+        // points `TMPDIR` at its working directory. Windows decides for itself:
+        // an AppContainer is given a private temp directory inside its own
+        // package folder, which nothing outside the container can read, and
+        // that redirection overrides whatever `TEMP` is set to. Both satisfy
+        // the guarantee, so it is the behaviour that is asserted.
+        smol::block_on(async {
+            let sandbox = Sandbox::new().await.unwrap();
+            let output = shell(&sandbox, ROUND_TRIP_THROUGH_TEMP).await;
+
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "written",
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+    }
+
+    /// On Unix the temporary directory is the working directory itself.
+    #[cfg(not(windows))]
+    #[test]
     fn tmpdir_points_at_the_working_directory() {
         smol::block_on(async {
             let sandbox = Sandbox::new().await.unwrap();
-            let output = shell(&sandbox, PRINT_TEMP_DIR).await;
+            let output = shell(&sandbox, "printf %s \"$TMPDIR\"").await;
 
             assert_eq!(
                 String::from_utf8_lossy(&output.stdout).trim(),
