@@ -53,10 +53,40 @@ cargo run --bin heel -- python script.py    # Run Python in sandbox with venv
 - **macOS**: Works out of the box, tests run directly
 - **Linux**: Requires kernel 6.7+ with Landlock ABI v4. CI uses ubuntu-24.04
 
-`tests/isolation.rs` and `tests/ipc.rs` run real programs in real sandboxes and
-assert that forbidden operations fail. A change to a profile template, a
-ruleset, or a syscall filter is not verified until those pass: asserting on
-generated profile text only proves the generator wrote what it was told to.
+`tests/guarantees.rs` asserts what the sandbox promises, once per guarantee
+rather than once per backend, with each platform supplying only the way to ask.
+Every item of its `Probes` trait is required, so a backend that omits one fails
+to compile instead of quietly going unchecked. Every isolation bug this crate
+has had was a guarantee enforced on one backend and absent on another; that file
+exists so the next one cannot hide. `tests/isolation.rs` and
+`tests/isolation_windows.rs` cover what a single backend does beyond the shared
+guarantees, and `tests/ipc.rs` covers the host-command path.
+
+These run real programs in real sandboxes and assert that forbidden operations
+fail. A change to a profile template, a ruleset, or a syscall filter is not
+verified until they pass: asserting on generated profile text only proves the
+generator wrote what it was told to.
+
+## Releasing
+
+Publishing takes **two merges**, and only the second one publishes:
+
+1. Merge the content into `main`. This publishes nothing.
+2. release-plz then opens a PR of its own, titled `chore: release vX.Y.Z`, which
+   bumps the version and writes the changelog. Merging **that** is what runs
+   `cargo publish`.
+
+Stopping after the first merge leaves the release un-published while looking
+finished, which matters most when a security fix is riding on it. Confirm on
+crates.io rather than from the merge:
+
+```bash
+curl -s -H 'User-Agent: heel' https://crates.io/api/v1/crates/heel | grep -o '"max_version":"[^"]*"'
+```
+
+`cargo publish` is irreversible, so the merge of the release PR belongs to the
+user. Never merge it automatically, and never hand-edit `version =` or
+`CHANGELOG.md`: release-plz derives both from conventional-commit messages.
 
 ## Architecture
 
