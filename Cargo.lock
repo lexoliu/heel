@@ -1229,6 +1229,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11762a6aea3b0a87a51b21cb2085d252f10c01cd0f3f505e1da002cf6e2427da"
 dependencies = [
  "thiserror",
+ "tracing",
  "windows",
 ]
 

@@ -420,8 +420,20 @@ mod tests {
     #[cfg(not(windows))]
     const PRINT_TEMP_DIR: &str = "printf %s \"$TMPDIR\"";
 
+    /// Show the backend's own diagnostics when a test fails.
+    ///
+    /// Windows reports a refused launch through one opaque error, and the
+    /// detail that says which step failed is only emitted as a trace.
+    fn show_backend_diagnostics() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::TRACE)
+            .try_init();
+    }
+
     /// Run one command string through the platform's shell.
     async fn shell(sandbox: &Sandbox, script: &str) -> std::process::Output {
+        show_backend_diagnostics();
         sandbox
             .command(SHELL.0)
             .arg(SHELL.1)

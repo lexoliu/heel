@@ -116,7 +116,7 @@ seccompiler = "0.4"
 [target.'cfg(target_os = "windows")'.dependencies]
 # AppContainer profiles, capability SIDs, ACL grants, container launch and the
 # loopback exemption the proxy needs.
-rappct = { version = "0.13.3", features = ["net"] }
+rappct = { version = "0.13.3", features = ["net", "tracing"] }
 # Kept on the version rappct exposes in its own API: a handle from one version
 # of the `windows` crate is a different type from the same handle in another.
 windows = { version = "0.62", features = [
@@ -130,3 +130,5 @@ windows = { version = "0.62", features = [
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 executor-core = { version = "0.7", features = ["tokio"] }
 tempfile = "3"
+# Surfaces the launcher's own diagnostics when a Windows test fails.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
