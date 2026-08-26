@@ -101,7 +101,10 @@ impl Probes for Platform {
     const WRITE_AND_READ_BACK: &'static str = "echo written> probe.txt && type probe.txt";
     const FETCH_TOOL_PRESENT: &'static str = "if exist %SystemRoot%\\System32\\curl.exe echo FOUND";
     const FETCH: &'static str = "curl.exe --silent --max-time 5 http://example.com || echo BLOCKED";
-    const PRINT_PROXY: &'static str = "if \"%HTTP_PROXY%\"==\"\" echo unset";
+    // `if not defined`, because `cmd.exe` leaves an unset variable as the
+    // literal `%HTTP_PROXY%` rather than expanding it to nothing, so comparing
+    // it against an empty string is false exactly when the variable is absent.
+    const PRINT_PROXY: &'static str = "if not defined HTTP_PROXY echo unset";
     // A batch file would prove nothing: `cmd.exe` interprets one after merely
     // reading it, which execute rights do not govern. It has to be a real
     // program, and the container cannot read the system's own, so the host
