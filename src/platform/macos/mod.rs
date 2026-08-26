@@ -9,6 +9,7 @@ use std::process::{Command, Output};
 
 use blocking::unblock;
 
+use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::child::unix::UnixChild;
 use crate::platform::rlimit::PreparedLimits;
@@ -27,7 +28,7 @@ pub struct MacOSBackend {
 
 impl MacOSBackend {
     /// Create the backend, checking that the OS is new enough.
-    pub fn new() -> Result<Self> {
+    pub fn new(_config: &SandboxConfigData) -> Result<Self> {
         let version = Self::macos_version()?;
         if version < (10, 15) {
             return Err(Error::UnsupportedPlatformVersion {

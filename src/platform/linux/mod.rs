@@ -8,6 +8,7 @@ use std::process::{Command, Output};
 
 use blocking::unblock;
 
+use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::child::unix::UnixChild;
 use crate::platform::rlimit::PreparedLimits;
@@ -70,7 +71,7 @@ impl LinuxBackend {
     /// creating a ruleset rather than by forking a child and applying one:
     /// forking a multi-threaded process and then allocating in the child is
     /// unsound.
-    pub fn new() -> Result<Self> {
+    pub fn new(_config: &SandboxConfigData) -> Result<Self> {
         let kernel = detect_kernel_version()?;
         if kernel < MIN_KERNEL_VERSION {
             return Err(Error::UnsupportedPlatformVersion {

@@ -200,7 +200,6 @@ impl<N: NetworkPolicy> Sandbox<N> {
         config: SandboxConfig<N>,
         executor: E,
     ) -> Result<Self> {
-        let backend = platform::create_native_backend()?;
         let (policy, mut config_data, router) = config.into_parts();
 
         // Create and canonicalize the working directory before anything else
@@ -209,6 +208,12 @@ impl<N: NetworkPolicy> Sandbox<N> {
         let auto = config_data.working_dir_is_auto();
         let working_dir = unblock(move || WorkingDir::create(&requested_dir, auto)).await?;
         config_data.set_working_dir(working_dir.path().to_path_buf());
+
+        // After the working directory exists, so a backend that has to open it
+        // to the sandbox does so before the caller can put anything in it.
+        // Windows grants by inheritance, and inheritance only reaches files
+        // created once the grant is in place.
+        let backend = platform::create_native_backend(&config_data)?;
 
         // DenyAll needs no proxy: the backend denies outbound traffic outright,
         // which is a stronger guarantee than a userspace rejection.

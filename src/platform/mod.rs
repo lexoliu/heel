@@ -87,11 +87,13 @@ pub(crate) type NativeBackend = windows::WindowsBackend;
 
 /// Create the native backend for the current platform.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-pub(crate) fn create_native_backend() -> Result<NativeBackend> {
-    NativeBackend::new()
+pub(crate) fn create_native_backend(config: &SandboxConfigData) -> Result<NativeBackend> {
+    NativeBackend::new(config)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub(crate) fn create_native_backend() -> Result<std::convert::Infallible> {
+pub(crate) fn create_native_backend(
+    _config: &SandboxConfigData,
+) -> Result<std::convert::Infallible> {
     Err(crate::error::Error::UnsupportedPlatform)
 }

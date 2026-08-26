@@ -22,6 +22,7 @@ use rappct::launch::{
 pub(crate) use child::AppContainerChild;
 use container::Container;
 
+use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::{Backend, Child, SpawnRequest};
 
@@ -65,24 +66,25 @@ const USER_DIRECTORIES: &[&str] = &["USERPROFILE", "LOCALAPPDATA", "APPDATA", "A
 #[derive(Debug)]
 pub struct WindowsBackend {
     container: Container,
-    /// Granting the configured paths rewrites directory ACLs, which makes
-    /// Windows re-propagate inheritance through everything beneath them. That
-    /// costs seconds on a directory as busy as the user's temp, so it is done
-    /// once for the sandbox rather than once per process.
-    granted: std::sync::OnceLock<()>,
 }
 
 impl WindowsBackend {
-    /// Create the AppContainer this sandbox's processes will run in.
+    /// Create the AppContainer this sandbox's processes will run in, and open
+    /// the configured paths to it.
+    ///
+    /// The paths are granted here rather than at the first launch because
+    /// Windows grants by inheritance, and an inheritable entry only reaches
+    /// files created after it exists. Granting later would leave anything the
+    /// caller had already put in the working directory unreadable.
     ///
     /// # Errors
     ///
-    /// Returns an error if the AppContainer profile cannot be created.
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            container: Container::create()?,
-            granted: std::sync::OnceLock::new(),
-        })
+    /// Returns an error if the AppContainer profile cannot be created, or if a
+    /// configured path cannot be opened to it.
+    pub fn new(config: &SandboxConfigData) -> Result<Self> {
+        let container = Container::create()?;
+        container.grant_configured_paths(config)?;
+        Ok(Self { container })
     }
 
     /// Prepare everything one launch needs.
@@ -90,11 +92,6 @@ impl WindowsBackend {
     /// Returns the options, the capabilities and the loopback exemption, which
     /// must outlive the process it is granted for.
     fn prepare(&self, request: &SpawnRequest<'_>) -> Result<Prepared> {
-        if self.granted.get().is_none() {
-            self.container.grant_configured_paths(request.config)?;
-            let _ = self.granted.set(());
-        }
-
         // The container has to read the program to run it. Anything under the
         // system directories is already open to every package; a program
         // elsewhere is not, so it is granted explicitly.
