@@ -17,6 +17,8 @@ pub struct FileConfig {
     pub network: Option<NetworkMode>,
     /// Domains to allow under the `allow-list` policy.
     pub allow_domains: Vec<String>,
+    /// File the network decisions of each run are appended to.
+    pub audit_log: Option<PathBuf>,
     /// Isolation level.
     pub isolation: Option<Isolation>,
     /// Security toggles layered onto the isolation level's preset.
@@ -80,6 +82,7 @@ pub struct PythonSection {
 pub struct MergedConfig {
     pub network_mode: NetworkMode,
     pub allow_domains: Vec<String>,
+    pub audit_log: Option<PathBuf>,
     pub isolation: Isolation,
     pub security: SecurityConfig,
     pub readable_paths: Vec<PathBuf>,
@@ -150,9 +153,18 @@ pub fn merge_config(file: FileConfig, cli: &CommonArgs) -> CliResult<MergedConfi
         return Err(CliError::MissingAllowDomains);
     }
 
+    // An audit log records what the proxy decided, and a deny-all policy runs
+    // no proxy: the kernel refuses every connection before a policy sees it, so
+    // the log would stay empty rather than recording denials.
+    let audit_log = cli.audit_log.clone().or(file.audit_log);
+    if audit_log.is_some() && network_mode == NetworkMode::Deny {
+        return Err(CliError::AuditLogWithoutProxy);
+    }
+
     Ok(MergedConfig {
         network_mode,
         allow_domains,
+        audit_log,
         isolation,
         security,
         readable_paths: concat(file.paths.readable, &cli.readable_paths),
@@ -288,6 +300,50 @@ mod tests {
         )
         .expect_err("must fail");
         assert!(matches!(error, CliError::MissingAllowDomains));
+    }
+
+    #[test]
+    fn the_audit_log_prefers_the_command_line_over_the_file() {
+        let file: FileConfig =
+            toml::from_str("network = \"allow\"\naudit-log = \"/var/log/from-file.jsonl\"")
+                .expect("parses");
+        let merged = merge_config(file, &common_args(&["--audit-log", "/tmp/from-cli.jsonl"]))
+            .expect("merges");
+
+        assert_eq!(
+            merged.audit_log.as_deref(),
+            Some(Path::new("/tmp/from-cli.jsonl"))
+        );
+    }
+
+    #[test]
+    fn the_audit_log_can_come_from_the_file_alone() {
+        let file: FileConfig =
+            toml::from_str("network = \"allow\"\naudit-log = \"/var/log/heel.jsonl\"")
+                .expect("parses");
+        let merged = merge_config(file, &common_args(&[])).expect("merges");
+
+        assert_eq!(
+            merged.audit_log.as_deref(),
+            Some(Path::new("/var/log/heel.jsonl"))
+        );
+    }
+
+    #[test]
+    fn an_audit_log_without_a_proxy_is_rejected() {
+        // Deny-all is the default, and it denies in the kernel without ever
+        // consulting a policy, so an audit log would record nothing at all.
+        let error = merge_config(
+            FileConfig::default(),
+            &common_args(&["--audit-log", "/tmp/heel.jsonl"]),
+        )
+        .expect_err("must fail");
+        assert!(matches!(error, CliError::AuditLogWithoutProxy));
+
+        let file: FileConfig =
+            toml::from_str("audit-log = \"/tmp/heel.jsonl\"\nnetwork = \"deny\"").expect("parses");
+        let error = merge_config(file, &common_args(&[])).expect_err("must fail");
+        assert!(matches!(error, CliError::AuditLogWithoutProxy));
     }
 
     #[test]
