@@ -51,7 +51,7 @@ fn secret_file() -> (tempfile::TempDir, std::path::PathBuf) {
 async fn an_explicitly_readable_path_is_readable() {
     let (_dir, secret) = secret_file();
     let config = SandboxConfigBuilder::default()
-        .readable_path(secret.parent().expect("has a parent"))
+        .readable(secret.parent().expect("has a parent"))
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -74,9 +74,7 @@ async fn an_explicit_allow_beats_a_default_protection() {
     std::fs::create_dir_all(&scratch).expect("creates");
     std::fs::write(scratch.join("data.txt"), "visible").expect("writes");
 
-    let config = SandboxConfigBuilder::default()
-        .readable_path(&scratch)
-        .build();
+    let config = SandboxConfigBuilder::default().readable(&scratch).build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts");
@@ -280,7 +278,7 @@ async fn exit_codes_are_reported_faithfully() {
 #[tokio::test]
 async fn a_missing_configured_path_is_an_error_rather_than_a_silent_denial() {
     let config = SandboxConfigBuilder::default()
-        .readable_path("/definitely/not/a/real/path")
+        .readable("/definitely/not/a/real/path")
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await

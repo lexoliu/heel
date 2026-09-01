@@ -6,6 +6,7 @@ use askama::Template;
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
+use crate::grant::Grant;
 
 /// A Python virtual environment as the template sees it.
 struct VenvRules {
@@ -48,19 +49,24 @@ impl std::fmt::Display for PathFilter {
     }
 }
 
-/// An explicitly permitted executable as the template sees it.
-struct ExecutableRule {
+/// One configured grant as the template sees it.
+///
+/// The template emits the whole grant as one block, so the rule order that
+/// decides the outcome — read, then write, then the exec allow or deny that
+/// SBPL's last-match-wins resolution settles on — is a property of this one
+/// loop rather than of how three separate loops happen to be arranged.
+struct GrantRules {
     path: String,
     filter: PathFilter,
+    writable: bool,
+    executable: bool,
 }
 
 /// SBPL profile template.
 #[derive(Template)]
 #[template(path = "sandbox.txt", escape = "none")]
 struct SandboxProfile {
-    readable_paths: Vec<String>,
-    writable_paths: Vec<String>,
-    executable_paths: Vec<ExecutableRule>,
+    grants: Vec<GrantRules>,
     working_dir: String,
     ipc_bin_dir: Option<String>,
     ipc_socket_dir: Option<String>,
@@ -96,9 +102,7 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
     let security = config.security();
 
     let mut template = SandboxProfile {
-        readable_paths: sbpl_paths(config.readable_paths())?,
-        writable_paths: sbpl_paths(config.writable_paths())?,
-        executable_paths: executable_rules(config.executable_paths())?,
+        grants: grant_rules(config.grants())?,
         working_dir: sbpl_path(config.working_dir())?,
         ipc_bin_dir: config
             .ipc_socket()
@@ -175,10 +179,9 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
 /// leaving its other children denied.
 fn traversal_paths(profile: &SandboxProfile) -> Vec<String> {
     let granted = profile
-        .readable_paths
+        .grants
         .iter()
-        .chain(&profile.writable_paths)
-        .chain(profile.executable_paths.iter().map(|rule| &rule.path))
+        .map(|grant| &grant.path)
         .chain(std::iter::once(&profile.working_dir))
         .chain(profile.ipc_bin_dir.iter())
         .chain(profile.ipc_socket_dir.iter())
@@ -200,11 +203,6 @@ fn traversal_paths(profile: &SandboxProfile) -> Vec<String> {
     ancestors
 }
 
-/// Canonicalize and escape a list of configured paths.
-fn sbpl_paths(paths: &[PathBuf]) -> Result<Vec<String>> {
-    paths.iter().map(|path| sbpl_path(path)).collect()
-}
-
 /// Canonicalize a path and escape it for an SBPL string literal.
 fn sbpl_path(path: &Path) -> Result<String> {
     escape_path(&canonical_path(path)?)
@@ -221,19 +219,21 @@ fn canonical_path(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path).map_err(|source| Error::path(path, source))
 }
 
-/// Build the executable grants, choosing a filter per path.
+/// Build the rules for the configured grants, choosing a filter per path.
 ///
 /// A grant naming a directory covers the whole tree beneath it, which is what
 /// makes a build cache that is written and then executed usable; a grant naming
 /// a file stays that one file.
-fn executable_rules(paths: &[PathBuf]) -> Result<Vec<ExecutableRule>> {
-    paths
+fn grant_rules(grants: &[Grant]) -> Result<Vec<GrantRules>> {
+    grants
         .iter()
-        .map(|path| {
-            let canonical = canonical_path(path)?;
-            Ok(ExecutableRule {
+        .map(|grant| {
+            let canonical = canonical_path(grant.path())?;
+            Ok(GrantRules {
                 filter: PathFilter::for_path(&canonical)?,
                 path: escape_path(&canonical)?,
+                writable: grant.access().can_write(),
+                executable: grant.access().can_execute(),
             })
         })
         .collect()
@@ -270,6 +270,7 @@ fn escape_path(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::config::{SandboxConfig, SandboxConfigData};
+    use crate::grant::Access;
     use crate::network::AllowAll;
     use crate::workdir::WorkingDir;
     use std::process::Command;
@@ -309,11 +310,8 @@ mod tests {
     #[test]
     fn writable_locations_cannot_be_executed() {
         let scratch = tempfile::tempdir().expect("tempdir");
-        let (data, dir) = prepared_config(
-            SandboxConfig::builder()
-                .writable_path(scratch.path())
-                .build(),
-        );
+        let (data, dir) =
+            prepared_config(SandboxConfig::builder().writable(scratch.path()).build());
         let profile = generate_profile(&data, None).unwrap();
 
         let scratch_canonical = std::fs::canonicalize(scratch.path()).expect("canonical");
@@ -331,11 +329,8 @@ mod tests {
     #[test]
     fn an_executable_directory_is_granted_as_a_subpath() {
         let tools = tempfile::tempdir().expect("tempdir");
-        let (data, _dir) = prepared_config(
-            SandboxConfig::builder()
-                .executable_path(tools.path())
-                .build(),
-        );
+        let (data, _dir) =
+            prepared_config(SandboxConfig::builder().executable(tools.path()).build());
         let profile = generate_profile(&data, None).unwrap();
 
         let canonical = std::fs::canonicalize(tools.path()).expect("canonical");
@@ -358,8 +353,7 @@ mod tests {
         let binary = tools.path().join("tool");
         std::fs::write(&binary, b"#!/bin/sh\n").expect("writes");
 
-        let (data, _dir) =
-            prepared_config(SandboxConfig::builder().executable_path(&binary).build());
+        let (data, _dir) = prepared_config(SandboxConfig::builder().executable(&binary).build());
         let profile = generate_profile(&data, None).unwrap();
 
         let canonical = std::fs::canonicalize(&binary).expect("canonical");
@@ -377,38 +371,87 @@ mod tests {
     }
 
     #[test]
-    fn an_executable_grant_overrides_the_writable_deny_for_the_same_directory() {
-        // SBPL resolves an operation with the last matching rule, so the exec
-        // allow only wins if it is emitted after the deny that the same path
-        // earns for being writable. A build cache is written and then executed,
-        // which is exactly this case.
+    fn a_write_and_exec_grant_is_writable_and_executable() {
+        // A build cache is written and then executed. One grant carries both,
+        // so the path is never denied exec in the first place — there is no
+        // deny for the profile's last-match resolution to have to beat.
         let cache = tempfile::tempdir().expect("tempdir");
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .writable_path(cache.path())
-                .executable_path(cache.path())
+                .grant(cache.path(), Access::WRITE | Access::EXEC)
                 .build(),
         );
         let profile = generate_profile(&data, None).unwrap();
-
         let canonical = std::fs::canonicalize(cache.path()).expect("canonical");
-        let deny = profile
-            .find(&format!(
+
+        for rule in [
+            "allow file-read*",
+            "allow file-write*",
+            "allow file-write-create",
+            "allow file-write-unlink",
+            "allow process-exec",
+        ] {
+            let expected = format!("({rule} (subpath \"{}\"))", canonical.display());
+            assert!(
+                profile.contains(&expected),
+                "missing {expected}:\n{profile}"
+            );
+        }
+
+        assert!(
+            !profile.contains(&format!(
                 "(deny process-exec (subpath \"{}\"))",
                 canonical.display()
-            ))
-            .expect("the writable path is denied exec");
-        let allow = profile
+            )),
+            "a grant that allows exec must not also deny it:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn an_exec_grant_still_beats_the_protections_above_it() {
+        // The exec allow only wins because pass 3 comes after pass 2, and SBPL
+        // resolves an operation with the last matching rule. A grant under the
+        // shared temp directory, which pass 2 denies wholesale, is the case
+        // where that ordering is the only thing doing the work.
+        let tools = Path::new("/tmp").join(crate::workdir::generate_working_dir_name());
+        std::fs::create_dir_all(&tools).expect("creates");
+
+        let (data, _dir) = prepared_config(SandboxConfig::builder().executable(&tools).build());
+        let profile = generate_profile(&data, None).unwrap();
+        let canonical = std::fs::canonicalize(&tools).expect("canonical");
+        std::fs::remove_dir_all(&tools).ok();
+
+        let blanket = profile
+            .find("(deny process-exec (subpath \"/private/tmp\"))")
+            .expect("shared temp is denied exec");
+        let grant = profile
             .find(&format!(
                 "(allow process-exec (subpath \"{}\"))",
                 canonical.display()
             ))
-            .expect("the executable path is granted exec");
+            .expect("the grant allows exec");
 
         assert!(
-            deny < allow,
-            "the exec grant must come after the writable deny:\n{profile}"
+            blanket < grant,
+            "an explicit grant must be emitted after the protection it overrides:\n{profile}"
         );
+    }
+
+    #[test]
+    fn a_writable_grant_alone_is_still_denied_exec() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let (data, _dir) = prepared_config(SandboxConfig::builder().writable(cache.path()).build());
+        let profile = generate_profile(&data, None).unwrap();
+        let canonical = std::fs::canonicalize(cache.path()).expect("canonical");
+
+        assert!(profile.contains(&format!(
+            "(deny process-exec (subpath \"{}\"))",
+            canonical.display()
+        )));
+        assert!(!profile.contains(&format!(
+            "(allow process-exec (subpath \"{}\"))",
+            canonical.display()
+        )));
     }
 
     #[test]
@@ -418,8 +461,7 @@ mod tests {
         let scratch = Path::new("/tmp").join(crate::workdir::generate_working_dir_name());
         std::fs::create_dir_all(&scratch).expect("creates");
 
-        let (data, _dir) =
-            prepared_config(SandboxConfig::builder().readable_path(&scratch).build());
+        let (data, _dir) = prepared_config(SandboxConfig::builder().readable(&scratch).build());
         let profile = generate_profile(&data, None).unwrap();
 
         assert!(
@@ -433,7 +475,7 @@ mod tests {
     fn missing_configured_paths_are_rejected() {
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .readable_path("/definitely/not/a/real/path")
+                .readable("/definitely/not/a/real/path")
                 .build(),
         );
 
