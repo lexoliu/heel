@@ -115,7 +115,8 @@ user. Never merge it automatically, and never hand-edit `version =` or
 - **Drop-based cleanup**: Sandbox drop kills child processes and removes working directory
 - **pre_exec sandbox application**: On Linux, Landlock and Seccomp are applied in a `pre_exec` hook after fork, before exec. Everything that hook needs is built beforehand, so the post-fork path only issues syscalls
 - **SBPL rule order**: macOS resolves an operation with the LAST matching rule. `templates/sandbox.txt` is laid out in three passes — baseline, protections, then user-configured paths — so an explicit allow always beats a default protection. Moving a rule between passes changes what the sandbox enforces
-- **No exec where the sandbox can write**: the working directory, configured writable paths and shared temp are all denied execute, so sandboxed code cannot write a payload and run it. An explicit executable grant is the one exception, since it is emitted after those denies: it may name a file or a directory, and a directory grant covers the whole tree on every backend
+- **Grants, not path lists**: `SandboxConfig` carries one `Grant` per path — a path plus the `Access` (`READ`/`WRITE`/`EXEC`, where write and exec include read) the sandbox has to it. Each backend consumes them in one loop, so the rules that used to live in the cross-product of three lists are now properties of one value
+- **No exec where the sandbox can write**: the working directory, `Access::WRITE` grants and shared temp are all denied execute, so sandboxed code cannot write a payload and run it. `Access::WRITE | Access::EXEC` on one path is the deliberate exception: it may name a file or a directory, and a directory covers the whole tree on every backend
 
 ## Code Standards
 

@@ -1,8 +1,11 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use heel::SecurityOverrides;
+use heel::{Access, Grant, SecurityOverrides};
 use serde::Deserialize;
+
+use crate::error::CliError;
 
 /// Native sandbox for running untrusted code.
 #[derive(Parser)]
@@ -189,22 +192,30 @@ pub struct CommonArgs {
     #[command(flatten)]
     pub security: SecurityArgs,
 
-    /// Path the sandbox may read; may be repeated.
-    #[arg(long = "readable")]
-    pub readable_paths: Vec<PathBuf>,
-
-    /// Path the sandbox may write; may be repeated.
-    #[arg(long = "writable")]
-    pub writable_paths: Vec<PathBuf>,
-
-    /// Path the sandbox may execute; may be repeated.
+    /// Path the sandbox may use, as `PATH=MODE`; may be repeated.
     ///
-    /// A directory grants execute to everything beneath it on every platform,
-    /// which is what a build cache that is written and then run needs. Granting
-    /// execute to a directory the sandbox can also write gives up the
-    /// write-then-execute guarantee for that directory.
+    /// The mode is some of `r`, `w` and `x`, always including `r`: `rw` is a
+    /// writable directory, `rx` one the sandbox may run programs from, and
+    /// `rwx` one it may do both with. A path granted twice keeps the union.
+    ///
+    /// A directory grants what it says to everything beneath it on every
+    /// platform. `rwx` is what a build cache that is written and then run
+    /// needs, and it gives up the write-then-execute guarantee for that
+    /// directory.
+    #[arg(long = "grant", value_name = "PATH=MODE")]
+    pub grants: Vec<GrantArg>,
+
+    /// Path the sandbox may read; the same as `--grant PATH=r`.
+    #[arg(long = "readable")]
+    pub readable: Vec<PathBuf>,
+
+    /// Path the sandbox may write; the same as `--grant PATH=rw`.
+    #[arg(long = "writable")]
+    pub writable: Vec<PathBuf>,
+
+    /// Path the sandbox may execute; the same as `--grant PATH=rx`.
     #[arg(long = "executable")]
-    pub executable_paths: Vec<PathBuf>,
+    pub executable: Vec<PathBuf>,
 
     /// Maximum address space, in bytes.
     #[arg(long)]
@@ -292,6 +303,50 @@ security_args! {
     allow_npu,
     /// Allow general hardware access.
     allow_hardware,
+}
+
+/// One `--grant PATH=MODE` argument.
+///
+/// The split is on the last `=` so that a path containing one still parses,
+/// and a value without any `=` is an error rather than a path granted some
+/// default: guessing what a caller meant to open to a sandbox is exactly the
+/// kind of guess that must not happen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantArg {
+    pub path: PathBuf,
+    pub access: Access,
+}
+
+impl FromStr for GrantArg {
+    type Err = CliError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (path, mode) = value
+            .rsplit_once('=')
+            .ok_or_else(|| CliError::InvalidGrantFormat {
+                value: value.to_owned(),
+            })?;
+
+        if path.is_empty() {
+            return Err(CliError::InvalidGrantFormat {
+                value: value.to_owned(),
+            });
+        }
+
+        Ok(Self {
+            path: PathBuf::from(path),
+            access: mode.parse().map_err(|source| CliError::InvalidGrantMode {
+                value: value.to_owned(),
+                source,
+            })?,
+        })
+    }
+}
+
+impl From<&GrantArg> for Grant {
+    fn from(arg: &GrantArg) -> Self {
+        Self::new(&arg.path, arg.access)
+    }
 }
 
 /// How much of the host the sandbox can see.
@@ -440,6 +495,51 @@ mod tests {
         assert_eq!(args.common.isolation, Some(Isolation::Strict));
         assert_eq!(args.program(), "/bin/sh");
         assert_eq!(args.args(), ["-c", "x"]);
+    }
+
+    #[test]
+    fn a_grant_carries_its_path_and_its_mode() {
+        let cli = Cli::try_parse_from(["heel", "run", "--grant", "/opt/cache=rwx", "echo"])
+            .expect("parses");
+        let Commands::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+
+        assert_eq!(
+            args.common.grants,
+            [GrantArg {
+                path: PathBuf::from("/opt/cache"),
+                access: Access::WRITE | Access::EXEC,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_grant_path_may_contain_the_separator() {
+        // The split is on the last `=`, so a path with one in it still parses.
+        let grant: GrantArg = "/opt/a=b/cache=rx".parse().expect("parses");
+        assert_eq!(grant.path, PathBuf::from("/opt/a=b/cache"));
+        assert_eq!(grant.access, Access::EXEC);
+    }
+
+    #[test]
+    fn malformed_grants_are_rejected() {
+        let Err(error) = Cli::try_parse_from(["heel", "run", "--grant", "/opt/cache", "echo"])
+        else {
+            panic!("a grant without a mode must be rejected");
+        };
+        assert!(error.to_string().contains("expected PATH=MODE"), "{error}");
+
+        let Err(error) = Cli::try_parse_from(["heel", "run", "--grant", "/opt/cache=w", "echo"])
+        else {
+            panic!("a mode without read must be rejected");
+        };
+        assert!(error.to_string().contains("does not grant read"), "{error}");
+
+        let Err(error) = Cli::try_parse_from(["heel", "run", "--grant", "=rw", "echo"]) else {
+            panic!("a grant without a path must be rejected");
+        };
+        assert!(error.to_string().contains("expected PATH=MODE"), "{error}");
     }
 
     #[test]
