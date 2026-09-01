@@ -37,6 +37,28 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # The `lint` job runs on x86_64 Linux, where `cfg(target_os = "windows")` and
+  # the aarch64 arms of the seccomp filter compile to nothing: the code hardest
+  # to check by hand is the code the lint gate never sees, and it accumulated
+  # dead helpers unnoticed. `cargo clippy` needs a target's standard library but
+  # never links, so both are lintable from this runner without a Windows one.
+  cross-lint:
+    name: Cross-target Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-pc-windows-msvc, aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-cross
+      - name: Clippy (Windows)
+        run: cargo clippy --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
+      - name: Clippy (Linux aarch64)
+        run: cargo clippy --target aarch64-unknown-linux-gnu --all-targets --all-features -- -D warnings
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
