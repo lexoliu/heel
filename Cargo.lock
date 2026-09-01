@@ -559,8 +559,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2de25163ce4b5cac207bec1f1ebf6a1cf3033c7e02bf331e0d31cb50d239d058"
 dependencies = [
  "async-channel",
- "async-executor",
  "async-task",
+ "smol",
  "tokio",
 ]
 

@@ -5,7 +5,7 @@ use std::process::Output;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use blocking::unblock;
-use executor_core::async_executor::AsyncExecutor;
+use executor_core::smol::SmolGlobal;
 use executor_core::{DefaultExecutor, Executor, try_init_global_executor};
 
 use crate::command::{Command, ProxyEndpoint};
@@ -178,7 +178,9 @@ pub struct Sandbox<N: NetworkPolicy = DenyAll> {
 impl Sandbox<DenyAll> {
     /// Create a sandbox with default configuration and no network access.
     pub async fn new() -> Result<Self> {
-        let _ = try_init_global_executor(AsyncExecutor::new());
+        // See `with_config`: the fallback executor has to be one that runs the
+        // tasks handed to it. A caller that installed its own keeps it.
+        let _ = try_init_global_executor(SmolGlobal);
         Self::with_config_and_executor(SandboxConfig::new(), DefaultExecutor).await
     }
 
@@ -190,8 +192,15 @@ impl Sandbox<DenyAll> {
 
 impl<N: NetworkPolicy> Sandbox<N> {
     /// Create a sandbox from a configuration.
+    ///
+    /// The sandbox runs its proxy and its IPC server as spawned tasks, so the
+    /// executor they land on must actually poll them. When the caller has not
+    /// installed a global executor this supplies smol's, which owns the threads
+    /// that drive it. `async_executor::Executor` is not usable here: it only
+    /// makes progress while someone calls `run`, so a proxy spawned onto one
+    /// binds its port, accepts nothing, and hangs every connection.
     pub async fn with_config(config: SandboxConfig<N>) -> Result<Self> {
-        let _ = try_init_global_executor(AsyncExecutor::new());
+        let _ = try_init_global_executor(SmolGlobal);
         Self::with_config_and_executor(config, DefaultExecutor).await
     }
 
@@ -403,6 +412,31 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_fallback_global_executor_runs_the_tasks_it_is_given() {
+        // The proxy and the IPC server are detached tasks on this executor.
+        // One that only queues them leaves the proxy bound to its port and
+        // answering nothing, which reaches the sandboxed process as a hang
+        // rather than as an error, so the failure has to be caught here.
+        let _ = try_init_global_executor(SmolGlobal);
+
+        let (sender, receiver) = async_channel::bounded(1);
+        DefaultExecutor
+            .spawn(async move { sender.send(()).await })
+            .detach();
+
+        let ran = smol::block_on(futures_lite::future::or(
+            async { receiver.recv().await.is_ok() },
+            async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                false
+            },
+        ));
+
+        assert!(ran, "the global executor never ran a task spawned onto it");
+    }
 
     /// A shell and the flag that makes it run one command string.
     #[cfg(windows)]
