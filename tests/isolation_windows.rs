@@ -1,14 +1,11 @@
-//! What the Windows sandbox must actually prevent.
+//! What the Windows sandbox does beyond the shared guarantees.
 //!
-//! The same guarantees `isolation.rs` asserts on macOS and Linux, expressed for
-//! an AppContainer: reachable paths are the ones granted by ACL, execution is a
-//! right of its own, and a container without `internetClient` has no network.
-//!
-//! These are a separate file rather than a platform arm of `isolation.rs`
-//! because every script differs -- `cmd.exe` is not a POSIX shell -- and because
-//! the write-then-execute check has to use a real executable: a batch file is
-//! read and interpreted by `cmd.exe`, so it would prove nothing about execute
-//! rights.
+//! The guarantees every backend owes -- reachable paths are the ones granted,
+//! execution is a right of its own, a container without `internetClient` has no
+//! network -- are asserted once in `guarantees.rs`, with this platform supplying
+//! only the way to ask. What is left here is what only an AppContainer does:
+//! Windows hands each container a temp directory inside its own package folder
+//! and redirects `TEMP` there, overriding whatever the sandbox sets.
 
 #![cfg(target_os = "windows")]
 #![allow(clippy::unwrap_used)]
@@ -36,32 +33,11 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
 }
 
-/// The access control list Windows reports for a path, as the host sees it.
-///
-/// An AppContainer's reach is decided entirely by these entries, so when the
-/// container cannot read something the entries are the evidence: they say
-/// whether the grant landed on the directory and whether it reached the file.
-fn access_control_list(path: &std::path::Path) -> String {
-    let output = std::process::Command::new("icacls")
-        .arg(path)
-        .output()
-        .expect("icacls runs");
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
 /// A sandbox with the default, deny-everything configuration.
 async fn default_sandbox() -> Sandbox {
     Sandbox::with_config_and_executor(SandboxConfig::new(), executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts")
-}
-
-/// A file outside the sandbox that must stay unreadable.
-fn secret_file() -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("secret.txt");
-    std::fs::write(&path, "token-value").expect("writes");
-    (dir, path)
 }
 
 #[tokio::test]
