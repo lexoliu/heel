@@ -175,6 +175,13 @@ pub struct CommonArgs {
     #[arg(long = "allow-domain")]
     pub allow_domains: Vec<String>,
 
+    /// File to append this run's network decisions to, one JSON line each.
+    ///
+    /// The parent directory must exist. Requires a network policy that runs the
+    /// proxy: under `--network deny` nothing reaches a policy to be recorded.
+    #[arg(long = "audit-log")]
+    pub audit_log: Option<PathBuf>,
+
     /// Isolation level.
     #[arg(long, value_enum)]
     pub isolation: Option<Isolation>,
@@ -191,6 +198,11 @@ pub struct CommonArgs {
     pub writable_paths: Vec<PathBuf>,
 
     /// Path the sandbox may execute; may be repeated.
+    ///
+    /// A directory grants execute to everything beneath it on every platform,
+    /// which is what a build cache that is written and then run needs. Granting
+    /// execute to a directory the sandbox can also write gives up the
+    /// write-then-execute guarantee for that directory.
     #[arg(long = "executable")]
     pub executable_paths: Vec<PathBuf>,
 

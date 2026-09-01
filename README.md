@@ -207,6 +207,15 @@ heel python script.py
 heel run --isolation strict cat /etc/hosts
 heel run --network allow-list --allow-domain '*.crates.io' cargo fetch
 
+# Record this run's network decisions as JSON lines. It needs a policy that runs
+# the proxy: under the default deny-all the kernel refuses connections and there
+# is nothing to record.
+heel run --network allow-list --allow-domain example.com \
+  --audit-log ./run.jsonl curl https://example.com
+
+# A directory that is written and then executed: both grants, deliberately
+heel run --writable ./target --executable ./target cargo test
+
 # Protections take an optional value, so a config file can be overridden either way
 heel run --protect-credentials=false ssh-add -l
 ```
