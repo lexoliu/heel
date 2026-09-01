@@ -109,7 +109,7 @@ Available policies:
 - `AllowAll` — allow everything
 - `AllowList` — allow specific domains, matched case-insensitively, with `*.example.com` wildcards
 - `CustomPolicy<F>` — decide per request with an async handler
-- `Audited<N>` — wrap any policy to record every decision as JSON lines
+- `Audited<N>` — wrap any policy to record every decision as JSON lines, into one file (`NetworkAuditLog::file`) or a daily-rotated set of them (`NetworkAuditLog::rolling_daily`)
 
 The proxy refuses to forward to addresses local to the host, so a policy that allows a hostname cannot be used to reach services on the machine running the sandbox.
 
