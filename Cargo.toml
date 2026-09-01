@@ -68,7 +68,7 @@ http-body-util = "0.1"
 bytes = "1.11.1"
 
 # Runtime-agnostic async (smol-based by default)
-executor-core = { version = "0.7", features = ["async-executor", "std"] }
+executor-core = { version = "0.7", features = ["smol", "std"] }
 async-net = "2"
 futures-lite = "2"
 blocking = "1"
