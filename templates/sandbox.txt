@@ -288,10 +288,14 @@
 {% endif %}
 {% endif %}
 
-; Explicitly permitted executables
-{% for path in executable_paths %}
-(allow file-read* (literal "{{ path }}"))
-(allow process-exec (literal "{{ path }}"))
+; Explicitly permitted executables. A grant naming a directory is rendered with
+; the `subpath` filter and so covers the whole tree; a grant naming a file keeps
+; `literal`. Both come after the writable denies above, so a directory that is
+; both writable and executable ends up executable — that is the point of asking
+; for it, and it gives up the write-then-execute guarantee for that tree.
+{% for rule in executable_paths %}
+(allow file-read* ({{ rule.filter }} "{{ rule.path }}"))
+(allow process-exec ({{ rule.filter }} "{{ rule.path }}"))
 {% endfor %}
 
 ; =============================================================================

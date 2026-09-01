@@ -44,6 +44,9 @@
 //! is also exported as `TMPDIR`. Everything else is opt-in through
 //! [`SandboxConfigBuilder::readable_path`], [`writable_path`] and
 //! [`executable_path`], and no location a process can write to may be executed.
+//! [`executable_path`] is the deliberate exception: it may name a single file
+//! or a directory whose whole tree becomes executable, so granting it to a
+//! writable directory gives up write-then-execute for that directory.
 //!
 //! [`writable_path`]: SandboxConfigBuilder::writable_path
 //! [`executable_path`]: SandboxConfigBuilder::executable_path

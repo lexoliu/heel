@@ -13,13 +13,54 @@ struct VenvRules {
     writable: bool,
 }
 
+/// How SBPL matches one configured path.
+///
+/// The two filters are not interchangeable: `literal` matches exactly one path,
+/// so naming a directory with it grants nothing at all, while `subpath` covers
+/// the whole tree beneath it. Which one a rule needs follows from what the
+/// canonicalized path is, and is decided once, when the profile is generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathFilter {
+    /// One path, matched exactly: a grant naming a single file.
+    Literal,
+    /// A directory and everything beneath it.
+    Subpath,
+}
+
+impl PathFilter {
+    /// The filter that grants `path`, which must already be canonical.
+    fn for_path(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path).map_err(|source| Error::path(path, source))?;
+        Ok(if metadata.is_dir() {
+            Self::Subpath
+        } else {
+            Self::Literal
+        })
+    }
+}
+
+impl std::fmt::Display for PathFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Literal => "literal",
+            Self::Subpath => "subpath",
+        })
+    }
+}
+
+/// An explicitly permitted executable as the template sees it.
+struct ExecutableRule {
+    path: String,
+    filter: PathFilter,
+}
+
 /// SBPL profile template.
 #[derive(Template)]
 #[template(path = "sandbox.txt", escape = "none")]
 struct SandboxProfile {
     readable_paths: Vec<String>,
     writable_paths: Vec<String>,
-    executable_paths: Vec<String>,
+    executable_paths: Vec<ExecutableRule>,
     working_dir: String,
     ipc_bin_dir: Option<String>,
     ipc_socket_dir: Option<String>,
@@ -57,7 +98,7 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
     let mut template = SandboxProfile {
         readable_paths: sbpl_paths(config.readable_paths())?,
         writable_paths: sbpl_paths(config.writable_paths())?,
-        executable_paths: sbpl_paths(config.executable_paths())?,
+        executable_paths: executable_rules(config.executable_paths())?,
         working_dir: sbpl_path(config.working_dir())?,
         ipc_bin_dir: config
             .ipc_socket()
@@ -137,7 +178,7 @@ fn traversal_paths(profile: &SandboxProfile) -> Vec<String> {
         .readable_paths
         .iter()
         .chain(&profile.writable_paths)
-        .chain(&profile.executable_paths)
+        .chain(profile.executable_paths.iter().map(|rule| &rule.path))
         .chain(std::iter::once(&profile.working_dir))
         .chain(profile.ipc_bin_dir.iter())
         .chain(profile.ipc_socket_dir.iter())
@@ -165,15 +206,37 @@ fn sbpl_paths(paths: &[PathBuf]) -> Result<Vec<String>> {
 }
 
 /// Canonicalize a path and escape it for an SBPL string literal.
+fn sbpl_path(path: &Path) -> Result<String> {
+    escape_path(&canonical_path(path)?)
+}
+
+/// Resolve a configured path to the form the kernel matches rules against.
 ///
 /// Canonicalization is a correctness requirement rather than tidiness: the
 /// macOS sandbox matches rules against fully resolved paths, so a rule naming
 /// `/tmp/data` never matches the kernel's `/private/tmp/data` and would
 /// silently grant nothing. A path that cannot be resolved is an error, because
 /// emitting a rule that matches nothing is exactly the failure this avoids.
-fn sbpl_path(path: &Path) -> Result<String> {
-    let canonical = std::fs::canonicalize(path).map_err(|source| Error::path(path, source))?;
-    escape_path(&canonical)
+fn canonical_path(path: &Path) -> Result<PathBuf> {
+    std::fs::canonicalize(path).map_err(|source| Error::path(path, source))
+}
+
+/// Build the executable grants, choosing a filter per path.
+///
+/// A grant naming a directory covers the whole tree beneath it, which is what
+/// makes a build cache that is written and then executed usable; a grant naming
+/// a file stays that one file.
+fn executable_rules(paths: &[PathBuf]) -> Result<Vec<ExecutableRule>> {
+    paths
+        .iter()
+        .map(|path| {
+            let canonical = canonical_path(path)?;
+            Ok(ExecutableRule {
+                filter: PathFilter::for_path(&canonical)?,
+                path: escape_path(&canonical)?,
+            })
+        })
+        .collect()
 }
 
 /// Escape a path for use inside an SBPL double-quoted string.
@@ -263,6 +326,89 @@ mod tests {
             dir.path().display()
         )));
         assert!(profile.contains("(deny process-exec (subpath \"/private/tmp\"))"));
+    }
+
+    #[test]
+    fn an_executable_directory_is_granted_as_a_subpath() {
+        let tools = tempfile::tempdir().expect("tempdir");
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .executable_path(tools.path())
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+
+        let canonical = std::fs::canonicalize(tools.path()).expect("canonical");
+        assert!(
+            profile.contains(&format!(
+                "(allow process-exec (subpath \"{}\"))",
+                canonical.display()
+            )),
+            "a directory grant must cover the tree:\n{profile}"
+        );
+        assert!(profile.contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            canonical.display()
+        )));
+    }
+
+    #[test]
+    fn an_executable_file_is_granted_as_a_literal() {
+        let tools = tempfile::tempdir().expect("tempdir");
+        let binary = tools.path().join("tool");
+        std::fs::write(&binary, b"#!/bin/sh\n").expect("writes");
+
+        let (data, _dir) =
+            prepared_config(SandboxConfig::builder().executable_path(&binary).build());
+        let profile = generate_profile(&data, None).unwrap();
+
+        let canonical = std::fs::canonicalize(&binary).expect("canonical");
+        assert!(
+            profile.contains(&format!(
+                "(allow process-exec (literal \"{}\"))",
+                canonical.display()
+            )),
+            "a file grant must name exactly that file:\n{profile}"
+        );
+        assert!(!profile.contains(&format!(
+            "(allow process-exec (subpath \"{}\"))",
+            canonical.display()
+        )));
+    }
+
+    #[test]
+    fn an_executable_grant_overrides_the_writable_deny_for_the_same_directory() {
+        // SBPL resolves an operation with the last matching rule, so the exec
+        // allow only wins if it is emitted after the deny that the same path
+        // earns for being writable. A build cache is written and then executed,
+        // which is exactly this case.
+        let cache = tempfile::tempdir().expect("tempdir");
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable_path(cache.path())
+                .executable_path(cache.path())
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+
+        let canonical = std::fs::canonicalize(cache.path()).expect("canonical");
+        let deny = profile
+            .find(&format!(
+                "(deny process-exec (subpath \"{}\"))",
+                canonical.display()
+            ))
+            .expect("the writable path is denied exec");
+        let allow = profile
+            .find(&format!(
+                "(allow process-exec (subpath \"{}\"))",
+                canonical.display()
+            ))
+            .expect("the executable path is granted exec");
+
+        assert!(
+            deny < allow,
+            "the exec grant must come after the writable deny:\n{profile}"
+        );
     }
 
     #[test]
