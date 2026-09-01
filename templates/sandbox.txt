@@ -238,21 +238,33 @@
 (allow file-read* (literal "{{ path }}"))
 {% endfor %}
 
-; Readable paths
-{% for path in readable_paths %}
-(allow file-read* (subpath "{{ path }}"))
+; Configured grants, one block each. Read is always granted; write is granted
+; when the grant allows it; and exec is settled last, so within a block the
+; last matching rule is the one the grant asks for. A writable path that is not
+; also executable is denied exec, which is what stops sandboxed code from
+; staging a payload; a path granted both is executable on purpose, and gives up
+; that guarantee for itself alone.
+;
+; A grant naming a directory is rendered with `subpath` and covers its whole
+; tree; one naming a file is rendered with `literal`. The profile generator
+; decides which from the canonicalized path.
+{% for grant in grants %}
+(allow file-read* ({{ grant.filter }} "{{ grant.path }}"))
+{% if grant.writable %}
+(allow file-write* ({{ grant.filter }} "{{ grant.path }}"))
+(allow file-write-create ({{ grant.filter }} "{{ grant.path }}"))
+(allow file-write-unlink ({{ grant.filter }} "{{ grant.path }}"))
+{% endif %}
+{% if grant.executable %}
+(allow process-exec ({{ grant.filter }} "{{ grant.path }}"))
+{% else if grant.writable %}
+(deny process-exec ({{ grant.filter }} "{{ grant.path }}"))
+{% endif %}
 {% endfor %}
 
-; Writable paths, with exec removed so they cannot be used to stage a payload
-{% for path in writable_paths %}
-(allow file-read* (subpath "{{ path }}"))
-(allow file-write* (subpath "{{ path }}"))
-(allow file-write-create (subpath "{{ path }}"))
-(allow file-write-unlink (subpath "{{ path }}"))
-(deny process-exec (subpath "{{ path }}"))
-{% endfor %}
-
-; Working directory: full read and write, no exec
+; Working directory: full read and write, no exec. It comes after the grants
+; above on purpose — the sandbox's own scratch directory is never executable,
+; not even when a grant covering one of its parents asks for exec.
 (allow file-read* (subpath "{{ working_dir }}"))
 (allow file-write* (subpath "{{ working_dir }}"))
 (allow file-write-create (subpath "{{ working_dir }}"))
@@ -287,16 +299,6 @@
 (allow file-write-unlink (subpath "{{ venv.path }}"))
 {% endif %}
 {% endif %}
-
-; Explicitly permitted executables. A grant naming a directory is rendered with
-; the `subpath` filter and so covers the whole tree; a grant naming a file keeps
-; `literal`. Both come after the writable denies above, so a directory that is
-; both writable and executable ends up executable — that is the point of asking
-; for it, and it gives up the write-then-execute guarantee for that tree.
-{% for rule in executable_paths %}
-(allow file-read* ({{ rule.filter }} "{{ rule.path }}"))
-(allow process-exec ({{ rule.filter }} "{{ rule.path }}"))
-{% endfor %}
 
 ; =============================================================================
 ; Network

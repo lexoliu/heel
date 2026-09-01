@@ -56,12 +56,8 @@ export interface SandboxConfigJs {
   isolation?: IsolationJs
   /** Security toggles layered onto the isolation level's preset. */
   security?: SecurityConfigJs
-  /** Paths the sandbox may write. */
-  writablePaths?: Array<string>
-  /** Paths the sandbox may read. */
-  readablePaths?: Array<string>
-  /** Paths the sandbox may execute. */
-  executablePaths?: Array<string>
+  /** Paths the sandbox may use, each mapped to an access mode of `r`, `rw`, `rx` or `rwx`. */
+  grants?: Record<string, string>
   /** Python configuration. */
   python?: PythonConfigJs
   /** Working directory; generated when omitted. */

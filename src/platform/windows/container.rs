@@ -24,6 +24,7 @@ use windows::Win32::Storage::FileSystem::{
 use super::acl::{self, Entry, Scope};
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
+use crate::grant::Access;
 
 /// Capability that permits outbound connections.
 const INTERNET_CLIENT: &str = "internetClient";
@@ -41,48 +42,34 @@ const TRAVERSE: u32 = FILE_TRAVERSE.0;
 /// Run a file.
 const EXECUTE: u32 = FILE_GENERIC_EXECUTE.0;
 
-/// What a directory tree the sandbox may write to is granted.
+/// What one grant opens to the container.
 ///
-/// Directories carry traverse so the container can enter them; files do not
-/// carry execute, so nothing written there can be run. That split is the
+/// Directories always carry traverse so the container can enter them, and files
+/// carry execute only when the grant allows it. On NTFS "run this file" and
+/// "enter this directory" are the same bit, so the two scopes are the only
+/// place that distinction can be drawn: a writable tree whose grant does not
+/// allow execute gives its files write without execute, which is the
 /// no-exec-where-you-can-write guarantee the other backends enforce, and
 /// `tests/isolation_windows.rs` asserts it.
-fn writable_tree() -> [Entry; 2] {
-    [
-        Entry {
-            access: READ | WRITE | TRAVERSE,
-            applies_to: Scope::Directories,
-        },
-        Entry {
-            access: READ | WRITE,
-            applies_to: Scope::Files,
-        },
-    ]
-}
+fn access_tree(access: Access) -> [Entry; 2] {
+    let mut directories = READ | TRAVERSE;
+    let mut files = READ;
 
-/// What a directory tree the sandbox may only read is granted.
-fn readable_tree() -> [Entry; 2] {
-    [
-        Entry {
-            access: READ | TRAVERSE,
-            applies_to: Scope::Directories,
-        },
-        Entry {
-            access: READ,
-            applies_to: Scope::Files,
-        },
-    ]
-}
+    if access.can_write() {
+        directories |= WRITE;
+        files |= WRITE;
+    }
+    if access.can_execute() {
+        files |= EXECUTE;
+    }
 
-/// What a directory tree the sandbox may run programs from is granted.
-fn executable_tree() -> [Entry; 2] {
     [
         Entry {
-            access: READ | TRAVERSE,
+            access: directories,
             applies_to: Scope::Directories,
         },
         Entry {
-            access: READ | EXECUTE,
+            access: files,
             applies_to: Scope::Files,
         },
     ]
@@ -135,42 +122,23 @@ impl Container {
         // can enter by default. Each ancestor gets traverse and nothing else,
         // and the grant does not inherit, so their other children stay closed.
         self.grant_ancestors(config.working_dir())?;
-        self.grant(config.working_dir(), &writable_tree())?;
+        self.grant(config.working_dir(), &access_tree(Access::WRITE))?;
 
-        for path in config.readable_paths() {
-            self.grant_ancestors(path)?;
-            self.grant(path, &readable_tree())?;
-        }
-        for path in config.writable_paths() {
-            self.grant_ancestors(path)?;
-            self.grant(path, &writable_tree())?;
-        }
-        for path in config.executable_paths() {
-            self.grant_ancestors(path)?;
-            self.grant(path, &executable_tree())?;
+        for grant in config.grants() {
+            self.grant_ancestors(grant.path())?;
+            self.grant(grant.path(), &access_tree(grant.access()))?;
         }
 
         if let Some(python) = config.python() {
             // A virtual environment is run from, and pip writes executables into
             // it, so it is the one place that is deliberately both.
             self.grant_ancestors(python.venv().path())?;
-            if python.allow_pip_install() {
-                self.grant(
-                    python.venv().path(),
-                    &[
-                        Entry {
-                            access: READ | WRITE | TRAVERSE,
-                            applies_to: Scope::Directories,
-                        },
-                        Entry {
-                            access: READ | WRITE | EXECUTE,
-                            applies_to: Scope::Files,
-                        },
-                    ],
-                )?;
+            let access = if python.allow_pip_install() {
+                Access::WRITE | Access::EXEC
             } else {
-                self.grant(python.venv().path(), &executable_tree())?;
-            }
+                Access::EXEC
+            };
+            self.grant(python.venv().path(), &access_tree(access))?;
         }
 
         Ok(())

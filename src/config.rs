@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::grant::{Access, Grant};
 use crate::ipc::IpcRouter;
 use crate::network::{DenyAll, NetworkPolicy};
 use crate::security::SecurityConfig;
@@ -277,9 +278,7 @@ impl PythonConfigBuilder {
 #[derive(Debug, Clone)]
 pub struct SandboxConfigData {
     security: SecurityConfig,
-    writable_paths: Vec<PathBuf>,
-    readable_paths: Vec<PathBuf>,
-    executable_paths: Vec<PathBuf>,
+    grants: Vec<Grant>,
     network_deny_all: bool,
     python: Option<PythonConfig>,
     working_dir: PathBuf,
@@ -306,19 +305,12 @@ impl SandboxConfigData {
         &self.security
     }
 
-    /// Paths the sandboxed process may write.
-    pub fn writable_paths(&self) -> &[PathBuf] {
-        &self.writable_paths
-    }
-
-    /// Paths the sandboxed process may read.
-    pub fn readable_paths(&self) -> &[PathBuf] {
-        &self.readable_paths
-    }
-
-    /// Paths the sandboxed process may execute.
-    pub fn executable_paths(&self) -> &[PathBuf] {
-        &self.executable_paths
+    /// The configured paths and what may be done with each.
+    ///
+    /// The working directory is not among them: it is always writable and never
+    /// executable, which no configuration can change.
+    pub fn grants(&self) -> &[Grant] {
+        &self.grants
     }
 
     /// Whether the network policy rejects everything, letting the backend deny
@@ -382,10 +374,19 @@ impl SandboxConfigData {
         self.ipc_socket = path;
     }
 
-    /// Register a path the sandboxed process must be able to execute.
-    pub(crate) fn push_executable_path(&mut self, path: PathBuf) {
-        if !self.executable_paths.contains(&path) {
-            self.executable_paths.push(path);
+    /// Add `access` to what the sandboxed process may do with `path`.
+    ///
+    /// A path granted twice keeps the union of both grants, so a directory that
+    /// is listed as writable and as executable ends up both rather than
+    /// whichever list a backend happened to read last.
+    pub(crate) fn push_grant(&mut self, path: PathBuf, access: Access) {
+        match self
+            .grants
+            .iter_mut()
+            .find(|grant| grant.path() == path.as_path())
+        {
+            Some(existing) => existing.widen(access),
+            None => self.grants.push(Grant::new(path, access)),
         }
     }
 }
@@ -450,9 +451,7 @@ impl Default for SandboxConfigBuilder<DenyAll> {
             network: DenyAll,
             data: SandboxConfigData {
                 security: SecurityConfig::default(),
-                writable_paths: Vec::new(),
-                readable_paths: Vec::new(),
-                executable_paths: Vec::new(),
+                grants: Vec::new(),
                 network_deny_all: DenyAll::DENIES_ALL,
                 python: None,
                 // Resolved on build(); replaced by the canonical path when the
@@ -491,53 +490,46 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
         self
     }
 
-    /// Allow writing one path.
-    pub fn writable_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.data.writable_paths.push(path.as_ref().to_path_buf());
+    /// Grant `access` on one path.
+    ///
+    /// Granting the same path twice keeps the union: `.writable(p).executable(p)`
+    /// and `.grant(p, Access::WRITE | Access::EXEC)` configure the same sandbox.
+    pub fn grant(mut self, path: impl AsRef<Path>, access: Access) -> Self {
+        self.data.push_grant(path.as_ref().to_path_buf(), access);
         self
     }
 
-    /// Allow writing several paths.
-    pub fn writable_paths(mut self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
-        self.data
-            .writable_paths
-            .extend(paths.into_iter().map(|p| p.as_ref().to_path_buf()));
+    /// Apply several grants.
+    pub fn grants(mut self, grants: impl IntoIterator<Item = Grant>) -> Self {
+        for grant in grants {
+            self.data
+                .push_grant(grant.path().to_path_buf(), grant.access());
+        }
         self
     }
 
-    /// Allow reading one path.
-    pub fn readable_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.data.readable_paths.push(path.as_ref().to_path_buf());
-        self
+    /// Allow reading one path: `.grant(path, Access::READ)`.
+    pub fn readable(self, path: impl AsRef<Path>) -> Self {
+        self.grant(path, Access::READ)
     }
 
-    /// Allow reading several paths.
-    pub fn readable_paths(mut self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
-        self.data
-            .readable_paths
-            .extend(paths.into_iter().map(|p| p.as_ref().to_path_buf()));
-        self
+    /// Allow reading and writing one path: `.grant(path, Access::WRITE)`.
+    ///
+    /// A path that is writable and not executable is denied execute, so nothing
+    /// written there can be run.
+    pub fn writable(self, path: impl AsRef<Path>) -> Self {
+        self.grant(path, Access::WRITE)
     }
 
-    /// Allow executing one path.
+    /// Allow reading and executing one path: `.grant(path, Access::EXEC)`.
     ///
     /// The path may be a single file or a directory; a directory grants execute
-    /// to everything beneath it. Every backend applies this grant after the
-    /// denies that keep writable locations non-executable, so a directory that
-    /// is both writable and executable ends up executable. That is what a build
-    /// cache needs, and it gives up the write-then-execute guarantee for that
-    /// directory alone.
-    pub fn executable_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.data.executable_paths.push(path.as_ref().to_path_buf());
-        self
-    }
-
-    /// Allow executing several paths.
-    pub fn executable_paths(mut self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
-        self.data
-            .executable_paths
-            .extend(paths.into_iter().map(|p| p.as_ref().to_path_buf()));
-        self
+    /// to everything beneath it. Every backend applies this after the denies
+    /// that keep writable locations non-executable, so a path granted both ends
+    /// up executable. That is what a build cache needs, and it gives up the
+    /// write-then-execute guarantee for that path alone.
+    pub fn executable(self, path: impl AsRef<Path>) -> Self {
+        self.grant(path, Access::EXEC)
     }
 
     /// Configure Python support.
@@ -659,7 +651,7 @@ pub fn python_data_science_preset() -> SandboxConfig<DenyAll> {
                 .allow_pip_install(true)
                 .build(),
         )
-        .readable_path("/usr/share")
+        .readable("/usr/share")
         .build()
 }
 

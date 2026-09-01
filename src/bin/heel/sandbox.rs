@@ -106,9 +106,7 @@ fn build<N: NetworkPolicy>(
     let mut builder = builder
         .security(config.security.clone())
         .limits(config.limits.clone())
-        .readable_paths(&config.readable_paths)
-        .writable_paths(&config.writable_paths)
-        .executable_paths(&config.executable_paths)
+        .grants(config.grants.iter().cloned())
         .env_passthroughs(config.env_passthroughs.iter().cloned())
         .filesystem_strict(config.isolation.filesystem_strict())
         .writable_file_system(config.isolation.writable_file_system());

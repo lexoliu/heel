@@ -11,6 +11,7 @@ use executor_core::{DefaultExecutor, Executor, try_init_global_executor};
 use crate::command::{Command, ProxyEndpoint};
 use crate::config::{SandboxConfig, SandboxConfigData};
 use crate::error::{Error, Result};
+use crate::grant::Access;
 use crate::ipc::{IpcLayout, IpcServer};
 use crate::network::{DenyAll, NetworkPolicy, NetworkProxy};
 use crate::platform::{self, NativeBackend};
@@ -296,7 +297,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
 
         // The launcher execs the host binary, so it must be executable from
         // inside the sandbox even if it lives under a restricted path.
-        config_data.push_executable_path(heel_binary);
+        config_data.push_grant(heel_binary, Access::EXEC);
         config_data.set_ipc_socket(Some(socket.clone()));
 
         let server = IpcServer::new(socket, router, executor).await?;
