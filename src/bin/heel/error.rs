@@ -34,6 +34,12 @@ pub enum CliError {
     MissingAllowDomains,
 
     #[error(
+        "--audit-log records what the sandbox proxy decided, but --network deny (the default) \
+         runs no proxy and denies every connection in the kernel, so nothing would be audited"
+    )]
+    AuditLogWithoutProxy,
+
+    #[error(
         "HEEL_IPC_ENDPOINT is not set; `heel ipc` runs inside a sandbox that has IPC configured"
     )]
     MissingIpcEndpoint,
