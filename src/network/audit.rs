@@ -1,9 +1,13 @@
-//! Rolling audit log for sandboxed network access.
+//! Audit log for sandboxed network access.
 //!
-//! Every policy decision — allowed or denied — is appended as one JSON line
-//! to a daily-rotated log file, independent of which [`NetworkPolicy`] is in
-//! force. Wrap any policy in [`Audited`] to record its verdicts.
+//! Every policy decision — allowed or denied — is appended as one JSON line,
+//! independent of which [`NetworkPolicy`] is in force. Wrap any policy in
+//! [`Audited`] to record its verdicts. The sink is either a daily-rotated set
+//! of files ([`NetworkAuditLog::rolling_daily`]) for a long-lived host, or one
+//! file ([`NetworkAuditLog::file`]) for a harness that wants the decisions of
+//! exactly one run.
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -29,11 +33,11 @@ struct NetworkAuditRecord<'a> {
     allowed: bool,
 }
 
-/// Rolling JSONL sink for network access decisions.
+/// JSONL sink for network access decisions.
 ///
-/// Writes are handed to a background worker thread and never block the
-/// caller. Log files rotate daily; at most `max_files` are kept.
-/// Cloning shares the same underlying writer and worker.
+/// Writes are handed to a background worker thread and never block the caller.
+/// Cloning shares the same underlying writer and worker, and the worker flushes
+/// when the last clone is dropped.
 #[derive(Clone, Debug)]
 pub struct NetworkAuditLog {
     writer: NonBlocking,
@@ -54,11 +58,46 @@ impl NetworkAuditLog {
             .max_log_files(max_files)
             .build(directory.as_ref())
             .map_err(|error| Error::AuditLog(error.to_string()))?;
-        let (writer, guard) = tracing_appender::non_blocking(appender);
-        Ok(Self {
+        Ok(Self::with_sink(appender))
+    }
+
+    /// Append every decision to the single file at `path`, creating it if it
+    /// does not exist and keeping whatever it already holds.
+    ///
+    /// One file per run is what a harness that starts many sandboxes wants: the
+    /// decisions of exactly that sandbox, with nothing to split apart
+    /// afterwards. The parent directory must already exist — creating it here
+    /// would silently produce an audit trail somewhere the caller did not mean.
+    pub fn file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // A bare file name has an empty parent, which names the current
+        // directory rather than a missing one.
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        if !parent.is_dir() {
+            return Err(Error::AuditLog(format!(
+                "audit log directory {} does not exist",
+                parent.display()
+            )));
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map_err(|error| Error::AuditLog(format!("cannot open {}: {error}", path.display())))?;
+        Ok(Self::with_sink(file))
+    }
+
+    /// Wrap a sink in the non-blocking worker every audit log writes through.
+    fn with_sink(sink: impl Write + Send + 'static) -> Self {
+        let (writer, guard) = tracing_appender::non_blocking(sink);
+        Self {
             writer,
             _guard: Arc::new(guard),
-        })
+        }
     }
 
     /// Record one policy decision.
@@ -78,7 +117,7 @@ impl NetworkAuditLog {
         };
         line.push(b'\n');
         // NonBlocking hands the buffer to a worker thread; this never blocks.
-        if let Err(error) = std::io::Write::write_all(&mut self.writer.clone(), &line) {
+        if let Err(error) = self.writer.clone().write_all(&line) {
             tracing::error!(%error, "network audit: failed to enqueue record");
         }
     }
@@ -152,6 +191,59 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line["allowed"] == true));
         assert!(lines.iter().any(|line| line["allowed"] == false));
+    }
+
+    #[test]
+    fn a_file_log_writes_one_line_per_decision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.jsonl");
+        let log = NetworkAuditLog::file(&path).expect("audit log opens");
+
+        smol::block_on(async {
+            let policy = Audited::new(AllowAll, log.clone());
+            for port in [80, 443, 8080] {
+                assert!(policy.check(&DomainRequest::new("example.com", port)).await);
+            }
+        });
+
+        // Drop the log to flush the worker thread before reading.
+        drop(log);
+
+        let content = std::fs::read_to_string(&path).expect("audit file readable");
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit line is JSON"))
+            .collect();
+
+        assert_eq!(lines.len(), 3, "expected one line per decision: {lines:?}");
+        assert!(lines.iter().all(|line| line["allowed"] == true));
+        let ports: Vec<_> = lines.iter().map(|line| line["port"].clone()).collect();
+        assert_eq!(ports, [80, 443, 8080]);
+    }
+
+    #[test]
+    fn a_file_log_appends_to_what_is_already_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.jsonl");
+
+        for _ in 0..2 {
+            let log = NetworkAuditLog::file(&path).expect("audit log opens");
+            log.record(&DomainRequest::new("example.com", 443), true);
+            drop(log);
+        }
+
+        let content = std::fs::read_to_string(&path).expect("audit file readable");
+        assert_eq!(content.lines().count(), 2, "reopening must not truncate");
+    }
+
+    #[test]
+    fn a_missing_parent_directory_is_an_error_rather_than_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent").join("run.jsonl");
+
+        let error = NetworkAuditLog::file(&path).expect_err("must fail");
+        assert!(matches!(error, Error::AuditLog(_)), "got {error:?}");
+        assert!(!dir.path().join("absent").exists());
     }
 
     // Checked at compile time: the marker decides whether a proxy runs at all,
