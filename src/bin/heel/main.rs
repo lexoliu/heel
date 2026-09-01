@@ -8,7 +8,7 @@
 use std::process::{ExitCode, ExitStatus};
 
 use clap::Parser;
-use executor_core::async_executor::AsyncExecutor;
+use executor_core::smol::SmolGlobal;
 use executor_core::try_init_global_executor;
 
 mod cli;
@@ -37,7 +37,10 @@ fn main() -> ExitCode {
         )
         .init();
 
-    let _ = try_init_global_executor(AsyncExecutor::new());
+    // `block_on` below drives only this future; the sandbox's proxy and IPC
+    // server are spawned onto the global executor, so that one has to run its
+    // own tasks. smol's does, on threads it owns.
+    let _ = try_init_global_executor(SmolGlobal);
 
     match smol::block_on(run(cli)) {
         Ok(code) => exit_code_from(code),
