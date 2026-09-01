@@ -520,6 +520,13 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
     }
 
     /// Allow executing one path.
+    ///
+    /// The path may be a single file or a directory; a directory grants execute
+    /// to everything beneath it. Every backend applies this grant after the
+    /// denies that keep writable locations non-executable, so a directory that
+    /// is both writable and executable ends up executable. That is what a build
+    /// cache needs, and it gives up the write-then-execute guarantee for that
+    /// directory alone.
     pub fn executable_path(mut self, path: impl AsRef<Path>) -> Self {
         self.data.executable_paths.push(path.as_ref().to_path_buf());
         self
