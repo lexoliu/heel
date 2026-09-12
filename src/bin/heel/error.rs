@@ -30,8 +30,23 @@ pub enum CliError {
     #[error("invalid --env value (expected KEY=VALUE): {value}")]
     InvalidEnvFormat { value: String },
 
+    #[error("invalid --grant value (expected PATH=MODE, such as /opt/tools=rx): {value}")]
+    InvalidGrantFormat { value: String },
+
+    #[error("invalid --grant value {value}: {source}")]
+    InvalidGrantMode {
+        value: String,
+        source: heel::ParseAccessError,
+    },
+
     #[error("--network allow-list requires at least one --allow-domain")]
     MissingAllowDomains,
+
+    #[error(
+        "--audit-log records what the sandbox proxy decided, but --network deny (the default) \
+         runs no proxy and denies every connection in the kernel, so nothing would be audited"
+    )]
+    AuditLogWithoutProxy,
 
     #[error(
         "HEEL_IPC_ENDPOINT is not set; `heel ipc` runs inside a sandbox that has IPC configured"

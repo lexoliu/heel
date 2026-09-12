@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use heel::{ResourceLimits, SecurityConfig, SecurityOverrides, VenvBackend};
+use heel::{Access, Grant, ResourceLimits, SecurityConfig, SecurityOverrides, VenvBackend};
 use serde::Deserialize;
 
 use crate::cli::{CommonArgs, Isolation, NetworkMode, PythonArgs, VenvBackendArg};
@@ -17,12 +17,14 @@ pub struct FileConfig {
     pub network: Option<NetworkMode>,
     /// Domains to allow under the `allow-list` policy.
     pub allow_domains: Vec<String>,
+    /// File the network decisions of each run are appended to.
+    pub audit_log: Option<PathBuf>,
     /// Isolation level.
     pub isolation: Option<Isolation>,
     /// Security toggles layered onto the isolation level's preset.
     pub security: SecurityOverrides,
-    /// Path allow lists.
-    pub paths: PathsSection,
+    /// Paths the sandbox may use, each mapped to its access mode.
+    pub grants: BTreeMap<PathBuf, Access>,
     /// Resource limits.
     pub limits: LimitsSection,
     /// Working directory settings.
@@ -31,14 +33,6 @@ pub struct FileConfig {
     pub env: EnvSection,
     /// Python settings.
     pub python: PythonSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
-pub struct PathsSection {
-    pub readable: Vec<PathBuf>,
-    pub writable: Vec<PathBuf>,
-    pub executable: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,11 +74,10 @@ pub struct PythonSection {
 pub struct MergedConfig {
     pub network_mode: NetworkMode,
     pub allow_domains: Vec<String>,
+    pub audit_log: Option<PathBuf>,
     pub isolation: Isolation,
     pub security: SecurityConfig,
-    pub readable_paths: Vec<PathBuf>,
-    pub writable_paths: Vec<PathBuf>,
-    pub executable_paths: Vec<PathBuf>,
+    pub grants: Vec<Grant>,
     pub limits: ResourceLimits,
     pub working_dir: Option<PathBuf>,
     pub keep_working_dir: bool,
@@ -150,14 +143,21 @@ pub fn merge_config(file: FileConfig, cli: &CommonArgs) -> CliResult<MergedConfi
         return Err(CliError::MissingAllowDomains);
     }
 
+    // An audit log records what the proxy decided, and a deny-all policy runs
+    // no proxy: the kernel refuses every connection before a policy sees it, so
+    // the log would stay empty rather than recording denials.
+    let audit_log = cli.audit_log.clone().or(file.audit_log);
+    if audit_log.is_some() && network_mode == NetworkMode::Deny {
+        return Err(CliError::AuditLogWithoutProxy);
+    }
+
     Ok(MergedConfig {
         network_mode,
         allow_domains,
+        audit_log,
         isolation,
         security,
-        readable_paths: concat(file.paths.readable, &cli.readable_paths),
-        writable_paths: concat(file.paths.writable, &cli.writable_paths),
-        executable_paths: concat(file.paths.executable, &cli.executable_paths),
+        grants: merge_grants(file.grants, cli),
         limits: merge_limits(&file.limits, cli),
         working_dir: cli.working_dir.clone().or(file.workdir.path),
         keep_working_dir: cli.keep_working_dir || file.workdir.keep,
@@ -223,6 +223,46 @@ impl Isolation {
 fn concat<T: Clone>(mut file: Vec<T>, cli: &[T]) -> Vec<T> {
     file.extend_from_slice(cli);
     file
+}
+
+/// Combine the file's grants with the command line's.
+///
+/// A path granted more than once keeps the union of its modes, so
+/// `--writable p --executable p` and `--grant p=rwx` describe the same sandbox,
+/// and a file that makes a path readable plus a `--grant p=rw` widens it rather
+/// than one silently replacing the other. Ordering by path keeps the resulting
+/// profile stable across runs.
+fn merge_grants(file: BTreeMap<PathBuf, Access>, cli: &CommonArgs) -> Vec<Grant> {
+    let mut grants = file;
+
+    let from_flags = cli
+        .readable
+        .iter()
+        .map(|path| (path.clone(), Access::READ))
+        .chain(
+            cli.writable
+                .iter()
+                .map(|path| (path.clone(), Access::WRITE)),
+        )
+        .chain(
+            cli.executable
+                .iter()
+                .map(|path| (path.clone(), Access::EXEC)),
+        )
+        .chain(
+            cli.grants
+                .iter()
+                .map(|grant| (grant.path.clone(), grant.access)),
+        );
+
+    for (path, access) in from_flags {
+        *grants.entry(path).or_insert(access) |= access;
+    }
+
+    grants
+        .into_iter()
+        .map(|(path, access)| Grant::new(path, access))
+        .collect()
 }
 
 fn merge_limits(file: &LimitsSection, cli: &CommonArgs) -> ResourceLimits {
@@ -291,6 +331,50 @@ mod tests {
     }
 
     #[test]
+    fn the_audit_log_prefers_the_command_line_over_the_file() {
+        let file: FileConfig =
+            toml::from_str("network = \"allow\"\naudit-log = \"/var/log/from-file.jsonl\"")
+                .expect("parses");
+        let merged = merge_config(file, &common_args(&["--audit-log", "/tmp/from-cli.jsonl"]))
+            .expect("merges");
+
+        assert_eq!(
+            merged.audit_log.as_deref(),
+            Some(Path::new("/tmp/from-cli.jsonl"))
+        );
+    }
+
+    #[test]
+    fn the_audit_log_can_come_from_the_file_alone() {
+        let file: FileConfig =
+            toml::from_str("network = \"allow\"\naudit-log = \"/var/log/heel.jsonl\"")
+                .expect("parses");
+        let merged = merge_config(file, &common_args(&[])).expect("merges");
+
+        assert_eq!(
+            merged.audit_log.as_deref(),
+            Some(Path::new("/var/log/heel.jsonl"))
+        );
+    }
+
+    #[test]
+    fn an_audit_log_without_a_proxy_is_rejected() {
+        // Deny-all is the default, and it denies in the kernel without ever
+        // consulting a policy, so an audit log would record nothing at all.
+        let error = merge_config(
+            FileConfig::default(),
+            &common_args(&["--audit-log", "/tmp/heel.jsonl"]),
+        )
+        .expect_err("must fail");
+        assert!(matches!(error, CliError::AuditLogWithoutProxy));
+
+        let file: FileConfig =
+            toml::from_str("audit-log = \"/tmp/heel.jsonl\"\nnetwork = \"deny\"").expect("parses");
+        let error = merge_config(file, &common_args(&[])).expect_err("must fail");
+        assert!(matches!(error, CliError::AuditLogWithoutProxy));
+    }
+
+    #[test]
     fn security_overrides_layer_file_then_command_line() {
         let file: FileConfig =
             toml::from_str("[security]\nprotect-credentials = false\nallow-gpu = false")
@@ -317,9 +401,9 @@ mod tests {
     }
 
     #[test]
-    fn paths_and_domains_concatenate() {
+    fn grants_and_domains_concatenate() {
         let file: FileConfig =
-            toml::from_str("allow-domains = [\"a.example\"]\n[paths]\nreadable = [\"/etc\"]")
+            toml::from_str("allow-domains = [\"a.example\"]\n[grants]\n\"/etc\" = \"r\"")
                 .expect("parses");
         let merged = merge_config(
             file,
@@ -336,9 +420,53 @@ mod tests {
 
         assert_eq!(merged.allow_domains, ["a.example", "b.example"]);
         assert_eq!(
-            merged.readable_paths,
-            [PathBuf::from("/etc"), PathBuf::from("/usr")]
+            merged.grants,
+            [
+                Grant::new("/etc", Access::READ),
+                Grant::new("/usr", Access::READ)
+            ]
         );
+    }
+
+    #[test]
+    fn the_sugar_flags_and_a_grant_mode_describe_the_same_sandbox() {
+        // Both spellings have to reach the backends as one grant carrying both
+        // rights: two grants for the same path would leave the outcome to
+        // whichever rule a backend happens to emit last.
+        let spelled_out = merge_config(
+            FileConfig::default(),
+            &common_args(&["--writable", "/opt/cache", "--executable", "/opt/cache"]),
+        )
+        .expect("merges");
+        let one_mode = merge_config(
+            FileConfig::default(),
+            &common_args(&["--grant", "/opt/cache=rwx"]),
+        )
+        .expect("merges");
+
+        assert_eq!(
+            spelled_out.grants,
+            [Grant::new("/opt/cache", Access::WRITE | Access::EXEC)]
+        );
+        assert_eq!(spelled_out.grants, one_mode.grants);
+    }
+
+    #[test]
+    fn a_file_grant_and_a_command_line_grant_for_one_path_are_unioned() {
+        let file: FileConfig = toml::from_str("[grants]\n\"/opt/cache\" = \"rw\"").expect("parses");
+        let merged =
+            merge_config(file, &common_args(&["--grant", "/opt/cache=rx"])).expect("merges");
+
+        assert_eq!(
+            merged.grants,
+            [Grant::new("/opt/cache", Access::WRITE | Access::EXEC)]
+        );
+    }
+
+    #[test]
+    fn an_unparsable_grant_mode_in_the_file_is_an_error() {
+        let error = toml::from_str::<FileConfig>("[grants]\n\"/opt\" = \"rq\"").unwrap_err();
+        assert!(error.to_string().contains("unknown access mode"), "{error}");
     }
 
     #[test]

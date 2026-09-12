@@ -7,16 +7,19 @@
 
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+// The `Access` trait supplies `AccessFs::from_all` and friends and is only
+// needed in scope; the name itself belongs to this crate's own `Access`.
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
+    ABI, Access as _, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
     PathFd, RestrictSelfError, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
     RulesetError, RulesetStatus, make_bitflags,
 };
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
+use crate::grant::Access;
 
 /// The Landlock ABI this backend requires.
 ///
@@ -279,13 +282,37 @@ fn writable_access(abi: ABI) -> BitFlags<AccessFs> {
     AccessFs::from_all(abi) & !BitFlags::from(AccessFs::Execute)
 }
 
-/// Grant access to the paths the caller configured.
-fn add_configured_rules(
-    ruleset: &mut RulesetCreated,
-    config: &SandboxConfigData,
-    abi: ABI,
-) -> Result<()> {
-    add_required_path(ruleset, config.working_dir(), writable_access(abi), abi)?;
+/// One rule for a configured path: what is granted, and to what.
+#[derive(Debug)]
+struct ConfiguredRule {
+    path: PathBuf,
+    access: BitFlags<AccessFs>,
+}
+
+/// The Landlock rights one grant asks for.
+///
+/// Read is unconditional, since write and execute both include it. Execute is
+/// added only when the grant allows it: Landlock has no deny rule, so the
+/// absence of `Execute` here is what keeps a writable path from being used to
+/// stage a payload, and adding it is the deliberate exception the macOS profile
+/// spells as an allow after the deny.
+fn landlock_access(access: Access, abi: ABI) -> BitFlags<AccessFs> {
+    let mut rights = AccessFs::from_read(abi);
+    if access.can_write() {
+        rights |= writable_access(abi);
+    }
+    if access.can_execute() {
+        rights |= AccessFs::Execute;
+    }
+    rights
+}
+
+/// Plan the rules for the paths the caller configured.
+fn configured_rules(config: &SandboxConfigData, abi: ABI) -> Vec<ConfiguredRule> {
+    let mut rules = vec![ConfiguredRule {
+        path: config.working_dir().to_path_buf(),
+        access: writable_access(abi),
+    }];
 
     // The generated IPC shims live inside the working directory and are written
     // by the host before the sandbox starts, so they are the one place in it
@@ -293,32 +320,26 @@ fn add_configured_rules(
     // same directory.
     if config.ipc_socket().is_some() {
         let layout = crate::ipc::IpcLayout::new(config.working_dir());
-        add_required_path(
-            ruleset,
-            layout.bin_dir(),
-            make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute }),
-            abi,
-        )?;
+        rules.push(ConfiguredRule {
+            path: layout.bin_dir().to_path_buf(),
+            access: make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute }),
+        });
     }
 
-    for path in config.readable_paths() {
-        add_required_path(ruleset, path, AccessFs::from_read(abi), abi)?;
-    }
-    for path in config.writable_paths() {
-        add_required_path(ruleset, path, writable_access(abi), abi)?;
-    }
-
-    let exec_access = make_bitflags!(AccessFs::{ ReadFile | Execute });
-    for path in config.executable_paths() {
-        add_required_path(ruleset, path, exec_access, abi)?;
-    }
+    rules.extend(config.grants().iter().map(|grant| ConfiguredRule {
+        path: grant.path().to_path_buf(),
+        access: landlock_access(grant.access(), abi),
+    }));
 
     // The IPC socket lives outside the working directory; connecting needs
     // read and write on the socket file.
     if let Some(socket) = config.ipc_socket()
         && let Some(dir) = socket.parent()
     {
-        add_required_path(ruleset, dir, writable_access(abi), abi)?;
+        rules.push(ConfiguredRule {
+            path: dir.to_path_buf(),
+            access: writable_access(abi),
+        });
     }
 
     if let Some(python) = config.python() {
@@ -329,7 +350,23 @@ fn add_configured_rules(
         } else {
             make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute })
         };
-        add_required_path(ruleset, python.venv().path(), access, abi)?;
+        rules.push(ConfiguredRule {
+            path: python.venv().path().to_path_buf(),
+            access,
+        });
+    }
+
+    rules
+}
+
+/// Grant access to the paths the caller configured.
+fn add_configured_rules(
+    ruleset: &mut RulesetCreated,
+    config: &SandboxConfigData,
+    abi: ABI,
+) -> Result<()> {
+    for rule in configured_rules(config, abi) {
+        add_required_path(ruleset, &rule.path, rule.access, abi)?;
     }
 
     Ok(())
@@ -451,6 +488,7 @@ fn path_is_directory(path_fd: &PathFd) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::config::SandboxConfig;
+    use crate::grant::Grant;
     use std::fs::{self, File};
 
     /// A configuration whose working directory exists, as it would at runtime.
@@ -503,7 +541,7 @@ mod tests {
     fn missing_configured_paths_are_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("absent");
-        let (data, _dir) = prepared(SandboxConfig::builder().readable_path(&missing).build());
+        let (data, _dir) = prepared(SandboxConfig::builder().readable(&missing).build());
 
         let error = build_ruleset(&data, None).expect_err("must fail");
         assert!(
@@ -533,6 +571,41 @@ mod tests {
         assert!(!relaxed.filesystem_strict());
         assert!(build_ruleset(&strict, None).is_ok());
         assert!(build_ruleset(&relaxed, None).is_ok());
+    }
+
+    #[test]
+    fn a_path_that_is_writable_and_executable_carries_both_access_sets() {
+        // Landlock has no rule inspection API, so this asserts the rules the
+        // builder plans. A build cache is written and then executed, and both
+        // spellings — one `WRITE | EXEC` grant, or the two sugar methods, which
+        // the builder unions into one grant — have to produce both rights.
+        let cache = tempfile::tempdir().expect("tempdir");
+        let (data, _dir) = prepared(
+            SandboxConfig::builder()
+                .writable(cache.path())
+                .executable(cache.path())
+                .build(),
+        );
+        assert_eq!(
+            data.grants(),
+            [Grant::new(cache.path(), Access::WRITE | Access::EXEC)],
+            "granting a path twice must widen one grant, not add a second"
+        );
+
+        let granted = configured_rules(&data, ABI::V4)
+            .into_iter()
+            .filter(|rule| rule.path == cache.path())
+            .fold(BitFlags::EMPTY, |granted, rule| granted | rule.access);
+
+        assert!(
+            granted.contains(AccessFs::Execute),
+            "the executable grant must survive: {granted:?}"
+        );
+        assert!(
+            granted.contains(AccessFs::WriteFile | AccessFs::MakeReg),
+            "the writable grant must survive: {granted:?}"
+        );
+        assert!(build_ruleset(&data, None).is_ok());
     }
 
     #[test]

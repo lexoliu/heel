@@ -1,8 +1,8 @@
 //! Sandbox configuration from JavaScript.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
 
-use heel::{NetworkPolicy, SandboxConfig, SandboxConfigBuilder, SecurityConfig};
+use heel::{Access, Grant, NetworkPolicy, SandboxConfig, SandboxConfigBuilder, SecurityConfig};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -99,12 +99,8 @@ pub struct SandboxConfigJs {
     pub isolation: Option<IsolationJs>,
     /// Security toggles layered onto the isolation level's preset.
     pub security: Option<SecurityConfigJs>,
-    /// Paths the sandbox may write.
-    pub writable_paths: Option<Vec<String>>,
-    /// Paths the sandbox may read.
-    pub readable_paths: Option<Vec<String>>,
-    /// Paths the sandbox may execute.
-    pub executable_paths: Option<Vec<String>>,
+    /// Paths the sandbox may use, each mapped to an access mode of `r`, `rw`, `rx` or `rwx`.
+    pub grants: Option<HashMap<String, String>>,
     /// Python configuration.
     pub python: Option<PythonConfigJs>,
     /// Working directory; generated when omitted.
@@ -132,14 +128,21 @@ impl SandboxConfigJs {
             .filesystem_strict(isolation.filesystem_strict())
             .writable_file_system(isolation.writable_file_system());
 
-        if let Some(paths) = self.writable_paths {
-            builder = builder.writable_paths(paths.iter().map(PathBuf::from));
-        }
-        if let Some(paths) = self.readable_paths {
-            builder = builder.readable_paths(paths.iter().map(PathBuf::from));
-        }
-        if let Some(paths) = self.executable_paths {
-            builder = builder.executable_paths(paths.iter().map(PathBuf::from));
+        if let Some(grants) = self.grants {
+            builder = builder.grants(
+                grants
+                    .into_iter()
+                    .map(|(path, mode)| -> Result<Grant> {
+                        let access: Access = mode.parse().map_err(|error| {
+                            Error::new(
+                                Status::InvalidArg,
+                                format!("[ERR_ACCESS_MODE] grants[\"{path}\"]: {error}"),
+                            )
+                        })?;
+                        Ok(Grant::new(path, access))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
         }
         if let Some(python) = self.python {
             builder = builder.python(python.into_rust()?);
@@ -165,9 +168,7 @@ pub fn preset_strict() -> SandboxConfigJs {
         network: None,
         isolation: Some(IsolationJs::Strict),
         security: None,
-        writable_paths: None,
-        readable_paths: None,
-        executable_paths: None,
+        grants: None,
         python: None,
         working_dir: None,
         env_passthrough: None,

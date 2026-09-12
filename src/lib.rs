@@ -5,7 +5,7 @@
 //! - **macOS**: `sandbox-exec` with generated SBPL profiles
 //! - **Linux**: Landlock (ABI v4) for the filesystem and network, Seccomp for
 //!   syscalls
-//! - **Windows**: AppContainer (not yet implemented)
+//! - **Windows**: AppContainer + job objects (implemented, Windows 10+)
 //!
 //! # Example
 //!
@@ -42,11 +42,20 @@
 //!
 //! Sandboxed processes may always read and write their working directory, which
 //! is also exported as `TMPDIR`. Everything else is opt-in through
-//! [`SandboxConfigBuilder::readable_path`], [`writable_path`] and
-//! [`executable_path`], and no location a process can write to may be executed.
+//! [`SandboxConfigBuilder::grant`], which pairs a path with the [`Access`] the
+//! sandbox has to it, and no location a process can write to may be executed.
+//! An [`Access::EXEC`] grant is the deliberate exception: it may name a single
+//! file or a directory whose whole tree becomes executable, so granting it on a
+//! writable path gives up write-then-execute for that path.
 //!
-//! [`writable_path`]: SandboxConfigBuilder::writable_path
-//! [`executable_path`]: SandboxConfigBuilder::executable_path
+//! ```rust,ignore
+//! use heel::{Access, SandboxConfig};
+//!
+//! let config = SandboxConfig::builder()
+//!     .readable("/usr/share")
+//!     .grant("target", Access::WRITE | Access::EXEC)
+//!     .build();
+//! ```
 //!
 //! # Python
 //!
@@ -75,6 +84,7 @@ pub(crate) mod accept;
 mod command;
 mod config;
 mod error;
+mod grant;
 pub mod ipc;
 mod network;
 mod platform;
@@ -92,6 +102,7 @@ pub use config::{
     python_data_science_preset, python_dev_preset, strict_preset,
 };
 pub use error::{Error, Result};
+pub use grant::{Access, Grant, ParseAccessError};
 pub use ipc::{CommandMeta, IpcClient, IpcCommand, IpcError, IpcRouter, NoArgs};
 pub use network::{
     AllowAll, AllowList, Audited, CustomPolicy, DenyAll, DomainRequest, NetworkAuditLog,

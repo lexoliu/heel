@@ -9,7 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Platform support:
 - **macOS**: `sandbox-exec` with SBPL profiles (fully implemented)
 - **Linux**: Landlock (ABI v4, kernel 6.7+) + Seccomp (implemented, requires kernel support)
-- **Windows**: AppContainer (declared but not yet implemented)
+- **Windows**: AppContainer + job objects (implemented). Access is granted per
+  path to the container's package SID by ACL; a job object carries the resource
+  limits and kills the process tree
 
 ## Workspace Structure
 
@@ -51,10 +53,40 @@ cargo run --bin heel -- python script.py    # Run Python in sandbox with venv
 - **macOS**: Works out of the box, tests run directly
 - **Linux**: Requires kernel 6.7+ with Landlock ABI v4. CI uses ubuntu-24.04
 
-`tests/isolation.rs` and `tests/ipc.rs` run real programs in real sandboxes and
-assert that forbidden operations fail. A change to a profile template, a
-ruleset, or a syscall filter is not verified until those pass: asserting on
-generated profile text only proves the generator wrote what it was told to.
+`tests/guarantees.rs` asserts what the sandbox promises, once per guarantee
+rather than once per backend, with each platform supplying only the way to ask.
+Every item of its `Probes` trait is required, so a backend that omits one fails
+to compile instead of quietly going unchecked. Every isolation bug this crate
+has had was a guarantee enforced on one backend and absent on another; that file
+exists so the next one cannot hide. `tests/isolation.rs` and
+`tests/isolation_windows.rs` cover what a single backend does beyond the shared
+guarantees, and `tests/ipc.rs` covers the host-command path.
+
+These run real programs in real sandboxes and assert that forbidden operations
+fail. A change to a profile template, a ruleset, or a syscall filter is not
+verified until they pass: asserting on generated profile text only proves the
+generator wrote what it was told to.
+
+## Releasing
+
+Publishing takes **two merges**, and only the second one publishes:
+
+1. Merge the content into `main`. This publishes nothing.
+2. release-plz then opens a PR of its own, titled `chore: release vX.Y.Z`, which
+   bumps the version and writes the changelog. Merging **that** is what runs
+   `cargo publish`.
+
+Stopping after the first merge leaves the release un-published while looking
+finished, which matters most when a security fix is riding on it. Confirm on
+crates.io rather than from the merge:
+
+```bash
+curl -s -H 'User-Agent: heel' https://crates.io/api/v1/crates/heel | grep -o '"max_version":"[^"]*"'
+```
+
+`cargo publish` is irreversible, so the merge of the release PR belongs to the
+user. Never merge it automatically, and never hand-edit `version =` or
+`CHANGELOG.md`: release-plz derives both from conventional-commit messages.
 
 ## Architecture
 
@@ -83,7 +115,8 @@ generated profile text only proves the generator wrote what it was told to.
 - **Drop-based cleanup**: Sandbox drop kills child processes and removes working directory
 - **pre_exec sandbox application**: On Linux, Landlock and Seccomp are applied in a `pre_exec` hook after fork, before exec. Everything that hook needs is built beforehand, so the post-fork path only issues syscalls
 - **SBPL rule order**: macOS resolves an operation with the LAST matching rule. `templates/sandbox.txt` is laid out in three passes — baseline, protections, then user-configured paths — so an explicit allow always beats a default protection. Moving a rule between passes changes what the sandbox enforces
-- **No exec where the sandbox can write**: the working directory, configured writable paths and shared temp are all denied execute, so sandboxed code cannot write a payload and run it
+- **Grants, not path lists**: `SandboxConfig` carries one `Grant` per path — a path plus the `Access` (`READ`/`WRITE`/`EXEC`, where write and exec include read) the sandbox has to it. Each backend consumes them in one loop, so the rules that used to live in the cross-product of three lists are now properties of one value
+- **No exec where the sandbox can write**: the working directory, `Access::WRITE` grants and shared temp are all denied execute, so sandboxed code cannot write a payload and run it. `Access::WRITE | Access::EXEC` on one path is the deliberate exception: it may name a file or a directory, and a directory covers the whole tree on every backend
 
 ## Code Standards
 

@@ -5,12 +5,13 @@ use std::process::Output;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use blocking::unblock;
-use executor_core::async_executor::AsyncExecutor;
+use executor_core::smol::SmolGlobal;
 use executor_core::{DefaultExecutor, Executor, try_init_global_executor};
 
 use crate::command::{Command, ProxyEndpoint};
 use crate::config::{SandboxConfig, SandboxConfigData};
 use crate::error::{Error, Result};
+use crate::grant::Access;
 use crate::ipc::{IpcLayout, IpcServer};
 use crate::network::{DenyAll, NetworkPolicy, NetworkProxy};
 use crate::platform::{self, NativeBackend};
@@ -178,7 +179,9 @@ pub struct Sandbox<N: NetworkPolicy = DenyAll> {
 impl Sandbox<DenyAll> {
     /// Create a sandbox with default configuration and no network access.
     pub async fn new() -> Result<Self> {
-        let _ = try_init_global_executor(AsyncExecutor::new());
+        // See `with_config`: the fallback executor has to be one that runs the
+        // tasks handed to it. A caller that installed its own keeps it.
+        let _ = try_init_global_executor(SmolGlobal);
         Self::with_config_and_executor(SandboxConfig::new(), DefaultExecutor).await
     }
 
@@ -190,8 +193,15 @@ impl Sandbox<DenyAll> {
 
 impl<N: NetworkPolicy> Sandbox<N> {
     /// Create a sandbox from a configuration.
+    ///
+    /// The sandbox runs its proxy and its IPC server as spawned tasks, so the
+    /// executor they land on must actually poll them. When the caller has not
+    /// installed a global executor this supplies smol's, which owns the threads
+    /// that drive it. `async_executor::Executor` is not usable here: it only
+    /// makes progress while someone calls `run`, so a proxy spawned onto one
+    /// binds its port, accepts nothing, and hangs every connection.
     pub async fn with_config(config: SandboxConfig<N>) -> Result<Self> {
-        let _ = try_init_global_executor(AsyncExecutor::new());
+        let _ = try_init_global_executor(SmolGlobal);
         Self::with_config_and_executor(config, DefaultExecutor).await
     }
 
@@ -200,7 +210,6 @@ impl<N: NetworkPolicy> Sandbox<N> {
         config: SandboxConfig<N>,
         executor: E,
     ) -> Result<Self> {
-        let backend = platform::create_native_backend()?;
         let (policy, mut config_data, router) = config.into_parts();
 
         // Create and canonicalize the working directory before anything else
@@ -209,6 +218,12 @@ impl<N: NetworkPolicy> Sandbox<N> {
         let auto = config_data.working_dir_is_auto();
         let working_dir = unblock(move || WorkingDir::create(&requested_dir, auto)).await?;
         config_data.set_working_dir(working_dir.path().to_path_buf());
+
+        // After the working directory exists, so a backend that has to open it
+        // to the sandbox does so before the caller can put anything in it.
+        // Windows grants by inheritance, and inheritance only reaches files
+        // created once the grant is in place.
+        let backend = platform::create_native_backend(&config_data)?;
 
         // DenyAll needs no proxy: the backend denies outbound traffic outright,
         // which is a stronger guarantee than a userspace rejection.
@@ -282,7 +297,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
 
         // The launcher execs the host binary, so it must be executable from
         // inside the sandbox even if it lives under a restricted path.
-        config_data.push_executable_path(heel_binary);
+        config_data.push_grant(heel_binary, Access::EXEC);
         config_data.set_ipc_socket(Some(socket.clone()));
 
         let server = IpcServer::new(socket, router, executor).await?;
@@ -395,13 +410,82 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
     }
 }
 
-// Every test here starts a real sandbox, which needs an implemented backend.
-// Windows has none yet and `WindowsBackend::new` refuses to construct, so these
-// are compiled only where there is something to exercise, matching how
-// `tests/isolation.rs` and `tests/ipc.rs` are gated.
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_fallback_global_executor_runs_the_tasks_it_is_given() {
+        // The proxy and the IPC server are detached tasks on this executor.
+        // One that only queues them leaves the proxy bound to its port and
+        // answering nothing, which reaches the sandboxed process as a hang
+        // rather than as an error, so the failure has to be caught here.
+        let _ = try_init_global_executor(SmolGlobal);
+
+        let (sender, receiver) = async_channel::bounded(1);
+        DefaultExecutor
+            .spawn(async move { sender.send(()).await })
+            .detach();
+
+        let ran = smol::block_on(futures_lite::future::or(
+            async { receiver.recv().await.is_ok() },
+            async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                false
+            },
+        ));
+
+        assert!(ran, "the global executor never ran a task spawned onto it");
+    }
+
+    /// A shell and the flag that makes it run one command string.
+    #[cfg(windows)]
+    const SHELL: (&str, &str) = ("cmd.exe", "/C");
+    /// A shell and the flag that makes it run one command string.
+    #[cfg(not(windows))]
+    const SHELL: (&str, &str) = ("/bin/sh", "-c");
+
+    /// Print the working directory.
+    #[cfg(windows)]
+    const PRINT_WORKING_DIR: &str = "cd";
+    /// Print the working directory.
+    #[cfg(not(windows))]
+    const PRINT_WORKING_DIR: &str = "pwd";
+
+    /// Write a file into the directory nominated for temporary files, and read
+    /// it back.
+    #[cfg(windows)]
+    const ROUND_TRIP_THROUGH_TEMP: &str =
+        "echo written> %TEMP%\\probe.txt && type %TEMP%\\probe.txt";
+    /// Write a file into the directory nominated for temporary files, and read
+    /// it back.
+    #[cfg(not(windows))]
+    const ROUND_TRIP_THROUGH_TEMP: &str =
+        "printf %s written > \"$TMPDIR/probe.txt\" && cat \"$TMPDIR/probe.txt\"";
+
+    /// Show the backend's own diagnostics when a test fails.
+    ///
+    /// Windows reports a refused launch through one opaque error, and the
+    /// detail that says which step failed is only emitted as a trace.
+    fn show_backend_diagnostics() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::TRACE)
+            .try_init();
+    }
+
+    /// Run one command string through the platform's shell.
+    async fn shell(sandbox: &Sandbox, script: &str) -> std::process::Output {
+        show_backend_diagnostics();
+        sandbox
+            .command(SHELL.0)
+            .arg(SHELL.1)
+            .arg(script)
+            .output()
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn working_directory_is_removed_on_drop() {
@@ -439,13 +523,7 @@ mod tests {
     fn commands_run_inside_the_sandbox() {
         smol::block_on(async {
             let sandbox = Sandbox::new().await.unwrap();
-            let output = sandbox
-                .command("/bin/sh")
-                .arg("-c")
-                .arg("pwd")
-                .output()
-                .await
-                .unwrap();
+            let output = shell(&sandbox, PRINT_WORKING_DIR).await;
 
             assert!(output.status.success(), "unexpected output: {output:?}");
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -454,19 +532,37 @@ mod tests {
     }
 
     #[test]
+    fn temporary_files_land_somewhere_the_sandbox_can_write() {
+        // The guarantee is that temporary files have a writable home inside the
+        // sandbox, not that it sits at a particular path. On Unix the sandbox
+        // points `TMPDIR` at its working directory. Windows decides for itself:
+        // an AppContainer is given a private temp directory inside its own
+        // package folder, which nothing outside the container can read, and
+        // that redirection overrides whatever `TEMP` is set to. Both satisfy
+        // the guarantee, so it is the behaviour that is asserted.
+        smol::block_on(async {
+            let sandbox = Sandbox::new().await.unwrap();
+            let output = shell(&sandbox, ROUND_TRIP_THROUGH_TEMP).await;
+
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "written",
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+    }
+
+    /// On Unix the temporary directory is the working directory itself.
+    #[cfg(not(windows))]
+    #[test]
     fn tmpdir_points_at_the_working_directory() {
         smol::block_on(async {
             let sandbox = Sandbox::new().await.unwrap();
-            let output = sandbox
-                .command("/bin/sh")
-                .arg("-c")
-                .arg("printf %s \"$TMPDIR\"")
-                .output()
-                .await
-                .unwrap();
+            let output = shell(&sandbox, "printf %s \"$TMPDIR\"").await;
 
             assert_eq!(
-                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stdout).trim(),
                 sandbox.working_dir().to_string_lossy()
             );
         });

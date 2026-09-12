@@ -18,15 +18,15 @@ Heel is designed for running LLM-generated code in a secure environment. It is n
 |----------|---------|--------|
 | macOS | `sandbox-exec` with SBPL profiles | ✅ Fully implemented |
 | Linux | Landlock (ABI v4) + Seccomp | ✅ Implemented (kernel 6.7+) |
-| Windows | AppContainer | 🚧 Planned (construction fails today) |
+| Windows | AppContainer + job objects | ✅ Implemented (Windows 10+) |
 
 ## What the sandbox enforces
 
-- **The working directory is the only writable place.** It is created for the sandbox, exported as `TMPDIR`, and removed when the sandbox is dropped.
-- **Nothing writable is executable.** The working directory, configured writable paths and the shared temp directories are all denied execute, so sandboxed code cannot drop a payload and run it.
+- **The working directory is the only writable place.** It is created for the sandbox and removed when the sandbox is dropped. Temporary files are directed into it through `TMPDIR` on Unix and `TEMP`/`TMP` on Windows, where an AppContainer is additionally given a private temporary directory of its own that nothing outside the container can read.
+- **Nothing writable is executable.** The working directory, paths granted `Access::WRITE` and the shared temp directories are all denied execute, so sandboxed code cannot drop a payload and run it. Each backend spells that differently: SBPL and Landlock withhold execute directly, while on NTFS "run this file" and "enter this directory" are one bit, so directories and files are granted separately. The one exception is `Access::WRITE | Access::EXEC` on the same path, which — like every explicit grant — beats the default protection: the path may be a file or a directory, and a directory grant covers everything beneath it on all three backends. Asking for both is therefore a deliberate choice to give up the write-then-execute guarantee for that path, and only for it. A build cache such as Cargo's `target/`, which writes test binaries under hashed names and runs them immediately, is what this is for.
 - **Network access goes through a policy.** Under the default `DenyAll` no proxy exists and the kernel refuses outbound connections; any other policy routes every connection through a local proxy that applies the policy per request.
-- **Reads are opt-in above a baseline.** Configured paths are granted explicitly, and an explicit grant always beats a default protection.
-- **Resource limits apply to the whole process tree**, installed with `setrlimit` between fork and exec.
+- **Reads are opt-in above a baseline.** Every path outside the working directory is granted explicitly, as a path plus the `Access` the sandbox has to it, and an explicit grant always beats a default protection.
+- **Resource limits apply to the whole process tree**, installed with `setrlimit` between fork and exec on Unix, and carried by a job object on Windows.
 
 ### Isolation levels
 
@@ -109,9 +109,29 @@ Available policies:
 - `AllowAll` — allow everything
 - `AllowList` — allow specific domains, matched case-insensitively, with `*.example.com` wildcards
 - `CustomPolicy<F>` — decide per request with an async handler
-- `Audited<N>` — wrap any policy to record every decision as JSON lines
+- `Audited<N>` — wrap any policy to record every decision as JSON lines, into one file (`NetworkAuditLog::file`) or a daily-rotated set of them (`NetworkAuditLog::rolling_daily`)
 
 The proxy refuses to forward to addresses local to the host, so a policy that allows a hostname cannot be used to reach services on the machine running the sandbox.
+
+## Paths
+
+One list of grants says what the sandbox may do with each path. `Access::WRITE`
+and `Access::EXEC` include read, since no platform can express a path that is
+writable or executable but not readable, and a path granted twice keeps the
+union of both grants.
+
+```rust
+use heel::{Access, SandboxConfig};
+
+let config = SandboxConfig::builder()
+    .readable("/usr/share")                             // Access::READ
+    .writable("/var/spool/work")                        // Access::WRITE, denied exec
+    .grant("/opt/cache", Access::WRITE | Access::EXEC)  // written, then run
+    .build();
+```
+
+The working directory is not a grant: it is always writable, never executable,
+and no configuration changes that.
 
 ## Security Configuration
 
@@ -207,11 +227,34 @@ heel python script.py
 heel run --isolation strict cat /etc/hosts
 heel run --network allow-list --allow-domain '*.crates.io' cargo fetch
 
+# Record this run's network decisions as JSON lines. It needs a policy that runs
+# the proxy: under the default deny-all the kernel refuses connections and there
+# is nothing to record.
+heel run --network allow-list --allow-domain example.com \
+  --audit-log ./run.jsonl curl https://example.com
+
+# A directory that is written and then executed: `rwx`, deliberately
+heel run --grant ./target=rwx cargo test
+
 # Protections take an optional value, so a config file can be overridden either way
 heel run --protect-credentials=false ssh-add -l
 ```
 
-Configuration can also come from a TOML file passed with `--config`; command-line arguments take precedence, and list settings concatenate.
+Configuration can also come from a TOML file passed with `--config`; command-line
+arguments take precedence, list settings concatenate, and a path granted by both
+keeps the union of its modes.
+
+```toml
+network = "allow-list"
+allow-domains = ["*.crates.io"]
+
+[grants]
+"/usr/share" = "r"
+"./target" = "rwx"
+```
+
+`--readable`, `--writable` and `--executable` are shorthand for `--grant PATH=r`,
+`=rw` and `=rx`.
 
 ## License
 
