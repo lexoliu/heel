@@ -31,6 +31,8 @@ struct OwnedProcess(HANDLE);
 // SAFETY: a process handle is not tied to the thread that opened it; the kernel
 // permits any thread to wait on, query or terminate through it.
 unsafe impl Send for OwnedProcess {}
+// SAFETY: as for Send — concurrent `&` access only reads the handle value.
+unsafe impl Sync for OwnedProcess {}
 
 impl Drop for OwnedProcess {
     fn drop(&mut self) {
@@ -51,6 +53,14 @@ pub(crate) struct AppContainerChild {
     _loopback: Option<LoopbackExemptionGuard>,
     pid: u32,
 }
+
+// SAFETY: every field is a kernel object (process/job/file handles) or a
+// read-only SID. None of them is tied to the thread that created it — Win32
+// permits any thread to wait on, signal, or pass them to syscalls — and the
+// only mutation runs once in Drop.
+unsafe impl Send for AppContainerChild {}
+// SAFETY: as for Send; shared `&` access exposes only read-only operations.
+unsafe impl Sync for AppContainerChild {}
 
 impl AppContainerChild {
     /// Adopt a freshly launched process.
