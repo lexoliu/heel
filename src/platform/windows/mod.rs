@@ -314,6 +314,17 @@ impl Backend for WindowsBackend {
 mod tests {
     use super::*;
 
+    // The public types must stay Send+Sync: callers hold a `Sandbox`/`Child`
+    // inside async state (per-chat actors, daemons) whose futures spawn onto
+    // multi-threaded executors. `rappct` internals lose the auto impls to raw
+    // pointers; the unsafe impls on `Container`/`AppContainerChild` restore
+    // them — this keeps that from regressing silently.
+    const _: () = {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<crate::Sandbox>();
+        assert_send_sync::<crate::Child>();
+    };
+
     #[test]
     fn plain_arguments_are_not_quoted() {
         assert_eq!(quote("simple"), "simple");
