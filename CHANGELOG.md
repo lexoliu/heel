@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/lexoliu/heel/compare/heel-v0.2.0...heel-v0.3.0) - 2026-09-13
+
+### Other
+
+- Gate fix + Windows which fix ([#32](https://github.com/lexoliu/heel/pull/32))
+- Release heel 0.3.0 ([#27](https://github.com/lexoliu/heel/pull/27))
+
 ## [0.2.0](https://github.com/lexoliu/heel/compare/heel-v0.1.1...heel-v0.2.0) - 2026-08-26
 
 ### Added
