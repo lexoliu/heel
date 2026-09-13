@@ -114,6 +114,9 @@ seccompiler = "0.4"
 
 # Windows-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
+# The AppContainer backend resolves programs on PATH before granting them;
+# unlike Python detection this is not optional there.
+which = "7"
 # AppContainer profiles, capability SIDs, ACL grants, container launch and the
 # loopback exemption the proxy needs.
 rappct = { version = "0.13.3", features = ["net", "tracing"] }
