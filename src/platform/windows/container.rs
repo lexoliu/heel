@@ -85,6 +85,13 @@ pub(crate) struct Container {
     profile: Option<AppContainerProfile>,
 }
 
+// SAFETY: the profile owns a SID, which is read-only kernel data after
+// creation — `rappct` stores it as a raw pointer, so auto Send/Sync are lost,
+// but no API mutates it and deallocation is a single Drop.
+unsafe impl Send for Container {}
+// SAFETY: as for Send; shared `&` access exposes only read-only operations.
+unsafe impl Sync for Container {}
+
 impl Container {
     /// Create the profile for a new sandbox.
     pub(crate) fn create() -> Result<Self> {
