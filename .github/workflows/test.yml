@@ -33,17 +33,19 @@ jobs:
 
       # The isolation suite runs real programs in real sandboxes and asserts
       # that forbidden operations fail, so it is the check that matters most
-      # here; it is part of `cargo test` rather than a separate example.
-      # `--no-fail-fast` so every suite reports. Without it `cargo test` stops
-      # at the first binary that fails, and the suites that assert what the
-      # sandbox denies are the last to run, so a single unrelated failure hides
-      # all of them.
+      # here; it is part of the test run rather than a separate example.
+      # nextest runs each test in its own process and always runs the whole
+      # list, so one failing binary cannot hide the suites that assert what
+      # the sandbox denies.
+      - uses: taiki-e/install-action@nextest
       - name: Test
-        run: cargo test --verbose --all-features --no-fail-fast
+        run: cargo nextest run --all-features
         env:
           # The backends report a refused launch through one opaque error; their
           # traces name the step that actually failed.
           RUST_LOG: heel=debug,rappct=trace
+      - name: Doctests
+        run: cargo test --doc --all-features
 
       - name: Examples build
         run: cargo build --examples --all-features
