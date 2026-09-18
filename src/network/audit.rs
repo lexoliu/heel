@@ -127,35 +127,30 @@ impl NetworkAuditLog {
     }
 
     /// Record one policy decision, resolving once the line is on disk.
-    pub async fn record(&self, request: &DomainRequest, allowed: bool) {
+    ///
+    /// Fails when the line could not be written; the caller decides what a
+    /// decision without a record means ([`Audited`] refuses the connection).
+    pub async fn record(&self, request: &DomainRequest, allowed: bool) -> Result<()> {
         let record = NetworkAuditRecord {
             timestamp: humantime::format_rfc3339_millis(SystemTime::now()).to_string(),
             host: request.host(),
             port: request.port(),
             allowed,
         };
-        let mut line = match serde_json::to_vec(&record) {
-            Ok(line) => line,
-            Err(error) => {
-                tracing::error!(%error, "network audit: failed to serialize record");
-                return;
-            }
-        };
+        let mut line = serde_json::to_vec(&record)
+            .map_err(|error| Error::AuditLog(format!("cannot serialize record: {error}")))?;
         line.push(b'\n');
         let (written, outcome) = bounded(1);
-        if self
-            .lines
+        self.lines
             .send(PendingLine { line, written })
             .await
-            .is_err()
-        {
-            tracing::error!("network audit: writer thread is gone");
-            return;
-        }
+            .map_err(|_| Error::AuditLog("writer thread is gone".into()))?;
         match outcome.recv().await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(%error, "network audit: failed to write record"),
-            Err(_) => tracing::error!("network audit: writer thread exited before writing"),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Error::AuditLog(format!("cannot write record: {error}"))),
+            Err(_) => Err(Error::AuditLog(
+                "writer thread exited before writing".into(),
+            )),
         }
     }
 }
@@ -179,10 +174,17 @@ impl<N: NetworkPolicy> NetworkPolicy for Audited<N> {
     /// [`DenyAll`](crate::DenyAll) still skips the proxy entirely.
     const DENIES_ALL: bool = N::DENIES_ALL;
 
+    /// A decision that could not be recorded is answered as a refusal: an
+    /// audited sandbox never opens a connection the log does not show.
     async fn check(&self, request: &DomainRequest) -> bool {
         let allowed = self.inner.check(request).await;
-        self.log.record(request, allowed).await;
-        allowed
+        match self.log.record(request, allowed).await {
+            Ok(()) => allowed,
+            Err(error) => {
+                tracing::error!(%error, host = %request.host(), port = request.port(), "network audit: refusing an unrecorded decision");
+                false
+            }
+        }
     }
 }
 
@@ -259,7 +261,8 @@ mod tests {
 
         for _ in 0..2 {
             let log = NetworkAuditLog::file(&path).expect("audit log opens");
-            smol::block_on(log.record(&DomainRequest::new("example.com", 443), true));
+            smol::block_on(log.record(&DomainRequest::new("example.com", 443), true))
+                .expect("record written");
         }
 
         let content = std::fs::read_to_string(&path).expect("audit file readable");
@@ -274,6 +277,92 @@ mod tests {
         let error = NetworkAuditLog::file(&path).expect_err("must fail");
         assert!(matches!(error, Error::AuditLog(_)), "got {error:?}");
         assert!(!dir.path().join("absent").exists());
+    }
+
+    /// A sink that reports when a write has reached it and then waits for the
+    /// test to open a gate, so the test can observe a recorder that is still
+    /// pending while its line is not yet written.
+    struct GatedSink {
+        entered: std::sync::mpsc::Sender<()>,
+        gate: std::sync::mpsc::Receiver<()>,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Write for GatedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).expect("the test listens");
+            self.gate.recv().expect("the test opens the gate");
+            self.written
+                .lock()
+                .expect("sink lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_record_resolves_only_once_its_line_is_written() {
+        let (entered, write_started) = std::sync::mpsc::channel();
+        let (open_gate, gate) = std::sync::mpsc::channel();
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = NetworkAuditLog::with_sink(GatedSink {
+            entered,
+            gate,
+            written: std::sync::Arc::clone(&written),
+        })
+        .expect("audit log opens");
+
+        let mut recording = smol::spawn({
+            let log = log.clone();
+            async move {
+                log.record(&DomainRequest::new("api.github.com", 443), true)
+                    .await
+            }
+        });
+        // The writer thread now holds the line and is blocked on the gate.
+        write_started.recv().expect("the write started");
+        assert!(
+            smol::block_on(futures_lite::future::poll_once(&mut recording)).is_none(),
+            "record resolved before its line was written"
+        );
+        assert!(written.lock().expect("sink lock").is_empty());
+
+        open_gate.send(()).expect("open the gate");
+        smol::block_on(recording).expect("record written");
+        let content =
+            String::from_utf8(written.lock().expect("sink lock").clone()).expect("utf8 line");
+        assert!(content.contains("api.github.com"), "{content}");
+    }
+
+    /// A sink that refuses every write.
+    struct BrokenSink;
+
+    impl Write for BrokenSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk gone"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_unrecorded_decision_is_a_refusal() {
+        let log = NetworkAuditLog::with_sink(BrokenSink).expect("audit log opens");
+        smol::block_on(async {
+            let policy = Audited::new(AllowAll, log.clone());
+            let request = DomainRequest::new("api.github.com", 443);
+            assert!(!policy.check(&request).await, "allowed without a record");
+            assert!(matches!(
+                log.record(&request, true).await,
+                Err(Error::AuditLog(message)) if message.contains("disk gone")
+            ));
+        });
     }
 
     // Checked at compile time: the marker decides whether a proxy runs at all,
