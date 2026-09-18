@@ -6,14 +6,17 @@
 //! of files ([`NetworkAuditLog::rolling_daily`]) for a long-lived host, or one
 //! file ([`NetworkAuditLog::file`]) for a harness that wants the decisions of
 //! exactly one run.
+//!
+//! The log is write-ahead: a decision is on disk before the connection it
+//! concerns is opened or refused, so anyone who observes the connection's
+//! outcome also observes its record.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::SystemTime;
 
+use async_channel::{Receiver, Sender, bounded, unbounded};
 use serde::Serialize;
-use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 use crate::error::{Error, Result};
@@ -33,15 +36,28 @@ struct NetworkAuditRecord<'a> {
     allowed: bool,
 }
 
+/// One line handed to the writer thread, with the channel its outcome is
+/// reported on.
+struct PendingLine {
+    line: Vec<u8>,
+    written: Sender<io::Result<()>>,
+}
+
 /// JSONL sink for network access decisions.
 ///
-/// Writes are handed to a background worker thread and never block the caller.
-/// Cloning shares the same underlying writer and worker, and the worker flushes
-/// when the last clone is dropped.
-#[derive(Clone, Debug)]
+/// Lines are written by one dedicated thread that owns the sink, in the order
+/// the decisions were made; [`NetworkAuditLog::record`] resolves once its line
+/// has been written and flushed. Cloning shares the thread, which exits when
+/// the last clone is dropped.
+#[derive(Clone)]
 pub struct NetworkAuditLog {
-    writer: NonBlocking,
-    _guard: Arc<WorkerGuard>,
+    lines: Sender<PendingLine>,
+}
+
+impl std::fmt::Debug for NetworkAuditLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkAuditLog").finish_non_exhaustive()
+    }
 }
 
 impl NetworkAuditLog {
@@ -58,7 +74,7 @@ impl NetworkAuditLog {
             .max_log_files(max_files)
             .build(directory.as_ref())
             .map_err(|error| Error::AuditLog(error.to_string()))?;
-        Ok(Self::with_sink(appender))
+        Self::with_sink(appender)
     }
 
     /// Append every decision to the single file at `path`, creating it if it
@@ -88,20 +104,30 @@ impl NetworkAuditLog {
             .create(true)
             .open(path)
             .map_err(|error| Error::AuditLog(format!("cannot open {}: {error}", path.display())))?;
-        Ok(Self::with_sink(file))
+        Self::with_sink(file)
     }
 
-    /// Wrap a sink in the non-blocking worker every audit log writes through.
-    fn with_sink(sink: impl Write + Send + 'static) -> Self {
-        let (writer, guard) = tracing_appender::non_blocking(sink);
-        Self {
-            writer,
-            _guard: Arc::new(guard),
-        }
+    /// Hand `sink` to the writer thread every clone of this log writes through.
+    fn with_sink(mut sink: impl Write + Send + 'static) -> Result<Self> {
+        let (lines, pending): (Sender<PendingLine>, Receiver<PendingLine>) = unbounded();
+        std::thread::Builder::new()
+            .name("heel-network-audit".into())
+            .spawn(move || {
+                // `recv_blocking` fails only once every sender is gone, which is
+                // when the last clone of the log has been dropped.
+                while let Ok(PendingLine { line, written }) = pending.recv_blocking() {
+                    let result = sink.write_all(&line).and_then(|()| sink.flush());
+                    // The recorder may have given up waiting; its line is on
+                    // disk either way.
+                    let _ = written.send_blocking(result);
+                }
+            })
+            .map_err(|error| Error::AuditLog(format!("cannot start the writer thread: {error}")))?;
+        Ok(Self { lines })
     }
 
-    /// Record one policy decision.
-    pub fn record(&self, request: &DomainRequest, allowed: bool) {
+    /// Record one policy decision, resolving once the line is on disk.
+    pub async fn record(&self, request: &DomainRequest, allowed: bool) {
         let record = NetworkAuditRecord {
             timestamp: humantime::format_rfc3339_millis(SystemTime::now()).to_string(),
             host: request.host(),
@@ -116,9 +142,20 @@ impl NetworkAuditLog {
             }
         };
         line.push(b'\n');
-        // NonBlocking hands the buffer to a worker thread; this never blocks.
-        if let Err(error) = self.writer.clone().write_all(&line) {
-            tracing::error!(%error, "network audit: failed to enqueue record");
+        let (written, outcome) = bounded(1);
+        if self
+            .lines
+            .send(PendingLine { line, written })
+            .await
+            .is_err()
+        {
+            tracing::error!("network audit: writer thread is gone");
+            return;
+        }
+        match outcome.recv().await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(%error, "network audit: failed to write record"),
+            Err(_) => tracing::error!("network audit: writer thread exited before writing"),
         }
     }
 }
@@ -144,7 +181,7 @@ impl<N: NetworkPolicy> NetworkPolicy for Audited<N> {
 
     async fn check(&self, request: &DomainRequest) -> bool {
         let allowed = self.inner.check(request).await;
-        self.log.record(request, allowed);
+        self.log.record(request, allowed).await;
         allowed
     }
 }
@@ -179,9 +216,6 @@ mod tests {
             assert!(!deny.check(&request).await);
         });
 
-        // Drop the log to flush the worker thread before reading.
-        drop(log);
-
         let lines = read_audit_lines(dir.path());
         assert_eq!(lines.len(), 2, "expected two audit records: {lines:?}");
         assert!(
@@ -206,9 +240,6 @@ mod tests {
             }
         });
 
-        // Drop the log to flush the worker thread before reading.
-        drop(log);
-
         let content = std::fs::read_to_string(&path).expect("audit file readable");
         let lines: Vec<serde_json::Value> = content
             .lines()
@@ -228,8 +259,7 @@ mod tests {
 
         for _ in 0..2 {
             let log = NetworkAuditLog::file(&path).expect("audit log opens");
-            log.record(&DomainRequest::new("example.com", 443), true);
-            drop(log);
+            smol::block_on(log.record(&DomainRequest::new("example.com", 443), true));
         }
 
         let content = std::fs::read_to_string(&path).expect("audit file readable");
