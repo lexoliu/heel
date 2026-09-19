@@ -125,11 +125,12 @@ async fn probe(
     program: &str,
     args: &[&str],
 ) -> Output {
-    let mut command = sandbox.command(program);
-    for arg in args {
-        command.arg(arg);
-    }
-    command.output().await.expect("the probe launches")
+    sandbox
+        .command(program)
+        .args(args.iter().copied())
+        .output()
+        .await
+        .expect("the probe launches")
 }
 
 /// Dump the security state a denied spawn needs to be diagnosed from.
