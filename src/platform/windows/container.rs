@@ -10,6 +10,7 @@
 //! deny-all policy needs. A filtering policy is enforced by the proxy instead,
 //! and reaching the proxy needs the loopback exemption below.
 
+use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 
 use rappct::capability::{SecurityCapabilities, SecurityCapabilitiesBuilder};
@@ -18,7 +19,8 @@ use rappct::profile::AppContainerProfile;
 use rappct::sid::AppContainerSid;
 
 use windows::Win32::Storage::FileSystem::{
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_TRAVERSE,
 };
 
 use super::acl::{self, Entry, Scope};
@@ -129,11 +131,11 @@ impl Container {
         // can enter by default. Each ancestor gets traverse and nothing else,
         // and the grant does not inherit, so their other children stay closed.
         self.grant_ancestors(config.working_dir())?;
-        self.grant(config.working_dir(), &access_tree(Access::WRITE))?;
+        self.grant_path(config.working_dir(), Access::WRITE)?;
 
         for grant in config.grants() {
             self.grant_ancestors(grant.path())?;
-            self.grant(grant.path(), &access_tree(grant.access()))?;
+            self.grant_path(grant.path(), grant.access())?;
         }
 
         if let Some(python) = config.python() {
@@ -145,9 +147,71 @@ impl Container {
             } else {
                 Access::EXEC
             };
-            self.grant(python.venv().path(), &access_tree(access))?;
+            self.grant_path(python.venv().path(), access)?;
         }
 
+        Ok(())
+    }
+
+    /// Open one configured path to this container.
+    ///
+    /// A file takes the file entry on itself and nothing else: the directory
+    /// entry's traverse bit means "run" on a file, so handing it the
+    /// directory mask would make every readable file executable. A directory
+    /// takes both entries — the directory entry applies to it as well, which
+    /// is what lets the container enter it — and then the tree already
+    /// beneath it is walked, because Windows inheritance is not retroactive:
+    /// an inheritable entry only reaches children created after it exists.
+    /// Without the walk a granted directory would open itself and nothing in
+    /// it, which is not what a grant means on the other backends.
+    fn grant_path(&self, path: &Path, access: Access) -> Result<()> {
+        let entries = access_tree(access);
+        if path.is_dir() {
+            self.grant(path, &entries)?;
+            self.grant_existing_children(path, &entries)
+        } else {
+            self.grant(
+                path,
+                &[Entry {
+                    access: entries[1].access,
+                    applies_to: Scope::ThisOnly,
+                }],
+            )
+        }
+    }
+
+    /// Apply a grant's entries to every child already beneath `dir`.
+    ///
+    /// Directories get both entries — opening them, and covering children the
+    /// container creates there later — and are walked for what they already
+    /// hold; files get the file entry on themselves alone.
+    ///
+    /// Reparse points are skipped rather than followed: setting an ACL on a
+    /// junction or symlink lands the entry on its target, which would open a
+    /// tree outside the grant to wherever the host could already reach.
+    fn grant_existing_children(&self, dir: &Path, entries: &[Entry; 2]) -> Result<()> {
+        for child in std::fs::read_dir(dir).map_err(|source| Error::path(dir, source))? {
+            let child = child.map_err(|source| Error::path(dir, source))?;
+            let path = child.path();
+            let metadata = child
+                .metadata()
+                .map_err(|source| Error::path(path.clone(), source))?;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                continue;
+            }
+            if metadata.is_dir() {
+                self.grant(&path, entries)?;
+                self.grant_existing_children(&path, entries)?;
+            } else {
+                self.grant(
+                    &path,
+                    &[Entry {
+                        access: entries[1].access,
+                        applies_to: Scope::ThisOnly,
+                    }],
+                )?;
+            }
+        }
         Ok(())
     }
 

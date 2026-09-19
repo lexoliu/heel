@@ -24,7 +24,7 @@
 use std::path::Path;
 use std::process::Output;
 
-use heel::{Sandbox, SandboxConfig};
+use heel::{Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 /// How to ask one platform to do the things the guarantees are about.
 trait Probes {
@@ -123,12 +123,17 @@ impl Probes for Platform {
         std::fs::write(working_dir.join("source.exe"), program).expect("the host stages it");
     }
 
+    // `cmd /C` does not read argv; it re-parses the raw command-line tail, so
+    // a quote embedded in the script arrives literally and `type` rejects the
+    // name rather than opening the file. The path therefore goes unquoted,
+    // as the unix probes already spell theirs: every probe path lives under
+    // the run's own temp directory, which carries no spaces.
     fn read(path: &Path) -> String {
-        format!("type \"{}\"", path.display())
+        format!("type {}", path.display())
     }
 
     fn write(path: &Path) -> String {
-        format!("echo escaped> \"{}\"", path.display())
+        format!("echo escaped> {}", path.display())
     }
 }
 
@@ -173,6 +178,36 @@ async fn the_working_directory_is_readable_and_writable() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "written");
+}
+
+#[tokio::test]
+async fn a_granted_directory_opens_the_tree_already_in_it() {
+    // A grant names a tree, not its future contents: a file staged before the
+    // sandbox exists is inside the grant exactly as much as one written
+    // after. Windows once opened the directory and nothing in it, because
+    // ACL inheritance only reaches children created after the entry does.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).expect("creates");
+    let staged = dir.path().join("staged.txt");
+    let deep = nested.join("staged.txt");
+    std::fs::write(&staged, "staged-value").expect("writes");
+    std::fs::write(&deep, "nested-value").expect("writes");
+
+    let config = SandboxConfigBuilder::default().readable(dir.path()).build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    for (path, value) in [(staged, "staged-value"), (deep, "nested-value")] {
+        let output = shell(&sandbox, &Platform::read(&path)).await;
+        assert!(
+            stdout(&output).contains(value),
+            "{} was present before the grant and must be readable: {}",
+            path.display(),
+            stderr(&output)
+        );
+    }
 }
 
 #[tokio::test]
