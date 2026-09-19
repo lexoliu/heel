@@ -10,9 +10,10 @@
 #![cfg(target_os = "windows")]
 #![allow(clippy::unwrap_used)]
 
+use std::path::PathBuf;
 use std::process::Output;
 
-use heel::{Sandbox, SandboxConfig};
+use heel::{Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 /// Run `script` with `cmd.exe` inside `sandbox`.
 async fn cmd(sandbox: &Sandbox<impl heel::NetworkPolicy>, script: &str) -> Output {
@@ -61,4 +62,34 @@ async fn the_temp_directory_is_private_to_the_container() {
     )
     .await;
     assert_eq!(stdout(&written), "written", "{}", stderr(&written));
+}
+
+#[tokio::test]
+async fn a_granted_directory_opens_children_deeper_than_max_path() {
+    // A granted tree is walked so its existing children can be ACL'd, and a
+    // tree like a cargo registry can nest past MAX_PATH. The named security
+    // APIs refuse such paths unless they are spelled verbatim, and `read_dir`
+    // cannot list a directory that deep either, so the grant once failed on
+    // the first child it could not even name. `std::fs` accepts verbatim
+    // `\\?\` paths and bypasses the limit, which is how the host stages the
+    // tree; the grant itself stays an ordinary path, as a caller's would.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut deep = PathBuf::from(format!(r"\\?\{}", dir.path().display()));
+    while deep.as_os_str().len() < 300 {
+        deep.push("a-directory-deeper-than-max-path");
+    }
+    std::fs::create_dir_all(&deep).expect("the host stages a tree past MAX_PATH");
+    let staged = deep.join("staged.txt");
+    std::fs::write(&staged, "deep-value").expect("the host stages a file");
+
+    let config = SandboxConfigBuilder::default().readable(dir.path()).build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    // `more` reads the file through redirection: a redirection target is
+    // taken literally, where the `?` in `\\?\` could look like a wildcard to
+    // a command that globs its arguments.
+    let output = cmd(&sandbox, &format!("more < {}", staged.display())).await;
+    assert_eq!(stdout(&output), "deep-value", "{}", stderr(&output));
 }

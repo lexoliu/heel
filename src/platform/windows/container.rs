@@ -168,7 +168,11 @@ impl Container {
         let entries = access_tree(access);
         if path.is_dir() {
             self.grant(path, &entries)?;
-            self.grant_existing_children(path, &entries)
+            // The walk starts from the resolved path: `read_dir` is under the
+            // same `MAX_PATH` ceiling as the ACL calls, and children joined
+            // under the verbatim `\\?\` root stay listable at any depth.
+            let dir = std::fs::canonicalize(path).map_err(|source| Error::path(path, source))?;
+            self.grant_existing_children(&dir, &entries)
         } else {
             self.grant(
                 path,
@@ -189,6 +193,10 @@ impl Container {
     /// Reparse points are skipped rather than followed: setting an ACL on a
     /// junction or symlink lands the entry on its target, which would open a
     /// tree outside the grant to wherever the host could already reach.
+    ///
+    /// `dir` arrives resolved rather than as configured: `read_dir` cannot
+    /// list a directory whose own path is deeper than `MAX_PATH`, and the
+    /// children it hands back stay under the `\\?\` prefix at any depth.
     fn grant_existing_children(&self, dir: &Path, entries: &[Entry; 2]) -> Result<()> {
         for child in std::fs::read_dir(dir).map_err(|source| Error::path(dir, source))? {
             let child = child.map_err(|source| Error::path(dir, source))?;
