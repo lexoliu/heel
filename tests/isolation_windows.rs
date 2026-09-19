@@ -79,16 +79,46 @@ async fn a_writable_grant_lets_the_container_rename_and_remove_what_it_wrote() {
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts");
+    let root = dir.path().display();
 
-    let output = cmd(
-        &sandbox,
-        &format!(
-            "mkdir {0}\\rmeta-tmp && echo written> {0}\\rmeta-tmp\\full.rmeta && move /y {0}\\rmeta-tmp\\full.rmeta {0}\\lib.rmeta && type {0}\\lib.rmeta && rd /s /q {0}\\rmeta-tmp",
-            dir.path().display()
+    for (step, script, expected) in [
+        (
+            "file create in the granted root",
+            format!("echo written> {root}\\direct.txt && type {root}\\direct.txt"),
+            "written",
         ),
-    )
-    .await;
-    assert_eq!(stdout(&output), "written", "{}", stderr(&output));
+        (
+            "mkdir under the grant",
+            format!("mkdir {root}\\rmeta-tmp"),
+            "",
+        ),
+        (
+            "file create in a container-made child",
+            format!("echo written> {root}\\rmeta-tmp\\full.rmeta"),
+            "",
+        ),
+        (
+            "rename within the grant",
+            format!(
+                "move /y {root}\\rmeta-tmp\\full.rmeta {root}\\lib.rmeta && type {root}\\lib.rmeta"
+            ),
+            "written",
+        ),
+        (
+            "delete file and tree",
+            format!("del {root}\\direct.txt && rd /s /q {root}\\rmeta-tmp"),
+            "",
+        ),
+    ] {
+        let output = cmd(&sandbox, &script).await;
+        assert_eq!(
+            stdout(&output),
+            expected,
+            "{step} failed: status={:?} stderr={:?}",
+            output.status.code(),
+            stderr(&output)
+        );
+    }
 }
 
 #[tokio::test]
