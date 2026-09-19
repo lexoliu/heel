@@ -12,7 +12,6 @@
 //! everything beneath it.
 
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
@@ -84,6 +83,22 @@ fn parse_sid(sddl: &str) -> io::Result<(LocalBuffer, PSID)> {
     Ok((LocalBuffer(sid.0), sid))
 }
 
+/// Add `access` for `sid` to the kernel object named `name`.
+///
+/// Devices live outside the filesystem tree, so the name is handed to the
+/// named security APIs verbatim — nothing resolves it — and the grant applies
+/// to the object itself, the only scope a device has.
+pub(crate) fn grant_object(name: &str, sid: &str, access: u32) -> io::Result<()> {
+    apply(
+        name,
+        sid,
+        &[Entry {
+            access,
+            applies_to: Scope::ThisOnly,
+        }],
+    )
+}
+
 /// Add `entries` for `sid` to the access control list of `path`.
 ///
 /// Existing entries are kept: the rule is added to what is already there rather
@@ -95,15 +110,19 @@ fn parse_sid(sddl: &str) -> io::Result<(LocalBuffer, PSID)> {
 /// that. Resolving the path first hands them the `\\?\` form they accept at
 /// any depth, while the errors keep naming the path the caller asked for.
 pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()> {
-    let (_sid_buffer, sid) = parse_sid(sid)?;
     let resolved = std::fs::canonicalize(path).map_err(|source| {
         io::Error::other(format!("cannot resolve {}: {source}", path.display()))
     })?;
-    let wide: Vec<u16> = resolved
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    apply(&resolved.to_string_lossy(), sid, entries)
+}
+
+/// Add `entries` for `sid` to the object `name` refers to.
+///
+/// `name` reaches the named security APIs as given: a filesystem path already
+/// spelled verbatim, or an object name such as a device path.
+fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
+    let (_sid_buffer, sid) = parse_sid(sddl)?;
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
     let trustee = TRUSTEE_W {
         TrusteeForm: TRUSTEE_IS_SID,
@@ -140,8 +159,7 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()>
     };
     if status.is_err() {
         return Err(io::Error::other(format!(
-            "cannot read the access control list of {}: {status:?}",
-            path.display()
+            "cannot read the access control list of {name}: {status:?}"
         )));
     }
     let _descriptor = LocalBuffer(descriptor.0);
@@ -151,8 +169,7 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()>
     let status = unsafe { SetEntriesInAclW(Some(&access), Some(current), &mut updated) };
     if status.is_err() {
         return Err(io::Error::other(format!(
-            "cannot build the access control list for {}: {status:?}",
-            path.display()
+            "cannot build the access control list for {name}: {status:?}"
         )));
     }
     let updated_buffer = LocalBuffer(updated.cast());
@@ -173,8 +190,7 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()>
 
     if status.is_err() {
         return Err(io::Error::other(format!(
-            "cannot apply the access control list to {}: {status:?}",
-            path.display()
+            "cannot apply the access control list to {name}: {status:?}"
         )));
     }
 

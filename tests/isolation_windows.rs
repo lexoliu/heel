@@ -10,10 +10,10 @@
 #![cfg(target_os = "windows")]
 #![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use heel::{Sandbox, SandboxConfig, SandboxConfigBuilder};
+use heel::{Access, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 /// Run `script` with `cmd.exe` inside `sandbox`.
 async fn cmd(sandbox: &Sandbox<impl heel::NetworkPolicy>, script: &str) -> Output {
@@ -92,4 +92,135 @@ async fn a_granted_directory_opens_children_deeper_than_max_path() {
     // and it opens a verbatim `\\?\` path like any other.
     let output = cmd(&sandbox, &format!("type {}", staged.display())).await;
     assert_eq!(stdout(&output), "deep-value", "{}", stderr(&output));
+}
+
+/// Stage a real program and a file for it to read into `dir`.
+///
+/// The copy mirrors how callers stage tool directories: the file lands before
+/// the sandbox exists, so only the grant walk can have opened it.
+fn stage_program(dir: &Path) -> (PathBuf, PathBuf) {
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let staged = dir.join("staged-findstr.exe");
+    std::fs::copy(format!("{system_root}\\System32\\findstr.exe"), &staged)
+        .expect("the host stages an executable");
+    let haystack = dir.join("haystack.txt");
+    std::fs::write(&haystack, "needle").expect("the host stages a file to search");
+    (staged, haystack)
+}
+
+/// A sandbox that grants `dir` read-and-execute.
+async fn exec_granted_sandbox(dir: &Path) -> Sandbox {
+    let config = SandboxConfigBuilder::default()
+        .grant(dir, Access::READ | Access::EXEC)
+        .build();
+    Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts")
+}
+
+/// Compile `run_child.rs`, the program that reproduces the production spawn
+/// shape: a process inside the container starting another by full path with
+/// `Command::output`, whose stdin is `NUL`.
+///
+/// The binary is staged alongside the target so the same grant covers both —
+/// the grant walk must see it, so it is built before the sandbox exists.
+fn compile_runner(dir: &Path) -> PathBuf {
+    let source = dir.join("run_child.rs");
+    std::fs::write(&source, include_str!("fixtures/run_child.rs"))
+        .expect("the host writes the runner source");
+    let runner = dir.join("run-child.exe");
+    let output = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg("-O")
+        .arg("-o")
+        .arg(&runner)
+        .arg(&source)
+        .output()
+        .expect("the host compiles the runner");
+    assert!(
+        output.status.success(),
+        "rustc: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    runner
+}
+
+/// Run the staged program through a child of the container.
+///
+/// `Sandbox::command` launches the runner; the runner is what spawns the
+/// staged program, by full path, with `Command::output` — the shape a build
+/// tool takes when it probes a staged wrapper. The runner forwards the
+/// child's streams, so `needle` reaching stdout proves the whole chain ran.
+async fn run_staged_from_inside(sandbox: &Sandbox<impl heel::NetworkPolicy>, dir: &Path) -> Output {
+    sandbox
+        .command(dir.join("run-child.exe").to_str().expect("UTF-8 path"))
+        .arg(dir.join("staged-findstr.exe").to_str().expect("UTF-8 path"))
+        .arg("needle")
+        .arg(dir.join("haystack.txt").to_str().expect("UTF-8 path"))
+        .output()
+        .await
+        .expect("the runner launches")
+}
+
+/// Assert the chain ran end to end.
+fn assert_needle(output: &Output) {
+    assert!(
+        output.status.success() && stdout(output).contains("needle"),
+        "the staged program must run inside the sandbox: status={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        stdout(output),
+        stderr(output)
+    );
+}
+
+#[tokio::test]
+async fn a_granted_directory_lets_the_container_run_staged_programs() {
+    // A grant that allows execute must open the directory's programs to the
+    // container exactly as much as the system's own. The binary is copied in
+    // before the sandbox exists — so only the grant walk can have opened it —
+    // and a process inside the container runs it afterwards, which is the
+    // shape a build tool spawning a staged wrapper takes.
+    let dir = tempfile::tempdir().expect("tempdir");
+    stage_program(dir.path());
+    compile_runner(dir.path());
+    let sandbox = exec_granted_sandbox(dir.path()).await;
+
+    assert_needle(&run_staged_from_inside(&sandbox, dir.path()).await);
+}
+
+#[tokio::test]
+async fn a_staged_program_runs_when_spawned_by_full_path() {
+    // Spawning the staged file itself takes the launch path rather than a
+    // child of the container: the program is resolved, granted read+execute
+    // on itself, and started inside the container.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (staged, haystack) = stage_program(dir.path());
+    let sandbox = exec_granted_sandbox(dir.path()).await;
+
+    let output = sandbox
+        .command(staged.to_str().expect("the staged path is UTF-8"))
+        .arg("needle")
+        .arg(haystack.to_str().expect("the haystack path is UTF-8"))
+        .output()
+        .await
+        .expect("the staged program launches");
+    assert_needle(&output);
+}
+
+#[tokio::test]
+async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_programs() {
+    // The failure this is a reproduction of staged its tools directory
+    // directly under `C:\`, whose only ancestor is the drive root itself.
+    // Staging under a temp directory instead would put ancestors with
+    // explicit traverse grants between the program and the root, so the same
+    // scenario is staged at the root here.
+    let dir = tempfile::Builder::new()
+        .prefix("heel-exec-")
+        .tempdir_in("C:\\")
+        .expect("a directory at the drive root");
+    stage_program(dir.path());
+    compile_runner(dir.path());
+    let sandbox = exec_granted_sandbox(dir.path()).await;
+
+    assert_needle(&run_staged_from_inside(&sandbox, dir.path()).await);
 }

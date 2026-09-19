@@ -18,6 +18,7 @@ use rappct::net::LoopbackExemptionGuard;
 use rappct::profile::AppContainerProfile;
 use rappct::sid::AppContainerSid;
 
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_TRAVERSE,
@@ -150,7 +151,37 @@ impl Container {
             self.grant_path(python.venv().path(), access)?;
         }
 
+        self.grant_null_device();
+
         Ok(())
+    }
+
+    /// Open the null device to this container.
+    ///
+    /// A process spawned with a null stdin opens `NUL`, which resolves to the
+    /// kernel device `\Device\Null`. The device's access control list names
+    /// nothing an AppContainer token carries, so the open is denied inside the
+    /// container — and with it every spawn `std::process::Command::output`
+    /// performs, because it wires the child's stdin to `NUL`. That is the
+    /// failure a build tool hits when it probes a staged wrapper: the child is
+    /// denied before it starts. Granting the package SID on the device object
+    /// opens it to this container and nothing else.
+    ///
+    /// The device belongs to the machine rather than to this sandbox, so a
+    /// host without the rights to change its access control list keeps a
+    /// working sandbox for everything that does not touch `NUL` — the grant
+    /// is attempted and a failure is reported rather than fatal.
+    fn grant_null_device(&self) {
+        const NULL_DEVICE: &str = r"\\.\NUL";
+        const READ_WRITE: u32 = GENERIC_READ.0 | GENERIC_WRITE.0;
+
+        match acl::grant_object(NULL_DEVICE, self.sid().as_string(), READ_WRITE) {
+            Ok(()) => tracing::debug!("opened the null device to the container"),
+            Err(source) => tracing::warn!(
+                %source,
+                "cannot open the null device to the container; children that open NUL will be denied"
+            ),
+        }
     }
 
     /// Open one configured path to this container.
