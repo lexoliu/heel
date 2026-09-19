@@ -89,9 +89,17 @@ fn parse_sid(sddl: &str) -> io::Result<(LocalBuffer, PSID)> {
 /// Existing entries are kept: the rule is added to what is already there rather
 /// than replacing it, so nothing the machine or the user already relies on is
 /// removed.
+///
+/// The named security APIs reject object names deeper than `MAX_PATH` unless
+/// they are spelled verbatim, and a walked tree reaches children deeper than
+/// that. Resolving the path first hands them the `\\?\` form they accept at
+/// any depth, while the errors keep naming the path the caller asked for.
 pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()> {
     let (_sid_buffer, sid) = parse_sid(sid)?;
-    let wide: Vec<u16> = path
+    let resolved = std::fs::canonicalize(path).map_err(|source| {
+        io::Error::other(format!("cannot resolve {}: {source}", path.display()))
+    })?;
+    let wide: Vec<u16> = resolved
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
