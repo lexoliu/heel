@@ -87,9 +87,9 @@ async fn a_granted_directory_opens_children_deeper_than_max_path() {
         .await
         .expect("sandbox starts");
 
-    // `more` reads the file through redirection: a redirection target is
-    // taken literally, where the `?` in `\\?\` could look like a wildcard to
-    // a command that globs its arguments.
-    let output = cmd(&sandbox, &format!("more < {}", staged.display())).await;
+    // `type` is a cmd builtin, so it needs no PATH lookup inside the
+    // container — the one the other probes lean on for the same reason —
+    // and it opens a verbatim `\\?\` path like any other.
+    let output = cmd(&sandbox, &format!("type {}", staged.display())).await;
     assert_eq!(stdout(&output), "deep-value", "{}", stderr(&output));
 }
