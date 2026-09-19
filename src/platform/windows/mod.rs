@@ -75,8 +75,9 @@ impl WindowsBackend {
     ///
     /// The paths are granted here rather than at the first launch because
     /// Windows grants by inheritance, and an inheritable entry only reaches
-    /// files created after it exists. Granting later would leave anything the
-    /// caller had already put in the working directory unreadable.
+    /// files created after it exists — what is already there is opened by a
+    /// walk over the tree, and the entries must all be in place before the
+    /// process starts creating its own files.
     ///
     /// # Errors
     ///
