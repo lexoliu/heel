@@ -65,6 +65,33 @@ async fn the_temp_directory_is_private_to_the_container() {
 }
 
 #[tokio::test]
+async fn a_writable_grant_lets_the_container_rename_and_remove_what_it_wrote() {
+    // rustc emits `.rmeta` by writing a scratch file beside the output and
+    // renaming it over the final name, then removing the scratch directory.
+    // On Windows a rename is a delete of the source name, and a write grant
+    // without the delete bits denies it — which is how a sandboxed build met
+    // "Access is denied" writing its first `.rmeta`. `Access::WRITE` promises
+    // creating and removing entries, so the grant has to carry them.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = SandboxConfigBuilder::default()
+        .grant(dir.path(), Access::WRITE)
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    let output = cmd(
+        &sandbox,
+        &format!(
+            "mkdir {0}\\rmeta-tmp && echo written> {0}\\rmeta-tmp\\full.rmeta && move /y {0}\\rmeta-tmp\\full.rmeta {0}\\lib.rmeta && type {0}\\lib.rmeta && rd /s /q {0}\\rmeta-tmp",
+            dir.path().display()
+        ),
+    )
+    .await;
+    assert_eq!(stdout(&output), "written", "{}", stderr(&output));
+}
+
+#[tokio::test]
 async fn a_granted_directory_opens_children_deeper_than_max_path() {
     // A granted tree is walked so its existing children can be ACL'd, and a
     // tree like a cargo registry can nest past MAX_PATH. The named security
