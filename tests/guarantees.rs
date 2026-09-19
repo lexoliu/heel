@@ -123,12 +123,17 @@ impl Probes for Platform {
         std::fs::write(working_dir.join("source.exe"), program).expect("the host stages it");
     }
 
+    // `cmd /C` does not read argv; it re-parses the raw command-line tail, so
+    // a quote embedded in the script arrives literally and `type` rejects the
+    // name rather than opening the file. The path therefore goes unquoted,
+    // as the unix probes already spell theirs: every probe path lives under
+    // the run's own temp directory, which carries no spaces.
     fn read(path: &Path) -> String {
-        format!("type \"{}\"", path.display())
+        format!("type {}", path.display())
     }
 
     fn write(path: &Path) -> String {
-        format!("echo escaped> \"{}\"", path.display())
+        format!("echo escaped> {}", path.display())
     }
 }
 
