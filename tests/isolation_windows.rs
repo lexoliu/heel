@@ -111,6 +111,19 @@ async fn a_writable_grant_lets_the_container_rename_and_remove_what_it_wrote() {
         ),
     ] {
         let output = cmd(&sandbox, &script).await;
+        if stdout(&output) != expected {
+            // Diagnose the denial from inside the container: the file's
+            // effective ACL and the token's groups say whether the grant even
+            // reached the object.
+            for probe in [
+                format!("C:\\Windows\\System32\\icacls.exe {root}\\rmeta-tmp\\full.rmeta"),
+                format!("C:\\Windows\\System32\\icacls.exe {root}"),
+                String::from("C:\\Windows\\System32\\whoami.exe /groups /fo list"),
+            ] {
+                let out = cmd(&sandbox, &probe).await;
+                eprintln!("[{step}] {probe} =>\n{}{}", stdout(&out), stderr(&out));
+            }
+        }
         assert_eq!(
             stdout(&output),
             expected,
