@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use heel::{Access, Sandbox, SandboxConfig, SandboxConfigBuilder};
+use heel::{Access, AllowAll, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 /// Run `script` with `cmd.exe` inside `sandbox`.
 async fn cmd(sandbox: &Sandbox<impl heel::NetworkPolicy>, script: &str) -> Output {
@@ -116,6 +116,37 @@ async fn exec_granted_sandbox(dir: &Path) -> Sandbox {
     Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts")
+}
+
+#[tokio::test]
+async fn a_network_capability_lets_the_container_spawn_children() {
+    // Every container-side spawn is denied under the default policy. If the
+    // same command runs once the token carries a capability, the difference is
+    // the capability list, not the grant.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (staged, haystack) = stage_program(dir.path());
+    let config = SandboxConfigBuilder::default()
+        .network(AllowAll)
+        .grant(dir.path(), Access::READ | Access::EXEC)
+        .build();
+    let sandbox: Sandbox<AllowAll> =
+        Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+            .await
+            .expect("sandbox starts");
+
+    let mut dump = String::new();
+    for script in [
+        format!("{} needle {}", staged.display(), haystack.display()),
+        "%SystemRoot%\\System32\\whoami.exe".to_string(),
+    ] {
+        let output = cmd(&sandbox, &script).await;
+        dump.push_str(&format!(
+            "\n> {script}\nstdout: {}\nstderr: {}\n",
+            stdout(&output),
+            stderr(&output)
+        ));
+    }
+    assert!(dump.contains("needle"), "the probes denied spawn:{dump}");
 }
 
 /// Run `program` inside `sandbox` through the launch path, not through a
