@@ -323,3 +323,253 @@ async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_pro
         security_state(&sandbox, &staged).await
     );
 }
+
+/// Bisect the launch shape: `rappct`'s own tests prove `cmd /C` can spawn
+/// children in a container it launches, and this crate's cannot. Every knob
+/// the two callers set differently is flipped one at a time here, from the
+/// known-good shape down to exactly what `heel` passes.
+#[test]
+fn appcontainer_spawn_bisect() {
+    use rappct::launch::{JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io};
+    use rappct::{AppContainerProfile, KnownCapability, SecurityCapabilitiesBuilder};
+
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let cmd = format!(r"{system_root}\System32\cmd.exe");
+    let icacls = format!(r"{system_root}\System32\icacls.exe");
+    let system32 = format!(r"{system_root}\System32");
+
+    let out = tempfile::tempdir().expect("tempdir");
+    let staged = out.path().join("staged-findstr.exe");
+    std::fs::copy(format!(r"{system_root}\System32\findstr.exe"), &staged)
+        .expect("the host stages an executable");
+    let haystack = out.path().join("haystack.txt");
+    std::fs::write(&haystack, "needle").expect("the host stages a file");
+
+    let name = format!("heel.bisect.{}", std::process::id());
+    let profile =
+        AppContainerProfile::ensure(&name, &name, Some("heel bisect")).expect("profile ensured");
+    let sid = profile.sid.as_string();
+
+    // Open the staging directory to the package SID from the host, where
+    // nothing about the container can interfere.
+    let grant = |path: &Path, permission: &str| {
+        let output = std::process::Command::new(&icacls)
+            .arg(path)
+            .arg("/grant")
+            .arg(format!("*{sid}:{permission}"))
+            .output()
+            .expect("icacls runs");
+        assert!(
+            output.status.success(),
+            "icacls {} {}: {}",
+            path.display(),
+            permission,
+            String::from_utf8_lossy(&output.stdout)
+        );
+    };
+    for ancestor in out.path().ancestors().skip(1) {
+        if ancestor.parent().is_none() {
+            continue;
+        }
+        grant(ancestor, "(X)");
+    }
+    grant(out.path(), "(OI)(CI)(F)");
+    grant(&staged, "(RX)");
+    grant(&haystack, "(R)");
+
+    let mut dump = String::new();
+    let mut run =
+        |label: &str, options: LaunchOptions, caps: &rappct::capability::SecurityCapabilities| {
+            match launch_in_container_with_io(caps, &options) {
+                Ok(child) => {
+                    let mut child = child;
+                    drop(child.stdin.take());
+                    // Draining the pipes also waits for the process to close them;
+                    // `wait` then only collects the exit code.
+                    let mut stdout_buf = String::new();
+                    let mut stderr_buf = String::new();
+                    if let Some(mut pipe) = child.stdout.take() {
+                        use std::io::Read;
+                        let _ = pipe.read_to_string(&mut stdout_buf);
+                    }
+                    if let Some(mut pipe) = child.stderr.take() {
+                        use std::io::Read;
+                        let _ = pipe.read_to_string(&mut stderr_buf);
+                    }
+                    let code = child.wait(Some(std::time::Duration::from_secs(30)));
+                    dump.push_str(&format!(
+                        "\n{label}: exit={code:?} stdout={:?} stderr={:?}\n",
+                        stdout_buf.trim(),
+                        stderr_buf.trim()
+                    ));
+                }
+                Err(error) => dump.push_str(&format!("\n{label}: LAUNCH FAILED {error}\n")),
+            }
+        };
+
+    struct Cell {
+        label: &'static str,
+        cwd: &'static str,
+        env: bool,
+        stdio: StdioConfig,
+        job: bool,
+        caps: bool,
+        argv0: bool,
+    }
+
+    // c0 is rappct's own test shape, which can spawn children. Each cell
+    // after it flips one knob toward the shape `prepare` builds in
+    // `src/platform/windows/mod.rs`; c9 is that shape exactly.
+    let cells = [
+        Cell {
+            label: "c0 rappct-replica     ",
+            cwd: "system32",
+            env: false,
+            stdio: StdioConfig::Null,
+            job: false,
+            caps: true,
+            argv0: false,
+        },
+        Cell {
+            label: "c1 cwd=out-dir        ",
+            cwd: "out",
+            env: false,
+            stdio: StdioConfig::Null,
+            job: false,
+            caps: true,
+            argv0: false,
+        },
+        Cell {
+            label: "c2 cwd=inherit        ",
+            cwd: "inherit",
+            env: false,
+            stdio: StdioConfig::Null,
+            job: false,
+            caps: true,
+            argv0: false,
+        },
+        Cell {
+            label: "c3 env=custom         ",
+            cwd: "system32",
+            env: true,
+            stdio: StdioConfig::Null,
+            job: false,
+            caps: true,
+            argv0: false,
+        },
+        Cell {
+            label: "c4 stdio=pipe         ",
+            cwd: "system32",
+            env: false,
+            stdio: StdioConfig::Pipe,
+            job: false,
+            caps: true,
+            argv0: false,
+        },
+        Cell {
+            label: "c5 job=kill-on-close  ",
+            cwd: "system32",
+            env: false,
+            stdio: StdioConfig::Null,
+            job: true,
+            caps: true,
+            argv0: false,
+        },
+        Cell {
+            label: "c6 cmdline=argv0      ",
+            cwd: "system32",
+            env: false,
+            stdio: StdioConfig::Null,
+            job: false,
+            caps: true,
+            argv0: true,
+        },
+        Cell {
+            label: "c7 caps=none          ",
+            cwd: "system32",
+            env: false,
+            stdio: StdioConfig::Null,
+            job: false,
+            caps: false,
+            argv0: false,
+        },
+        Cell {
+            label: "c8 heel-shape+inet    ",
+            cwd: "out",
+            env: true,
+            stdio: StdioConfig::Pipe,
+            job: true,
+            caps: true,
+            argv0: true,
+        },
+        Cell {
+            label: "c9 heel-shape-denyall ",
+            cwd: "out",
+            env: true,
+            stdio: StdioConfig::Pipe,
+            job: true,
+            caps: false,
+            argv0: true,
+        },
+    ];
+
+    let heel_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+        ("PATH", r"C:\Windows\System32"),
+        ("SystemRoot", r"C:\Windows"),
+        ("TEMP", r"C:\Windows\Temp"),
+        ("TMP", r"C:\Windows\Temp"),
+    ]
+    .iter()
+    .map(|(key, value)| (key.into(), value.into()))
+    .collect();
+
+    for cell in &cells {
+        let caps = {
+            let builder = SecurityCapabilitiesBuilder::new(&profile.sid);
+            let builder = if cell.caps {
+                builder.with_known(&[KnownCapability::InternetClient])
+            } else {
+                builder
+            };
+            builder.build().expect("capabilities build")
+        };
+        let cwd = match cell.cwd {
+            "system32" => Some(PathBuf::from(&system32)),
+            "out" => Some(out.path().to_path_buf()),
+            _ => None,
+        };
+        for script in [
+            "whoami".to_string(),
+            format!("dir /b {}", out.path().display()),
+            format!("{} needle {}", staged.display(), haystack.display()),
+        ] {
+            let cmdline = if cell.argv0 {
+                format!("cmd.exe /C {script}")
+            } else {
+                format!(" /C {script}")
+            };
+            let options = LaunchOptions {
+                exe: PathBuf::from(&cmd),
+                cmdline: Some(cmdline),
+                cwd: cwd.clone(),
+                env: cell.env.then(|| heel_env.clone()),
+                stdio: cell.stdio,
+                suspended: false,
+                join_job: cell.job.then_some(JobLimits {
+                    memory_bytes: None,
+                    cpu_rate_percent: None,
+                    kill_on_job_close: true,
+                }),
+                startup_timeout: None,
+            };
+            run(
+                &format!("{} | {}", cell.label.trim(), script),
+                options,
+                &caps,
+            );
+        }
+    }
+
+    profile.delete().ok();
+    panic!("spawn bisect results:{dump}");
+}

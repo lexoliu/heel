@@ -275,8 +275,11 @@ impl Container {
     ///
     /// `network` is true when a proxy is running: the sandboxed process talks to
     /// the proxy, and the proxy is what applies the policy.
-    pub(crate) fn capabilities(&self, _network: bool) -> Result<SecurityCapabilities> {
-        let builder = SecurityCapabilitiesBuilder::new(self.sid()).with_named(&[INTERNET_CLIENT]);
+    pub(crate) fn capabilities(&self, network: bool) -> Result<SecurityCapabilities> {
+        let mut builder = SecurityCapabilitiesBuilder::new(self.sid());
+        if network {
+            builder = builder.with_named(&[INTERNET_CLIENT]);
+        }
         builder.build().map_err(|source| {
             Error::InitFailed(format!(
                 "cannot derive container capabilities: {}",
