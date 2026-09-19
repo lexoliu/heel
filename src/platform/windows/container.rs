@@ -20,8 +20,8 @@ use rappct::sid::AppContainerSid;
 
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_TRAVERSE,
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
 };
 
 use super::acl::{self, Entry, Scope};
@@ -35,8 +35,16 @@ const INTERNET_CLIENT: &str = "internetClient";
 /// Read a file, or list a directory.
 const READ: u32 = FILE_GENERIC_READ.0;
 
-/// Write a file, or create entries in a directory.
-const WRITE: u32 = FILE_GENERIC_WRITE.0;
+/// Write a file, or create and remove entries in a directory.
+///
+/// The generic write mask alone does not deliver what `Access::WRITE`
+/// promises, because Windows prices removal separately: renaming a file is a
+/// delete of its old name and wants `DELETE` on the file or
+/// `FILE_DELETE_CHILD` on its parent, and removing a directory wants `DELETE`
+/// on it. Without them a writer that stages output and renames it into place
+/// — rustc emitting `.rmeta` is the shape that hit this — meets access denied
+/// inside a tree it was told is writable.
+const WRITE: u32 = FILE_GENERIC_WRITE.0 | DELETE.0 | FILE_DELETE_CHILD.0;
 
 /// Enter a directory. The same bit means "run" on a file, which is the whole
 /// reason directories and files are granted separately below.
