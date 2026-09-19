@@ -31,6 +31,18 @@ use crate::grant::Access;
 /// Capability that permits outbound connections.
 const INTERNET_CLIENT: &str = "internetClient";
 
+/// The capability every heel container carries.
+///
+/// A token minted with no capability SIDs is an AppContainer in name only: it
+/// reads granted paths but cannot start a child process inside the container,
+/// which fails `NtCreateUserProcess` with `ERROR_ACCESS_DENIED` for every
+/// image — the same error the caller sees when a granted program cannot run.
+/// Windows derives a capability SID from any name through
+/// `DeriveCapabilitySidsFromName`, and a name only heel uses produces a SID no
+/// resource ACL can mention, so the token is whole without granting anything
+/// the deny-all policy means to withhold.
+const CONTAINER_CAPABILITY: &str = "heel";
+
 /// Read a file, or list a directory.
 const READ: u32 = FILE_GENERIC_READ.0;
 
@@ -276,7 +288,8 @@ impl Container {
     /// `network` is true when a proxy is running: the sandboxed process talks to
     /// the proxy, and the proxy is what applies the policy.
     pub(crate) fn capabilities(&self, network: bool) -> Result<SecurityCapabilities> {
-        let mut builder = SecurityCapabilitiesBuilder::new(self.sid());
+        let mut builder =
+            SecurityCapabilitiesBuilder::new(self.sid()).with_named(&[CONTAINER_CAPABILITY]);
         if network {
             builder = builder.with_named(&[INTERNET_CLIENT]);
         }
