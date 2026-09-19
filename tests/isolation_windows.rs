@@ -399,7 +399,7 @@ fn appcontainer_spawn_bisect() {
     };
 
     let (out_pkg, staged_pkg, _copied_pkg, _haystack_pkg) = stage("pkg-", &sid);
-    let (out_aap, staged_aap, copied_aap, _haystack_aap) = stage("aap-", aap);
+    let (out_aap, staged_aap, copied_aap, haystack_aap) = stage("aap-", aap);
 
     let mut dump = String::new();
     let mut run =
@@ -440,35 +440,33 @@ fn appcontainer_spawn_bisect() {
         .build()
         .expect("capabilities build");
 
-    // Round 4: name resolution was the discriminator -- a bare or PATH-resolved
-    // name spawns and runs, including the staged copy, while every path spelled
-    // with a directory part is denied before it is even reached: cmd validates
-    // the path through `FindFirstFile`, and directory enumeration is denied on
-    // every directory in the container, System32 included. These probes pin
-    // down which object class the container cannot open: `cd` traverses a
-    // directory without enumerating it, `for` enumerates it, `>` to a file
-    // creates in it, `NUL` and pipes are devices.
+    // Round 5: the failures all resolve to opens that terminate at a device or
+    // volume object (\Device\Null for NUL, the volume device behind `dir`,
+    // `cd /d`, and cmd's drive-prefixed path validation), while opens that pass
+    // through the volume to a file or directory succeed. Two questions remain:
+    // does the child token actually carry ALL APPLICATION PACKAGES, and is the
+    // device-open deny absolute? `whoami /groups` prints the group list and
+    // `type` on the AAP-granted files checks the ACE at file level.
     let scripts = [
-        "whoami".to_string(),
-        format!("cd /d {} && cd", out_pkg.path().display()),
+        "whoami /groups".to_string(),
+        format!("type {}", staged_aap.display()),
+        format!("type {}", haystack_aap.display()),
         format!(
-            "for %f in ({}\\haystack.txt) do @echo found-%f",
-            out_pkg.path().display()
+            "for %f in ({}\\haystack.txt) do @echo aap-%f",
+            out_aap.path().display()
         ),
-        format!(
-            "echo made> {}\\made.txt && type {}\\made.txt",
-            out_pkg.path().display(),
-            out_pkg.path().display()
-        ),
-        format!("md {}\\newdir", out_pkg.path().display()),
-        "whoami | findstr runnervm".to_string(),
+        format!("cd {} && cd", out_pkg.path().display()),
+        "vol C:".to_string(),
         "type NUL".to_string(),
-        r"type C:\Windows\System32\whoami.exe".to_string(),
-        format!("type {}", staged_pkg.display()),
-        format!("dir /b {system32}"),
+        format!("echo x> {}\\made.txt", out_pkg.path().display()),
+        "echo x> NUL".to_string(),
+        format!("\"{}\"", copied_aap.display()),
+        format!(
+            "\"{}\" needle {}",
+            staged_aap.display(),
+            haystack_aap.display()
+        ),
         "dir".to_string(),
-        format!("dir /b {}", out_aap.path().display()),
-        format!("{}", copied_aap.display()),
     ];
 
     for script in &scripts {
