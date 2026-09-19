@@ -398,8 +398,8 @@ fn appcontainer_spawn_bisect() {
         (dir, staged, copied, haystack)
     };
 
-    let (out_pkg, staged_pkg, copied_pkg, haystack_pkg) = stage("pkg-", &sid);
-    let (out_aap, staged_aap, copied_aap, haystack_aap) = stage("aap-", aap);
+    let (out_pkg, staged_pkg, _copied_pkg, _haystack_pkg) = stage("pkg-", &sid);
+    let (out_aap, staged_aap, copied_aap, _haystack_aap) = stage("aap-", aap);
 
     let mut dump = String::new();
     let mut run =
@@ -440,35 +440,35 @@ fn appcontainer_spawn_bisect() {
         .build()
         .expect("capabilities build");
 
-    // Round 3: the trustee made no difference either -- an executable granted
-    // to ALL APPLICATION PACKAGES fails exactly like one granted to the
-    // package SID, and `dir` is denied on every directory including System32.
-    // What did differ is how the target was named: a bare `whoami`, resolved
-    // through PATH inside the container, spawned, while every fully-qualified
-    // path was denied. These probes isolate the same binary both ways and add
-    // the staged directory to PATH so a copy there can be resolved by name.
+    // Round 4: name resolution was the discriminator -- a bare or PATH-resolved
+    // name spawns and runs, including the staged copy, while every path spelled
+    // with a directory part is denied before it is even reached: cmd validates
+    // the path through `FindFirstFile`, and directory enumeration is denied on
+    // every directory in the container, System32 included. These probes pin
+    // down which object class the container cannot open: `cd` traverses a
+    // directory without enumerating it, `for` enumerates it, `>` to a file
+    // creates in it, `NUL` and pipes are devices.
     let scripts = [
         "whoami".to_string(),
-        format!(r"{system32}\whoami.exe"),
-        "findstr".to_string(),
-        format!(r"{system32}\findstr.exe"),
-        r".\whoami.exe".to_string(),
-        r"type C:\Windows\System32\whoami.exe > NUL".to_string(),
-        format!("type {} > NUL", staged_pkg.display()),
+        format!("cd /d {} && cd", out_pkg.path().display()),
         format!(
-            "set PATH={};%PATH% && whoami-copy",
+            "for %f in ({}\\haystack.txt) do @echo found-%f",
             out_pkg.path().display()
         ),
         format!(
-            "set PATH={};%PATH% && staged-findstr needle {}",
+            "echo made> {}\\made.txt && type {}\\made.txt",
             out_pkg.path().display(),
-            haystack_pkg.display()
+            out_pkg.path().display()
         ),
-        format!("{}", copied_pkg.display()),
-        format!("{}", copied_aap.display()),
-        format!("{} needle {}", staged_aap.display(), haystack_aap.display()),
-        format!("dir /b {}", out_aap.path().display()),
+        format!("md {}\\newdir", out_pkg.path().display()),
+        "whoami | findstr runnervm".to_string(),
+        "type NUL".to_string(),
+        r"type C:\Windows\System32\whoami.exe".to_string(),
+        format!("type {}", staged_pkg.display()),
+        format!("dir /b {system32}"),
         "dir".to_string(),
+        format!("dir /b {}", out_aap.path().display()),
+        format!("{}", copied_aap.display()),
     ];
 
     for script in &scripts {
