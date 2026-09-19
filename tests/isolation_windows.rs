@@ -440,16 +440,35 @@ fn appcontainer_spawn_bisect() {
         .build()
         .expect("capabilities build");
 
+    // Round 3: the trustee made no difference either -- an executable granted
+    // to ALL APPLICATION PACKAGES fails exactly like one granted to the
+    // package SID, and `dir` is denied on every directory including System32.
+    // What did differ is how the target was named: a bare `whoami`, resolved
+    // through PATH inside the container, spawned, while every fully-qualified
+    // path was denied. These probes isolate the same binary both ways and add
+    // the staged directory to PATH so a copy there can be resolved by name.
     let scripts = [
         "whoami".to_string(),
-        format!("dir /b {system32}"),
-        format!("dir /b {}", out_pkg.path().display()),
-        format!("dir /b {}", out_aap.path().display()),
-        format!("{} needle {}", staged_pkg.display(), haystack_pkg.display()),
+        format!(r"{system32}\whoami.exe"),
+        "findstr".to_string(),
+        format!(r"{system32}\findstr.exe"),
+        r".\whoami.exe".to_string(),
+        r"type C:\Windows\System32\whoami.exe > NUL".to_string(),
+        format!("type {} > NUL", staged_pkg.display()),
+        format!(
+            "set PATH={};%PATH% && whoami-copy",
+            out_pkg.path().display()
+        ),
+        format!(
+            "set PATH={};%PATH% && staged-findstr needle {}",
+            out_pkg.path().display(),
+            haystack_pkg.display()
+        ),
         format!("{}", copied_pkg.display()),
-        format!("{} needle {}", staged_aap.display(), haystack_aap.display()),
         format!("{}", copied_aap.display()),
-        format!(r"{system32}\findstr.exe needle {}", haystack_pkg.display()),
+        format!("{} needle {}", staged_aap.display(), haystack_aap.display()),
+        format!("dir /b {}", out_aap.path().display()),
+        "dir".to_string(),
     ];
 
     for script in &scripts {
