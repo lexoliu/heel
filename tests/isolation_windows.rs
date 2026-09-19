@@ -64,6 +64,35 @@ async fn the_temp_directory_is_private_to_the_container() {
     assert_eq!(stdout(&written), "written", "{}", stderr(&written));
 }
 
+/// Compile a fixture program into `dir` and return its path.
+fn compile_fixture(dir: &Path, fixture: &str, output: &str) -> PathBuf {
+    let source = dir.join(format!("{fixture}.rs"));
+    std::fs::write(
+        &source,
+        match fixture {
+            "run_child" => include_str!("fixtures/run_child.rs"),
+            "fs_probe" => include_str!("fixtures/fs_probe.rs"),
+            other => unreachable!("no fixture named {other}"),
+        },
+    )
+    .expect("the host writes the fixture source");
+    let binary = dir.join(output);
+    let output_result = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg("-O")
+        .arg("-o")
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .expect("the host compiles the fixture");
+    assert!(
+        output_result.status.success(),
+        "rustc: {}",
+        String::from_utf8_lossy(&output_result.stderr)
+    );
+    binary
+}
+
 #[tokio::test]
 async fn a_writable_grant_lets_the_container_rename_and_remove_what_it_wrote() {
     // rustc emits `.rmeta` by writing a scratch file beside the output and
@@ -72,66 +101,33 @@ async fn a_writable_grant_lets_the_container_rename_and_remove_what_it_wrote() {
     // without the delete bits denies it — which is how a sandboxed build met
     // "Access is denied" writing its first `.rmeta`. `Access::WRITE` promises
     // creating and removing entries, so the grant has to carry them.
+    //
+    // The probe is a staged binary rather than shell builtins so each
+    // operation reports its own raw error instead of cmd's single "Access is
+    // denied".
     let dir = tempfile::tempdir().expect("tempdir");
+    let tools = tempfile::tempdir().expect("tools dir");
+    let probe = compile_fixture(tools.path(), "fs_probe", "fs-probe.exe");
     let config = SandboxConfigBuilder::default()
         .grant(dir.path(), Access::WRITE)
+        .grant(tools.path(), Access::READ | Access::EXEC)
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts");
-    let root = dir.path().display();
 
-    for (step, script, expected) in [
-        (
-            "file create in the granted root",
-            format!("echo written> {root}\\direct.txt && type {root}\\direct.txt"),
-            "written",
-        ),
-        (
-            "mkdir under the grant",
-            format!("mkdir {root}\\rmeta-tmp"),
-            "",
-        ),
-        (
-            "file create in a container-made child",
-            format!("echo written> {root}\\rmeta-tmp\\full.rmeta"),
-            "",
-        ),
-        (
-            "rename within the grant",
-            format!(
-                "move /y {root}\\rmeta-tmp\\full.rmeta {root}\\lib.rmeta && type {root}\\lib.rmeta"
-            ),
-            "written",
-        ),
-        (
-            "delete file and tree",
-            format!("del {root}\\direct.txt && rd /s /q {root}\\rmeta-tmp"),
-            "",
-        ),
-    ] {
-        let output = cmd(&sandbox, &script).await;
-        if stdout(&output) != expected {
-            // Diagnose the denial from inside the container: the file's
-            // effective ACL and the token's groups say whether the grant even
-            // reached the object.
-            for probe in [
-                format!("C:\\Windows\\System32\\icacls.exe {root}\\rmeta-tmp\\full.rmeta"),
-                format!("C:\\Windows\\System32\\icacls.exe {root}"),
-                String::from("C:\\Windows\\System32\\whoami.exe /groups /fo list"),
-            ] {
-                let out = cmd(&sandbox, &probe).await;
-                eprintln!("[{step}] {probe} =>\n{}{}", stdout(&out), stderr(&out));
-            }
-        }
-        assert_eq!(
-            stdout(&output),
-            expected,
-            "{step} failed: status={:?} stderr={:?}",
-            output.status.code(),
-            stderr(&output)
-        );
-    }
+    let output = sandbox
+        .command(probe.to_str().expect("the staged path is UTF-8"))
+        .arg(dir.path().to_str().expect("the granted path is UTF-8"))
+        .output()
+        .await
+        .expect("the probe launches");
+    let report = stdout(&output);
+    assert!(
+        !report.contains("=err"),
+        "write grant must cover the container's own edits: {report} {}",
+        stderr(&output)
+    );
 }
 
 #[tokio::test]
@@ -195,24 +191,7 @@ async fn exec_granted_sandbox(dir: &Path) -> Sandbox {
 /// The binary is staged alongside the target so the same grant covers both —
 /// the grant walk must see it, so it is built before the sandbox exists.
 fn compile_runner(dir: &Path) -> PathBuf {
-    let source = dir.join("run_child.rs");
-    std::fs::write(&source, include_str!("fixtures/run_child.rs"))
-        .expect("the host writes the runner source");
-    let runner = dir.join("run-child.exe");
-    let output = std::process::Command::new("rustc")
-        .arg("--edition=2021")
-        .arg("-O")
-        .arg("-o")
-        .arg(&runner)
-        .arg(&source)
-        .output()
-        .expect("the host compiles the runner");
-    assert!(
-        output.status.success(),
-        "rustc: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    runner
+    compile_fixture(dir, "run_child", "run-child.exe")
 }
 
 /// Run the staged program through a child of the container.
