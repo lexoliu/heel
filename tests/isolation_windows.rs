@@ -10,10 +10,10 @@
 #![cfg(target_os = "windows")]
 #![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use heel::{Sandbox, SandboxConfig, SandboxConfigBuilder};
+use heel::{Access, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 /// Run `script` with `cmd.exe` inside `sandbox`.
 async fn cmd(sandbox: &Sandbox<impl heel::NetworkPolicy>, script: &str) -> Output {
@@ -92,4 +92,148 @@ async fn a_granted_directory_opens_children_deeper_than_max_path() {
     // and it opens a verbatim `\\?\` path like any other.
     let output = cmd(&sandbox, &format!("type {}", staged.display())).await;
     assert_eq!(stdout(&output), "deep-value", "{}", stderr(&output));
+}
+
+/// Stage a real program and a file for it to read into `dir`.
+///
+/// The copy mirrors how callers stage tool directories: the file lands before
+/// the sandbox exists, so only the grant walk can have opened it.
+fn stage_program(dir: &Path) -> (PathBuf, PathBuf) {
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let staged = dir.join("staged-findstr.exe");
+    std::fs::copy(format!("{system_root}\\System32\\findstr.exe"), &staged)
+        .expect("the host stages an executable");
+    let haystack = dir.join("haystack.txt");
+    std::fs::write(&haystack, "needle").expect("the host stages a file to search");
+    (staged, haystack)
+}
+
+/// A sandbox that grants `dir` read-and-execute.
+async fn exec_granted_sandbox(dir: &Path) -> Sandbox {
+    let config = SandboxConfigBuilder::default()
+        .grant(dir, Access::READ | Access::EXEC)
+        .build();
+    Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts")
+}
+
+/// Dump the security state a denied spawn needs to be diagnosed from.
+///
+/// The token's own group list answers which "everyone already" grants the
+/// container actually sees, and `icacls` shows whether the grant landed on the
+/// staged file and every directory above it. Reading the staged file proves
+/// the grant is on it at all, and running the system's own copy of the same
+/// program over the same data proves execution itself works where Windows
+/// pre-opens the path.
+async fn security_state(sandbox: &Sandbox<impl heel::NetworkPolicy>, staged: &Path) -> String {
+    let haystack = staged.with_file_name("haystack.txt");
+    let mut dump = String::new();
+    let scripts = std::iter::once(format!("{SYS32}\\whoami.exe /all"))
+        .chain(
+            staged
+                .ancestors()
+                .map(|path| format!("{SYS32}\\icacls.exe {}", path.display())),
+        )
+        .chain([
+            format!("type {} > NUL && echo READABLE", staged.display()),
+            format!("dir /b {}", staged.parent().expect("a parent").display()),
+            format!("{SYS32}\\findstr.exe needle {}", haystack.display()),
+        ]);
+    for script in scripts {
+        let output = cmd(sandbox, &script).await;
+        dump.push_str(&format!(
+            "\n> {script}\nstdout: {}\nstderr: {}\n",
+            stdout(&output),
+            stderr(&output)
+        ));
+    }
+    dump
+}
+
+/// Where the diagnostic tools live, spelled out because the sandbox PATH does
+/// not name it.
+const SYS32: &str = "%SystemRoot%\\System32";
+
+#[tokio::test]
+async fn a_granted_directory_lets_the_container_run_staged_programs() {
+    // A grant that allows execute must open the directory's programs to the
+    // container exactly as much as the system's own: staging copies a real
+    // binary in before the sandbox exists and `cmd /C` runs it afterwards,
+    // which is the shape a build tool spawning a wrapper takes.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (staged, haystack) = stage_program(dir.path());
+    let sandbox = exec_granted_sandbox(dir.path()).await;
+
+    let output = cmd(
+        &sandbox,
+        &format!("{} needle {}", staged.display(), haystack.display()),
+    )
+    .await;
+    assert!(
+        output.status.success() && stdout(&output).contains("needle"),
+        "the staged program must run inside the sandbox: status={:?} stdout={:?} stderr={:?}\n\
+         security state:{}",
+        output.status.code(),
+        stdout(&output),
+        stderr(&output),
+        security_state(&sandbox, &staged).await
+    );
+}
+
+#[tokio::test]
+async fn a_staged_program_runs_when_spawned_by_full_path() {
+    // Spawning the staged file itself takes the launch path rather than a
+    // shell: the program is resolved, granted read+execute on itself, and
+    // started inside the container.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (staged, haystack) = stage_program(dir.path());
+    let sandbox = exec_granted_sandbox(dir.path()).await;
+
+    let output = sandbox
+        .command(staged.to_str().expect("the staged path is UTF-8"))
+        .arg("needle")
+        .arg(haystack.to_str().expect("the haystack path is UTF-8"))
+        .output()
+        .await
+        .expect("the staged program launches");
+    assert!(
+        output.status.success() && stdout(&output).contains("needle"),
+        "the staged program must run inside the sandbox: status={:?} stdout={:?} stderr={:?}\n\
+         security state:{}",
+        output.status.code(),
+        stdout(&output),
+        stderr(&output),
+        security_state(&sandbox, &staged).await
+    );
+}
+
+#[tokio::test]
+async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_programs() {
+    // The failure this is a reproduction of staged its tools directory
+    // directly under `C:\`, whose only ancestor is the drive root itself.
+    // Staging under a temp directory instead would put ancestors with
+    // explicit traverse grants between the program and the root, so the same
+    // scenario is staged at the root here.
+    let dir = tempfile::Builder::new()
+        .prefix("heel-exec-")
+        .tempdir_in("C:\\")
+        .expect("a directory at the drive root");
+    let (staged, haystack) = stage_program(dir.path());
+    let sandbox = exec_granted_sandbox(dir.path()).await;
+
+    let output = cmd(
+        &sandbox,
+        &format!("{} needle {}", staged.display(), haystack.display()),
+    )
+    .await;
+    assert!(
+        output.status.success() && stdout(&output).contains("needle"),
+        "the staged program must run inside the sandbox: status={:?} stdout={:?} stderr={:?}\n\
+         security state:{}",
+        output.status.code(),
+        stdout(&output),
+        stderr(&output),
+        security_state(&sandbox, &staged).await
+    );
 }
