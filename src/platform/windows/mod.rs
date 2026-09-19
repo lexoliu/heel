@@ -103,7 +103,10 @@ impl WindowsBackend {
 
         // A proxy port means a filtering policy, which only works if the
         // container may reach the proxy on loopback.
-        let loopback = Some(self.container.exempt_loopback()?);
+        let loopback = match request.proxy_port {
+            Some(_) => Some(self.container.exempt_loopback()?),
+            None => None,
+        };
 
         let limits = request.config.limits();
         let options = LaunchOptions {
