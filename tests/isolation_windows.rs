@@ -330,6 +330,14 @@ async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_pro
 /// children in a container it launches, and this crate's cannot. Every knob
 /// the two callers set differently is flipped one at a time here, from the
 /// known-good shape down to exactly what `heel` passes.
+///
+/// Round 2: the first matrix showed the launch shape is irrelevant -- a
+/// `System32` binary spawns under every configuration while anything in the
+/// granted directory is denied, as is listing the directory itself. `System32`
+/// carries `ALL APPLICATION PACKAGES` entries where the grant carries only the
+/// package SID, so this matrix holds the launch shape fixed at the replica and
+/// varies the trustee instead: package SID versus `ALL APPLICATION PACKAGES`
+/// (S-1-15-2-1), on the directory and on the executable alike.
 #[test]
 fn appcontainer_spawn_bisect() {
     use rappct::launch::{JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io};
@@ -339,45 +347,59 @@ fn appcontainer_spawn_bisect() {
     let cmd = format!(r"{system_root}\System32\cmd.exe");
     let icacls = format!(r"{system_root}\System32\icacls.exe");
     let system32 = format!(r"{system_root}\System32");
-
-    let out = tempfile::tempdir().expect("tempdir");
-    let staged = out.path().join("staged-findstr.exe");
-    std::fs::copy(format!(r"{system_root}\System32\findstr.exe"), &staged)
-        .expect("the host stages an executable");
-    let haystack = out.path().join("haystack.txt");
-    std::fs::write(&haystack, "needle").expect("the host stages a file");
+    let aap = "S-1-15-2-1";
 
     let name = format!("heel.bisect.{}", std::process::id());
     let profile =
         AppContainerProfile::ensure(&name, &name, Some("heel bisect")).expect("profile ensured");
-    let sid = profile.sid.as_string();
+    let sid = profile.sid.as_string().to_string();
 
-    // Open the staging directory to the package SID from the host, where
-    // nothing about the container can interfere.
-    let grant = |path: &Path, permission: &str| {
-        let output = std::process::Command::new(&icacls)
-            .arg(path)
-            .arg("/grant")
-            .arg(format!("*{sid}:{permission}"))
-            .output()
-            .expect("icacls runs");
-        assert!(
-            output.status.success(),
-            "icacls {} {}: {}",
-            path.display(),
-            permission,
-            String::from_utf8_lossy(&output.stdout)
-        );
-    };
-    for ancestor in out.path().ancestors().skip(1) {
-        if ancestor.parent().is_none() {
-            continue;
+    // Open a staging directory to `trustee` from the host: traverse on every
+    // ancestor, read-execute on the tree itself and on each staged file.
+    let stage = |prefix: &str, trustee: &str| -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("staging dir");
+        let staged = dir.path().join("staged-findstr.exe");
+        std::fs::copy(format!(r"{system_root}\System32\findstr.exe"), &staged)
+            .expect("the host stages an executable");
+        let copied = dir.path().join("whoami-copy.exe");
+        std::fs::copy(format!(r"{system_root}\System32\whoami.exe"), &copied)
+            .expect("the host stages a system binary copy");
+        let haystack = dir.path().join("haystack.txt");
+        std::fs::write(&haystack, "needle").expect("the host stages a file");
+
+        let grant = |path: &Path, permission: &str| {
+            let output = std::process::Command::new(&icacls)
+                .arg(path)
+                .arg("/grant")
+                .arg(format!("*{trustee}:{permission}"))
+                .output()
+                .expect("icacls runs");
+            assert!(
+                output.status.success(),
+                "icacls {} {}: {}",
+                path.display(),
+                permission,
+                String::from_utf8_lossy(&output.stdout)
+            );
+        };
+        for ancestor in dir.path().ancestors().skip(1) {
+            if ancestor.parent().is_none() {
+                continue;
+            }
+            grant(ancestor, "(X)");
         }
-        grant(ancestor, "(X)");
-    }
-    grant(out.path(), "(OI)(CI)(F)");
-    grant(&staged, "(RX)");
-    grant(&haystack, "(R)");
+        grant(dir.path(), "(OI)(CI)(RX)");
+        grant(&staged, "(RX)");
+        grant(&copied, "(RX)");
+        grant(&haystack, "(R)");
+        (dir, staged, copied, haystack)
+    };
+
+    let (out_pkg, staged_pkg, copied_pkg, haystack_pkg) = stage("pkg-", &sid);
+    let (out_aap, staged_aap, copied_aap, haystack_aap) = stage("aap-", aap);
 
     let mut dump = String::new();
     let mut run =
@@ -409,167 +431,65 @@ fn appcontainer_spawn_bisect() {
             }
         };
 
-    struct Cell {
-        label: &'static str,
-        cwd: &'static str,
-        env: bool,
-        stdio: StdioConfig,
-        job: bool,
-        caps: bool,
-        argv0: bool,
-    }
+    // The launch shape is held at the replica the whole way: inherited
+    // environment, no job, `System32` as the current directory, `internetClient`
+    // as the only capability. What varies is the object the probe opens, and
+    // whose ACE it carries.
+    let caps = SecurityCapabilitiesBuilder::new(&profile.sid)
+        .with_known(&[KnownCapability::InternetClient])
+        .build()
+        .expect("capabilities build");
 
-    // c0 is rappct's own test shape, which can spawn children. Each cell
-    // after it flips one knob toward the shape `prepare` builds in
-    // `src/platform/windows/mod.rs`; c9 is that shape exactly.
-    let cells = [
-        Cell {
-            label: "c0 rappct-replica     ",
-            cwd: "system32",
-            env: false,
-            stdio: StdioConfig::Null,
-            job: false,
-            caps: true,
-            argv0: false,
-        },
-        Cell {
-            label: "c1 cwd=out-dir        ",
-            cwd: "out",
-            env: false,
-            stdio: StdioConfig::Null,
-            job: false,
-            caps: true,
-            argv0: false,
-        },
-        Cell {
-            label: "c2 cwd=inherit        ",
-            cwd: "inherit",
-            env: false,
-            stdio: StdioConfig::Null,
-            job: false,
-            caps: true,
-            argv0: false,
-        },
-        Cell {
-            label: "c3 env=custom         ",
-            cwd: "system32",
-            env: true,
-            stdio: StdioConfig::Null,
-            job: false,
-            caps: true,
-            argv0: false,
-        },
-        Cell {
-            label: "c4 stdio=pipe         ",
-            cwd: "system32",
-            env: false,
-            stdio: StdioConfig::Pipe,
-            job: false,
-            caps: true,
-            argv0: false,
-        },
-        Cell {
-            label: "c5 job=kill-on-close  ",
-            cwd: "system32",
-            env: false,
-            stdio: StdioConfig::Null,
-            job: true,
-            caps: true,
-            argv0: false,
-        },
-        Cell {
-            label: "c6 cmdline=argv0      ",
-            cwd: "system32",
-            env: false,
-            stdio: StdioConfig::Null,
-            job: false,
-            caps: true,
-            argv0: true,
-        },
-        Cell {
-            label: "c7 caps=none          ",
-            cwd: "system32",
-            env: false,
-            stdio: StdioConfig::Null,
-            job: false,
-            caps: false,
-            argv0: false,
-        },
-        Cell {
-            label: "c8 heel-shape+inet    ",
-            cwd: "out",
-            env: true,
-            stdio: StdioConfig::Pipe,
-            job: true,
-            caps: true,
-            argv0: true,
-        },
-        Cell {
-            label: "c9 heel-shape-denyall ",
-            cwd: "out",
-            env: true,
-            stdio: StdioConfig::Pipe,
-            job: true,
-            caps: false,
-            argv0: true,
-        },
+    let scripts = [
+        "whoami".to_string(),
+        format!("dir /b {system32}"),
+        format!("dir /b {}", out_pkg.path().display()),
+        format!("dir /b {}", out_aap.path().display()),
+        format!("{} needle {}", staged_pkg.display(), haystack_pkg.display()),
+        format!("{}", copied_pkg.display()),
+        format!("{} needle {}", staged_aap.display(), haystack_aap.display()),
+        format!("{}", copied_aap.display()),
+        format!(r"{system32}\findstr.exe needle {}", haystack_pkg.display()),
     ];
 
-    let heel_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
-        ("PATH", r"C:\Windows\System32"),
-        ("SystemRoot", r"C:\Windows"),
-        ("TEMP", r"C:\Windows\Temp"),
-        ("TMP", r"C:\Windows\Temp"),
-    ]
-    .iter()
-    .map(|(key, value)| (key.into(), value.into()))
-    .collect();
+    for script in &scripts {
+        let options = LaunchOptions {
+            exe: PathBuf::from(&cmd),
+            cmdline: Some(format!(" /C {script}")),
+            cwd: Some(PathBuf::from(&system32)),
+            env: None,
+            stdio: StdioConfig::Pipe,
+            suspended: false,
+            join_job: Some(JobLimits {
+                memory_bytes: None,
+                cpu_rate_percent: None,
+                kill_on_job_close: true,
+            }),
+            startup_timeout: None,
+        };
+        run(script, options, &caps);
+    }
 
-    for cell in &cells {
-        let caps = {
-            let builder = SecurityCapabilitiesBuilder::new(&profile.sid);
-            let builder = if cell.caps {
-                builder.with_known(&[KnownCapability::InternetClient])
-            } else {
-                builder
-            };
-            builder.build().expect("capabilities build")
-        };
-        let cwd = match cell.cwd {
-            "system32" => Some(PathBuf::from(&system32)),
-            "out" => Some(out.path().to_path_buf()),
-            _ => None,
-        };
-        for script in [
-            "whoami".to_string(),
-            format!("dir /b {}", out.path().display()),
-            format!("{} needle {}", staged.display(), haystack.display()),
-        ] {
-            let cmdline = if cell.argv0 {
-                format!("cmd.exe /C {script}")
-            } else {
-                format!(" /C {script}")
-            };
-            let options = LaunchOptions {
-                exe: PathBuf::from(&cmd),
-                cmdline: Some(cmdline),
-                cwd: cwd.clone(),
-                env: cell.env.then(|| heel_env.clone()),
-                stdio: cell.stdio,
-                suspended: false,
-                join_job: cell.job.then_some(JobLimits {
-                    memory_bytes: None,
-                    cpu_rate_percent: None,
-                    kill_on_job_close: true,
-                }),
-                startup_timeout: None,
-            };
-            run(
-                &format!("{} | {}", cell.label.trim(), script),
-                options,
-                &caps,
-            );
-        }
+    // The DACLs on both trees and on a system binary, read on the host.
+    let whoami_path = PathBuf::from(format!(r"{system32}\whoami.exe"));
+    let findstr_path = PathBuf::from(format!(r"{system32}\findstr.exe"));
+    for path in [
+        out_pkg.path(),
+        staged_pkg.as_path(),
+        out_aap.path(),
+        staged_aap.as_path(),
+        whoami_path.as_path(),
+        findstr_path.as_path(),
+    ] {
+        let output = std::process::Command::new(&icacls)
+            .arg(path)
+            .output()
+            .expect("the host reads a DACL");
+        dump.push_str(&format!(
+            "\n> host icacls {}\n{}\n",
+            path.display(),
+            String::from_utf8_lossy(&output.stdout)
+        ));
     }
 
     profile.delete().ok();
