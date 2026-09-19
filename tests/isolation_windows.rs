@@ -118,42 +118,96 @@ async fn exec_granted_sandbox(dir: &Path) -> Sandbox {
         .expect("sandbox starts")
 }
 
+/// Run `program` inside `sandbox` through the launch path, not through a
+/// shell: the host resolves and starts the program directly in the container.
+async fn probe(
+    sandbox: &Sandbox<impl heel::NetworkPolicy>,
+    program: &str,
+    args: &[&str],
+) -> Output {
+    let mut command = sandbox.command(program);
+    for arg in args {
+        command.arg(arg);
+    }
+    command.output().await.expect("the probe launches")
+}
+
 /// Dump the security state a denied spawn needs to be diagnosed from.
 ///
-/// The token's own group list answers which "everyone already" grants the
-/// container actually sees, and `icacls` shows whether the grant landed on the
-/// staged file and every directory above it. Reading the staged file proves
-/// the grant is on it at all, and running the system's own copy of the same
-/// program over the same data proves execution itself works where Windows
-/// pre-opens the path.
+/// `whoami /all` names every SID and capability the container token actually
+/// carries, which is what the ACEs get checked against; `icacls` shows whether
+/// the grant landed on the staged file and every directory above it, from both
+/// the container's and the host's view. The probes go through the launch path
+/// itself because a child spawned from inside the container is exactly what is
+/// under investigation, and the `cmd /C` probes keep the failing shape for
+/// comparison.
 async fn security_state(sandbox: &Sandbox<impl heel::NetworkPolicy>, staged: &Path) -> String {
     let haystack = staged.with_file_name("haystack.txt");
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    let whoami = format!(r"{system_root}\System32\whoami.exe");
+    let icacls = format!(r"{system_root}\System32\icacls.exe");
+    let findstr = format!(r"{system_root}\System32\findstr.exe");
+
     let mut dump = String::new();
-    let scripts = std::iter::once(format!("{SYS32}\\whoami.exe /all"))
-        .chain(
-            staged
-                .ancestors()
-                .map(|path| format!("{SYS32}\\icacls.exe {}", path.display())),
-        )
-        .chain([
-            format!("type {} > NUL && echo READABLE", staged.display()),
-            format!("dir /b {}", staged.parent().expect("a parent").display()),
-            format!("{SYS32}\\findstr.exe needle {}", haystack.display()),
-        ]);
+    let mut record = |label: String, output: &Output| {
+        dump.push_str(&format!(
+            "\n> {label}\nstdout: {}\nstderr: {}\n",
+            stdout(output),
+            stderr(output)
+        ));
+    };
+
+    // Programs the host launches straight into the container.
+    for (program, args) in [
+        (whoami.as_str(), vec!["/all"]),
+        (
+            staged.to_str().expect("the staged path is UTF-8"),
+            vec![
+                "needle",
+                haystack.to_str().expect("the haystack path is UTF-8"),
+            ],
+        ),
+        (
+            findstr.as_str(),
+            vec![
+                "needle",
+                haystack.to_str().expect("the haystack path is UTF-8"),
+            ],
+        ),
+    ] {
+        let output = probe(sandbox, program, &args).await;
+        record(format!("{program} {}", args.join(" ")), &output);
+    }
+    for ancestor in staged.ancestors() {
+        let target = ancestor.to_str().expect("the ancestor path is UTF-8");
+        let output = probe(sandbox, &icacls, &[target]).await;
+        record(format!("{icacls} {target}"), &output);
+    }
+
+    // The same paths opened through a shell inside the container: this is the
+    // shape the production failure takes.
+    let scripts = [
+        format!("{} needle {}", staged.display(), haystack.display()),
+        format!("type {}", staged.display()),
+        format!("dir /b {}", staged.parent().expect("a parent").display()),
+        format!("{} needle {}", findstr, haystack.display()),
+        "echo %USERNAME% %USERDOMAIN%".to_string(),
+    ];
     for script in scripts {
         let output = cmd(sandbox, &script).await;
-        dump.push_str(&format!(
-            "\n> {script}\nstdout: {}\nstderr: {}\n",
-            stdout(&output),
-            stderr(&output)
-        ));
+        record(script, &output);
+    }
+
+    // The same DACLs read on the host, where nothing can interfere.
+    for ancestor in staged.ancestors() {
+        let output = std::process::Command::new(&icacls)
+            .arg(ancestor)
+            .output()
+            .expect("the host reads a DACL");
+        record(format!("host {icacls} {}", ancestor.display()), &output);
     }
     dump
 }
-
-/// Where the diagnostic tools live, spelled out because the sandbox PATH does
-/// not name it.
-const SYS32: &str = "%SystemRoot%\\System32";
 
 #[tokio::test]
 async fn a_granted_directory_lets_the_container_run_staged_programs() {
