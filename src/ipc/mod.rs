@@ -62,5 +62,7 @@ pub use router::{CommandMeta, IpcRouter};
 pub use wrappers::{HEEL_DIR_NAME, SOCKET_NAME, WRAPPER_DIR_NAME};
 
 // Internal to the sandbox lifecycle, not part of the public surface.
+#[cfg(windows)]
+pub(crate) use endpoint::pipe_name;
 pub(crate) use server::IpcServer;
 pub(crate) use wrappers::{IpcLayout, socket_root};

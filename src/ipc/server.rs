@@ -170,7 +170,9 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-/// Named pipes are not filesystem objects, so there are no permissions to set.
+/// Named pipes are not filesystem objects, so there are no file permissions
+/// to set. The pipe's own access control list is opened to the sandbox's
+/// container once the server has bound it; see the Windows backend.
 #[cfg(not(unix))]
 fn restrict_socket_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
