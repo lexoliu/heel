@@ -119,7 +119,7 @@ pub(crate) fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Resul
             None,
             Some(&mut current),
             None,
-            &mut descriptor,
+            Some(&mut descriptor),
         )
     };
     if status.is_err() {
