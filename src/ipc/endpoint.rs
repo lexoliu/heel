@@ -27,20 +27,23 @@ pub(crate) fn name(path: &Path) -> io::Result<Name<'static>> {
 }
 
 /// Build the local socket name for `path`.
-///
-/// The last two path components are used, so the per-sandbox directory name
-/// that makes the socket unique is preserved in the pipe name.
 #[cfg(windows)]
 pub(crate) fn name(path: &Path) -> io::Result<Name<'static>> {
     use interprocess::local_socket::{GenericNamespaced, ToNsName};
 
-    let unique = path
-        .components()
+    pipe_name(path).to_ns_name::<GenericNamespaced>()
+}
+
+/// The name the pipe bound for `path` carries in `\\.\pipe\`.
+///
+/// The last two path components are used, so the per-sandbox directory name
+/// that makes the socket unique is preserved in the pipe name.
+#[cfg(windows)]
+pub(crate) fn pipe_name(path: &Path) -> String {
+    path.components()
         .rev()
         .take(2)
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
-        .join("-");
-
-    unique.to_ns_name::<GenericNamespaced>()
+        .join("-")
 }

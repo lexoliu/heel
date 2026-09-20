@@ -248,7 +248,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
         // The other transports reach it through the filesystem grants.
         #[cfg(windows)]
         if let Some(server) = &ipc_server {
-            backend.grant_ipc_endpoint(server.pipe_handle())?;
+            backend.grant_ipc_endpoint(server.socket_path())?;
         }
 
         match &proxy {

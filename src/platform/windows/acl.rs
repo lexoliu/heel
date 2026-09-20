@@ -14,11 +14,11 @@
 use std::io;
 use std::path::Path;
 
-use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-    GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
-    SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
     ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
@@ -97,69 +97,28 @@ pub(crate) fn grant_object(name: &str, sid: &str, access: u32) -> io::Result<()>
             access,
             applies_to: Scope::ThisOnly,
         }],
+        SE_FILE_OBJECT,
     )
 }
 
-/// Add `access` for `sid` to the kernel object `handle` refers to.
+/// Add `access` for `sid` to the named pipe `name` refers to.
 ///
-/// Some kernel objects — a named pipe is the case that needs this — have no
-/// name the security APIs accept, so the grant goes through a handle instead.
-/// The object itself is the only scope it has.
-pub(crate) fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
-    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    let mut current: *mut ACL = std::ptr::null_mut();
-
-    // SAFETY: the out-parameters are valid destinations.
-    let status = unsafe {
-        GetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut current),
-            None,
-            Some(&mut descriptor),
-        )
-    };
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot read the access control list of the kernel object: {status:?}"
-        )));
-    }
-    let _descriptor = LocalBuffer(descriptor.0);
-
-    let updated = merge(
-        sddl,
-        current,
+/// A pipe is a kernel object addressed as `\\.\pipe\name`, and the named
+/// security APIs open it requesting the access the edit needs — including
+/// `WRITE_DAC`. That last point decides the shape of the call: the handles
+/// the listener was built from are opened without `WRITE_DAC`, so a grant
+/// routed through one of them is always denied, while the name-based open
+/// requests the right itself. The pipe itself is the only scope it has.
+pub(crate) fn grant_pipe(name: &str, sid: &str, access: u32) -> io::Result<()> {
+    apply(
+        &format!("\\\\.\\pipe\\{name}"),
+        sid,
         &[Entry {
             access,
             applies_to: Scope::ThisOnly,
         }],
-        "the kernel object",
-    )?;
-
-    // SAFETY: `updated` is the list just built, valid while the guard lives.
-    let status = unsafe {
-        SetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(updated.0.cast()),
-            None,
-        )
-    };
-    drop(updated);
-
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot apply the access control list to the kernel object: {status:?}"
-        )));
-    }
-
-    Ok(())
+        SE_KERNEL_OBJECT,
+    )
 }
 
 /// Add `entries` for `sid` to the access control list of `path`.
@@ -176,7 +135,7 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()>
     let resolved = std::fs::canonicalize(path).map_err(|source| {
         io::Error::other(format!("cannot resolve {}: {source}", path.display()))
     })?;
-    apply(&resolved.to_string_lossy(), sid, entries)
+    apply(&resolved.to_string_lossy(), sid, entries, SE_FILE_OBJECT)
 }
 
 /// Merge `entries` for `sddl` into `current`, producing a new list.
@@ -221,9 +180,10 @@ fn merge(
 
 /// Add `entries` for `sid` to the object `name` refers to.
 ///
-/// `name` reaches the named security APIs as given: a filesystem path already
-/// spelled verbatim, or an object name such as a device path.
-fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
+/// `name` reaches the named security APIs as given — a filesystem path
+/// already spelled verbatim, or an object name such as a device or pipe —
+/// and `kind` tells the APIs how to open it.
+fn apply(name: &str, sddl: &str, entries: &[Entry], kind: SE_OBJECT_TYPE) -> io::Result<()> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
@@ -233,7 +193,7 @@ fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
     let status = unsafe {
         GetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
+            kind,
             DACL_SECURITY_INFORMATION,
             None,
             None,
@@ -255,7 +215,7 @@ fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
     let status = unsafe {
         SetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
+            kind,
             DACL_SECURITY_INFORMATION,
             None,
             None,
