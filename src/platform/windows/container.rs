@@ -164,6 +164,32 @@ impl Container {
         Ok(())
     }
 
+    /// Open the sandbox's IPC endpoint to this container.
+    ///
+    /// On Windows the endpoint is a named pipe — a kernel object with an
+    /// access control list of its own, which by default names nothing an
+    /// AppContainer token carries. The filesystem grants never reach it, so
+    /// the package SID has to be added on the pipe itself or every connect is
+    /// denied, which is the failure a capture wrapper meets the first time it
+    /// reports an artifact.
+    ///
+    /// `socket` is the path the endpoint was bound for; the pipe name is
+    /// derived from it the same way the server derives it.
+    pub(crate) fn grant_ipc_endpoint(&self, socket: &Path) -> Result<()> {
+        const PIPE_ACCESS: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
+
+        acl::grant_pipe(
+            &crate::ipc::pipe_name(socket),
+            self.sid().as_string(),
+            PIPE_ACCESS,
+        )
+        .map_err(|source| {
+            Error::InitFailed(format!(
+                "cannot open the IPC endpoint to the container: {source}"
+            ))
+        })
+    }
+
     /// Open the null device to this container.
     ///
     /// A process spawned with a null stdin opens `NUL`, which resolves to the

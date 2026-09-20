@@ -14,6 +14,7 @@ mod acl;
 mod child;
 mod container;
 
+use std::path::Path;
 use std::process::Output;
 
 use rappct::launch::{
@@ -87,6 +88,15 @@ impl WindowsBackend {
         let container = Container::create()?;
         container.grant_configured_paths(config)?;
         Ok(Self { container })
+    }
+
+    /// Open the sandbox's IPC endpoint to the container.
+    ///
+    /// The endpoint is a named pipe — a kernel object whose default access
+    /// control list names nothing an AppContainer token carries — so the pipe
+    /// bound for `socket` is granted once the server has bound it.
+    pub(crate) fn grant_ipc_endpoint(&self, socket: &Path) -> Result<()> {
+        self.container.grant_ipc_endpoint(socket)
     }
 
     /// Prepare everything one launch needs.
