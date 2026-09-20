@@ -19,6 +19,7 @@ use std::process::Output;
 use rappct::launch::{
     JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io, merge_parent_env,
 };
+use windows::Win32::Foundation::HANDLE;
 
 pub(crate) use child::AppContainerChild;
 use container::Container;
@@ -87,6 +88,16 @@ impl WindowsBackend {
         let container = Container::create()?;
         container.grant_configured_paths(config)?;
         Ok(Self { container })
+    }
+
+    /// Open the sandbox's IPC endpoint to the container.
+    ///
+    /// The endpoint is a named pipe — a kernel object whose default access
+    /// control list names nothing an AppContainer token carries — so it is
+    /// granted by handle once the server has bound it.
+    pub(crate) fn grant_ipc_endpoint(&self, handle: isize) -> Result<()> {
+        self.container
+            .grant_ipc_endpoint(HANDLE(handle as *mut core::ffi::c_void))
     }
 
     /// Prepare everything one launch needs.
