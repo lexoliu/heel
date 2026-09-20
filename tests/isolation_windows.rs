@@ -10,9 +10,13 @@
 #![cfg(target_os = "windows")]
 #![allow(clippy::unwrap_used)]
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use heel::ipc::{IpcCommand, IpcRouter, NoArgs};
 use heel::{Access, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 /// Run `script` with `cmd.exe` inside `sandbox`.
@@ -254,6 +258,68 @@ async fn a_staged_program_runs_when_spawned_by_full_path() {
         .await
         .expect("the staged program launches");
     assert_needle(&output);
+}
+
+/// A command that counts how often the sandbox called it.
+struct Probe {
+    calls: Arc<AtomicUsize>,
+}
+
+impl IpcCommand for Probe {
+    fn name(&self) -> Cow<'static, str> {
+        "probe".into()
+    }
+
+    type Args = NoArgs;
+    type Response = ();
+
+    async fn handle(&self, _args: NoArgs) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[tokio::test]
+async fn the_ipc_endpoint_reaches_the_host_from_inside_the_container() {
+    // On Windows the IPC endpoint is a named pipe — a kernel object with an
+    // access control list of its own, which names nothing an AppContainer
+    // token carries by default. A sandboxed process that cannot reach it —
+    // a capture wrapper reporting artifacts is the shape that hit this —
+    // meets "Access is denied" on its first call. The pipe has to be opened
+    // to the container the way the null device is.
+    //
+    // `heel ipc` is the real client, so this exercises the whole path:
+    // connecting to the pipe, the request, dispatch, and the response.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let config = SandboxConfigBuilder::default()
+        .heel_binary(env!("CARGO_BIN_EXE_heel"))
+        .ipc(IpcRouter::new().register(Probe {
+            calls: Arc::clone(&calls),
+        }))
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    let output = sandbox
+        .command(env!("CARGO_BIN_EXE_heel"))
+        .arg("ipc")
+        .arg("probe")
+        .output()
+        .await
+        .expect("heel ipc runs");
+
+    assert!(
+        output.status.success(),
+        "the container must reach the IPC endpoint: status={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "the handler must run once"
+    );
 }
 
 #[tokio::test]

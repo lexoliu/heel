@@ -14,10 +14,11 @@
 use std::io;
 use std::path::Path;
 
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
+    SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
     ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
@@ -99,6 +100,68 @@ pub(crate) fn grant_object(name: &str, sid: &str, access: u32) -> io::Result<()>
     )
 }
 
+/// Add `access` for `sid` to the kernel object `handle` refers to.
+///
+/// Some kernel objects — a named pipe is the case that needs this — have no
+/// name the security APIs accept, so the grant goes through a handle instead.
+/// The object itself is the only scope it has.
+pub(crate) fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let mut current: *mut ACL = std::ptr::null_mut();
+
+    // SAFETY: the out-parameters are valid destinations.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut current),
+            None,
+            &mut descriptor,
+        )
+    };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot read the access control list of the kernel object: {status:?}"
+        )));
+    }
+    let _descriptor = LocalBuffer(descriptor.0);
+
+    let updated = merge(
+        sddl,
+        current,
+        &[Entry {
+            access,
+            applies_to: Scope::ThisOnly,
+        }],
+        "the kernel object",
+    )?;
+
+    // SAFETY: `updated` is the list just built, valid while the guard lives.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(updated.0.cast()),
+            None,
+        )
+    };
+    drop(updated);
+
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot apply the access control list to the kernel object: {status:?}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Add `entries` for `sid` to the access control list of `path`.
 ///
 /// Existing entries are kept: the rule is added to what is already there rather
@@ -116,13 +179,17 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()>
     apply(&resolved.to_string_lossy(), sid, entries)
 }
 
-/// Add `entries` for `sid` to the object `name` refers to.
+/// Merge `entries` for `sddl` into `current`, producing a new list.
 ///
-/// `name` reaches the named security APIs as given: a filesystem path already
-/// spelled verbatim, or an object name such as a device path.
-fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
+/// The returned ACL is `LocalAlloc` memory the caller frees, and `object`
+/// names what is being edited for the error.
+fn merge(
+    sddl: &str,
+    current: *mut ACL,
+    entries: &[Entry],
+    object: &str,
+) -> io::Result<LocalBuffer> {
     let (_sid_buffer, sid) = parse_sid(sddl)?;
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
     let trustee = TRUSTEE_W {
         TrusteeForm: TRUSTEE_IS_SID,
@@ -140,6 +207,24 @@ fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
             Trustee: trustee,
         })
         .collect();
+
+    let mut updated: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `access` outlives the call and `current` is the caller's list.
+    let status = unsafe { SetEntriesInAclW(Some(&access), Some(current), &mut updated) };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot build the access control list for {object}: {status:?}"
+        )));
+    }
+    Ok(LocalBuffer(updated.cast()))
+}
+
+/// Add `entries` for `sid` to the object `name` refers to.
+///
+/// `name` reaches the named security APIs as given: a filesystem path already
+/// spelled verbatim, or an object name such as a device path.
+fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut current: *mut ACL = std::ptr::null_mut();
@@ -164,17 +249,9 @@ fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
     }
     let _descriptor = LocalBuffer(descriptor.0);
 
-    let mut updated: *mut ACL = std::ptr::null_mut();
-    // SAFETY: `access` outlives the call and `current` came from the call above.
-    let status = unsafe { SetEntriesInAclW(Some(&access), Some(current), &mut updated) };
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot build the access control list for {name}: {status:?}"
-        )));
-    }
-    let updated_buffer = LocalBuffer(updated.cast());
+    let updated = merge(sddl, current, entries, name)?;
 
-    // SAFETY: `updated` is the list just built, valid until the guard drops.
+    // SAFETY: `updated` is the list just built, valid while the guard lives.
     let status = unsafe {
         SetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
@@ -182,11 +259,11 @@ fn apply(name: &str, sddl: &str, entries: &[Entry]) -> io::Result<()> {
             DACL_SECURITY_INFORMATION,
             None,
             None,
-            Some(updated),
+            Some(updated.0.cast()),
             None,
         )
     };
-    drop(updated_buffer);
+    drop(updated);
 
     if status.is_err() {
         return Err(io::Error::other(format!(
