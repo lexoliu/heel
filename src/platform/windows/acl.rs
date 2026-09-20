@@ -12,17 +12,22 @@
 //! everything beneath it.
 
 use std::io;
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::Path;
 
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetEntriesInAclW,
+    SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
     ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
     OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, WRITE_DAC,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -103,22 +108,94 @@ pub(crate) fn grant_object(name: &str, sid: &str, access: u32) -> io::Result<()>
 
 /// Add `access` for `sid` to the named pipe `name` refers to.
 ///
-/// A pipe is a kernel object addressed as `\\.\pipe\name`, and the named
-/// security APIs open it requesting the access the edit needs — including
-/// `WRITE_DAC`. That last point decides the shape of the call: the handles
-/// the listener was built from are opened without `WRITE_DAC`, so a grant
-/// routed through one of them is always denied, while the name-based open
-/// requests the right itself. The pipe itself is the only scope it has.
+/// Neither usual route reaches the list: the object-name APIs reject pipe
+/// paths outright, and the handles the listener was built from were opened
+/// without `WRITE_DAC` — no call widens the rights of an existing handle.
+/// What does reach it is a client connection asking for `WRITE_DAC` itself,
+/// which the default list grants the pipe's owner. The server sees the
+/// connection come and go unanswered, which it already tolerates.
 pub(crate) fn grant_pipe(name: &str, sid: &str, access: u32) -> io::Result<()> {
-    apply(
-        &format!("\\\\.\\pipe\\{name}"),
-        sid,
+    let path = format!("\\\\.\\pipe\\{name}");
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | WRITE_DAC.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+    }
+    .map_err(|source| io::Error::other(format!("cannot open the named pipe {path}: {source}")))?;
+
+    // SAFETY: the handle came from the call above and is closed exactly once.
+    let _handle = unsafe { OwnedHandle::from_raw_handle(handle.0.cast()) };
+    grant_handle(handle, sid, access)
+}
+
+/// Add `access` for `sid` to the kernel object `handle` refers to.
+///
+/// The handle must already carry `WRITE_DAC`, which the caller arranges by
+/// how it opens the object. The object itself is the only scope it has.
+fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let mut current: *mut ACL = std::ptr::null_mut();
+
+    // SAFETY: the out-parameters are valid destinations.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut current),
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot read the access control list of the kernel object: {status:?}"
+        )));
+    }
+    let _descriptor = LocalBuffer(descriptor.0);
+
+    let updated = merge(
+        sddl,
+        current,
         &[Entry {
             access,
             applies_to: Scope::ThisOnly,
         }],
-        SE_KERNEL_OBJECT,
-    )
+        "the kernel object",
+    )?;
+
+    // SAFETY: `updated` is the list just built, valid while the guard lives.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(updated.0.cast()),
+            None,
+        )
+    };
+    drop(updated);
+
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot apply the access control list to the kernel object: {status:?}"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Add `entries` for `sid` to the access control list of `path`.
