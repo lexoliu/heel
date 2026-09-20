@@ -18,7 +18,7 @@ use rappct::net::LoopbackExemptionGuard;
 use rappct::profile::AppContainerProfile;
 use rappct::sid::AppContainerSid;
 
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
@@ -173,13 +173,17 @@ impl Container {
     /// denied, which is the failure a capture wrapper meets the first time it
     /// reports an artifact.
     ///
-    /// The pipe is a kernel object without a filesystem path, so the grant
-    /// goes through its handle rather than the object-name API the device
-    /// grant uses.
-    pub(crate) fn grant_ipc_endpoint(&self, handle: HANDLE) -> Result<()> {
+    /// `socket` is the path the endpoint was bound for; the pipe name is
+    /// derived from it the same way the server derives it.
+    pub(crate) fn grant_ipc_endpoint(&self, socket: &Path) -> Result<()> {
         const PIPE_ACCESS: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
 
-        acl::grant_handle(handle, self.sid().as_string(), PIPE_ACCESS).map_err(|source| {
+        acl::grant_pipe(
+            &crate::ipc::pipe_name(socket),
+            self.sid().as_string(),
+            PIPE_ACCESS,
+        )
+        .map_err(|source| {
             Error::InitFailed(format!(
                 "cannot open the IPC endpoint to the container: {source}"
             ))

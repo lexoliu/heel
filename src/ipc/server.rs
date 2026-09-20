@@ -27,17 +27,6 @@ use crate::ipc::endpoint;
 use crate::ipc::protocol::{IpcError, IpcRequest, IpcResponse, MAX_FRAME_BYTES};
 use crate::ipc::router::IpcRouter;
 
-/// The listener implementation the platform builds.
-///
-/// On Windows the concrete named-pipe listener is used rather than the
-/// dispatching enum, because the pipe's kernel-object handle has to be
-/// reachable so its access control list can be opened to the container.
-#[cfg(unix)]
-type ServerListener = interprocess::local_socket::Listener;
-/// The listener implementation the platform builds.
-#[cfg(windows)]
-type ServerListener = interprocess::os::windows::named_pipe::local_socket::Listener;
-
 /// Longest usable Unix socket path.
 ///
 /// `sockaddr_un::sun_path` is 104 bytes on macOS and 108 on Linux, including
@@ -51,12 +40,6 @@ const MAX_SOCKET_PATH_LEN: usize = 100;
 pub(crate) struct IpcServer {
     socket_path: PathBuf,
     shutdown: ShutdownSignal,
-    /// The pipe the endpoint listens on, kept so its access control list can
-    /// be opened to the container. The handle belongs to the listener the
-    /// accept thread owns; it stays valid for the server's lifetime and is
-    /// read only once, while the sandbox is being created.
-    #[cfg(windows)]
-    pipe_handle: isize,
 }
 
 impl IpcServer {
@@ -87,17 +70,8 @@ impl IpcServer {
 
         let listener = ListenerOptions::new()
             .name(endpoint::name(&socket_path)?)
-            .create_sync_as::<ServerListener>()?;
-        #[cfg(unix)]
+            .create_sync()?;
         restrict_socket_permissions(&socket_path)?;
-
-        // The handle is borrowed from the listener, which the accept thread
-        // takes ownership of below; the pipe object itself outlives it.
-        #[cfg(windows)]
-        let pipe_handle = {
-            use std::os::windows::io::AsRawHandle as _;
-            listener.inner().as_raw_handle() as isize
-        };
 
         let (shutdown, shutdown_rx) = ShutdownSignal::new();
         let router = Arc::new(router);
@@ -111,7 +85,7 @@ impl IpcServer {
         // this thread is not part of any runtime.
         std::thread::spawn(move || {
             loop {
-                match accept_stream(&listener) {
+                match listener.accept() {
                     Ok(stream) => {
                         // `stop` closes the channel and then connects once,
                         // purely to return this call. That connection carries no
@@ -150,23 +124,12 @@ impl IpcServer {
         Ok(Self {
             socket_path,
             shutdown,
-            #[cfg(windows)]
-            pipe_handle,
         })
     }
 
     /// The socket path sandboxed processes connect to.
     pub(crate) fn socket_path(&self) -> &Path {
         &self.socket_path
-    }
-
-    /// The pipe the endpoint listens on.
-    ///
-    /// The value is the listener's kernel handle, which the sandbox uses once
-    /// to open the pipe's access control list to the container.
-    #[cfg(windows)]
-    pub(crate) fn pipe_handle(&self) -> isize {
-        self.pipe_handle
     }
 
     /// Stop accepting new connections.
@@ -199,31 +162,20 @@ impl Drop for IpcServer {
     }
 }
 
-/// Accept one connection, uniform across the platform listener types.
-#[cfg(unix)]
-fn accept_stream(listener: &ServerListener) -> io::Result<Stream> {
-    listener.accept()
-}
-
-/// Accept one connection, uniform across the platform listener types.
-///
-/// The concrete pipe listener yields pipe streams; the transport speaks the
-/// dispatching `Stream` enum, so each accepted stream is converted.
-#[cfg(windows)]
-fn accept_stream(listener: &ServerListener) -> io::Result<Stream> {
-    listener.accept().map(Stream::from)
-}
-
 /// Restrict the socket to its owner.
-///
-/// A named pipe is a kernel object rather than a filesystem entry, so it has
-/// no mode to set — its access control list is opened to the container when
-/// the sandbox is created instead.
 #[cfg(unix)]
 fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Named pipes are not filesystem objects, so there are no file permissions
+/// to set. The pipe's own access control list is opened to the sandbox's
+/// container once the server has bound it; see the Windows backend.
+#[cfg(not(unix))]
+fn restrict_socket_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Read one length-prefixed frame, or `None` if the peer disconnected.
