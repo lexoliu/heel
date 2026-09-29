@@ -136,7 +136,7 @@ async fn a_writable_grant_lets_the_container_rename_and_remove_what_it_wrote() {
 
 #[tokio::test]
 async fn a_granted_directory_opens_children_deeper_than_max_path() {
-    // A granted tree is walked so its existing children can be ACL'd, and a
+    // A grant's entries propagate to its tree's existing children, and a
     // tree like a cargo registry can nest past MAX_PATH. The named security
     // APIs refuse such paths unless they are spelled verbatim, and `read_dir`
     // cannot list a directory that deep either, so the grant once failed on
@@ -167,7 +167,7 @@ async fn a_granted_directory_opens_children_deeper_than_max_path() {
 /// Stage a real program and a file for it to read into `dir`.
 ///
 /// The copy mirrors how callers stage tool directories: the file lands before
-/// the sandbox exists, so only the grant walk can have opened it.
+/// the sandbox exists, so only the grant's propagation can have opened it.
 fn stage_program(dir: &Path) -> (PathBuf, PathBuf) {
     let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
     let staged = dir.join("staged-findstr.exe");
@@ -193,7 +193,8 @@ async fn exec_granted_sandbox(dir: &Path) -> Sandbox {
 /// `Command::output`, whose stdin is `NUL`.
 ///
 /// The binary is staged alongside the target so the same grant covers both —
-/// the grant walk must see it, so it is built before the sandbox exists.
+/// the grant's propagation must reach it, so it is built before the sandbox
+/// exists.
 fn compile_runner(dir: &Path) -> PathBuf {
     compile_fixture(dir, "run_child", "run-child.exe")
 }
@@ -230,9 +231,9 @@ fn assert_needle(output: &Output) {
 async fn a_granted_directory_lets_the_container_run_staged_programs() {
     // A grant that allows execute must open the directory's programs to the
     // container exactly as much as the system's own. The binary is copied in
-    // before the sandbox exists — so only the grant walk can have opened it —
-    // and a process inside the container runs it afterwards, which is the
-    // shape a build tool spawning a staged wrapper takes.
+    // before the sandbox exists — so only the grant's propagation can have
+    // opened it — and a process inside the container runs it afterwards,
+    // which is the shape a build tool spawning a staged wrapper takes.
     let dir = tempfile::tempdir().expect("tempdir");
     stage_program(dir.path());
     compile_runner(dir.path());
@@ -338,4 +339,47 @@ async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_pro
     let sandbox = exec_granted_sandbox(dir.path()).await;
 
     assert_needle(&run_staged_from_inside(&sandbox, dir.path()).await);
+}
+
+#[tokio::test]
+async fn a_junction_inside_a_granted_directory_does_not_open_its_target() {
+    // A grant's entries propagate through the tree it names, and a junction
+    // planted in that tree must not carry them to wherever it points: the
+    // target lies outside the grant, so neither its own path nor the path
+    // through the junction may reach it.
+    let granted = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("tempdir");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "secret-value").expect("the host writes a secret");
+    let junction = granted.path().join("junction");
+    let created = std::process::Command::new("cmd.exe")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(&junction)
+        .arg(outside.path())
+        .output()
+        .expect("cmd runs");
+    assert!(
+        created.status.success(),
+        "mklink /J must create the junction: {}",
+        stderr(&created)
+    );
+
+    let config = SandboxConfigBuilder::default()
+        .readable(granted.path())
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    for path in [secret.clone(), junction.join("secret.txt")] {
+        let output = cmd(&sandbox, &format!("type {}", path.display())).await;
+        assert_ne!(
+            stdout(&output),
+            "secret-value",
+            "{} lies outside the grant and must stay closed",
+            path.display()
+        );
+    }
 }

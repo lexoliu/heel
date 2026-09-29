@@ -205,7 +205,7 @@ fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
 /// removed.
 ///
 /// The named security APIs reject object names deeper than `MAX_PATH` unless
-/// they are spelled verbatim, and a walked tree reaches children deeper than
+/// they are spelled verbatim, and a granted tree can itself sit deeper than
 /// that. Resolving the path first hands them the `\\?\` form they accept at
 /// any depth, while the errors keep naming the path the caller asked for.
 pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()> {
