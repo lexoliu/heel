@@ -498,6 +498,8 @@ mod tests {
 
     #[test]
     fn working_directory_is_removed_on_drop() {
+        // A failed removal is only reported as a trace from `Drop`.
+        show_backend_diagnostics();
         smol::block_on(async {
             let sandbox = Sandbox::new().await.unwrap();
             let working_dir = sandbox.working_dir().to_path_buf();

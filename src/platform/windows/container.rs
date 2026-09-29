@@ -254,13 +254,8 @@ impl Container {
             if ancestor.parent().is_none() || in_system_directory(ancestor) {
                 continue;
             }
-            self.grant(
-                ancestor,
-                &[Entry {
-                    access: TRAVERSE,
-                    applies_to: Scope::ThisOnly,
-                }],
-            )?;
+            acl::grant_this_only(ancestor, self.sid().as_string(), TRAVERSE)
+                .map_err(|source| Error::path(ancestor, source))?;
         }
         Ok(())
     }
