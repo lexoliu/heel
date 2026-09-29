@@ -6,8 +6,11 @@ permissions:
   id-token: write
 
 on:
+  # Topic branches are tested through their pull request. A push trigger on
+  # every branch ran the whole workflow a second time for each commit of an
+  # open pull request, so pushes run it only where no pull request does.
   push:
-    branches: ["**"]
+    branches: [dev, main]
   pull_request:
     branches: ["**"]
   # A push whose webhook is dropped -- during a GitHub incident, say -- leaves a
