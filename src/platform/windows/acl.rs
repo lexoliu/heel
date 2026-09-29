@@ -22,13 +22,16 @@ use windows::Win32::Security::Authorization::{
     SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
-    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+    ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+    INHERIT_ONLY_ACE, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL,
+    SetFileSecurityW, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING, WRITE_DAC,
 };
+use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows::core::{PCWSTR, PWSTR};
 
 /// What one entry grants, and to what it applies.
@@ -205,7 +208,7 @@ fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
 /// removed.
 ///
 /// The named security APIs reject object names deeper than `MAX_PATH` unless
-/// they are spelled verbatim, and a walked tree reaches children deeper than
+/// they are spelled verbatim, and a granted tree can itself sit deeper than
 /// that. Resolving the path first hands them the `\\?\` form they accept at
 /// any depth, while the errors keep naming the path the caller asked for.
 pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()> {
@@ -213,6 +216,94 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()>
         io::Error::other(format!("cannot resolve {}: {source}", path.display()))
     })?;
     apply(&resolved.to_string_lossy(), sid, entries, SE_FILE_OBJECT)
+}
+
+/// Add `access` for `sid` to the object at `path` alone, without touching
+/// anything beneath it.
+///
+/// `SetNamedSecurityInfoW` recomputes inheritance through the whole tree
+/// below a directory whenever it writes the directory's list, whether or not
+/// the entries it adds are inheritable. A traverse grant on an ancestor such
+/// as the user profile therefore walked the entire profile, once per grant
+/// and per sandbox, holding handles on whatever it passed. An entry that
+/// applies to the object alone changes nothing a child inherits, so it is
+/// stored with `SetFileSecurityW`, which writes the object's own descriptor
+/// and propagates nothing. The list keeps its protected and auto-inherited
+/// bits, so how it relates to its parent is unchanged.
+pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result<()> {
+    let resolved = std::fs::canonicalize(path).map_err(|source| {
+        io::Error::other(format!("cannot resolve {}: {source}", path.display()))
+    })?;
+    let name = resolved.to_string_lossy();
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let mut current: *mut ACL = std::ptr::null_mut();
+
+    // SAFETY: the path is NUL-terminated and the out-parameters are valid.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut current),
+            None,
+            &mut descriptor,
+        )
+    };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot read the access control list of {name}: {status:?}"
+        )));
+    }
+    let _descriptor = LocalBuffer(descriptor.0);
+
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: `descriptor` is the descriptor just read, alive while its guard
+    // lives, and the out-parameters are valid.
+    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.map_err(
+        |source| io::Error::other(format!("cannot read the descriptor of {name}: {source}")),
+    )?;
+
+    let updated = merge(
+        sid,
+        current,
+        &[Entry {
+            access,
+            applies_to: Scope::ThisOnly,
+        }],
+        &name,
+    )?;
+
+    let mut absolute = SECURITY_DESCRIPTOR::default();
+    let written = PSECURITY_DESCRIPTOR((&raw mut absolute).cast());
+    let inheritance = SECURITY_DESCRIPTOR_CONTROL(SE_DACL_PROTECTED.0 | SE_DACL_AUTO_INHERITED.0);
+    // SAFETY: `absolute` outlives every call below, and `updated` — which it
+    // points at once the list is set — outlives the write.
+    let status = unsafe {
+        InitializeSecurityDescriptor(written, SECURITY_DESCRIPTOR_REVISION)
+            .and_then(|()| SetSecurityDescriptorDacl(written, true, Some(updated.0.cast()), false))
+            .and_then(|()| {
+                SetSecurityDescriptorControl(
+                    written,
+                    inheritance,
+                    SECURITY_DESCRIPTOR_CONTROL(control & inheritance.0),
+                )
+            })
+            .and_then(|()| {
+                SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, written).ok()
+            })
+    };
+    drop(updated);
+
+    status.map_err(|source| {
+        io::Error::other(format!(
+            "cannot apply the access control list to {name}: {source}"
+        ))
+    })
 }
 
 /// Merge `entries` for `sddl` into `current`, producing a new list.

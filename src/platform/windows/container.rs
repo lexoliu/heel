@@ -10,7 +10,6 @@
 //! deny-all policy needs. A filtering policy is enforced by the proxy instead,
 //! and reaching the proxy needs the loopback exemption below.
 
-use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 
 use rappct::capability::{SecurityCapabilities, SecurityCapabilitiesBuilder};
@@ -20,8 +19,8 @@ use rappct::sid::AppContainerSid;
 
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
+    DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_TRAVERSE,
 };
 
 use super::acl::{self, Entry, Scope};
@@ -224,20 +223,18 @@ impl Container {
     /// entry's traverse bit means "run" on a file, so handing it the
     /// directory mask would make every readable file executable. A directory
     /// takes both entries — the directory entry applies to it as well, which
-    /// is what lets the container enter it — and then the tree already
-    /// beneath it is walked, because Windows inheritance is not retroactive:
-    /// an inheritable entry only reaches children created after it exists.
-    /// Without the walk a granted directory would open itself and nothing in
-    /// it, which is not what a grant means on the other backends.
+    /// is what lets the container enter it.
+    ///
+    /// One call covers the whole tree. `SetNamedSecurityInfoW` propagates a
+    /// directory's inheritable entries to every child that already exists,
+    /// and children created later inherit them on creation, so the tree is
+    /// written once by the system. Walking it and granting each child again
+    /// re-propagated every subtree once per directory above it — a
+    /// toolchain tree cost minutes per sandbox.
     fn grant_path(&self, path: &Path, access: Access) -> Result<()> {
         let entries = access_tree(access);
         if path.is_dir() {
-            self.grant(path, &entries)?;
-            // The walk starts from the resolved path: `read_dir` is under the
-            // same `MAX_PATH` ceiling as the ACL calls, and children joined
-            // under the verbatim `\\?\` root stay listable at any depth.
-            let dir = std::fs::canonicalize(path).map_err(|source| Error::path(path, source))?;
-            self.grant_existing_children(&dir, &entries)
+            self.grant(path, &entries)
         } else {
             self.grant(
                 path,
@@ -249,45 +246,6 @@ impl Container {
         }
     }
 
-    /// Apply a grant's entries to every child already beneath `dir`.
-    ///
-    /// Directories get both entries — opening them, and covering children the
-    /// container creates there later — and are walked for what they already
-    /// hold; files get the file entry on themselves alone.
-    ///
-    /// Reparse points are skipped rather than followed: setting an ACL on a
-    /// junction or symlink lands the entry on its target, which would open a
-    /// tree outside the grant to wherever the host could already reach.
-    ///
-    /// `dir` arrives resolved rather than as configured: `read_dir` cannot
-    /// list a directory whose own path is deeper than `MAX_PATH`, and the
-    /// children it hands back stay under the `\\?\` prefix at any depth.
-    fn grant_existing_children(&self, dir: &Path, entries: &[Entry; 2]) -> Result<()> {
-        for child in std::fs::read_dir(dir).map_err(|source| Error::path(dir, source))? {
-            let child = child.map_err(|source| Error::path(dir, source))?;
-            let path = child.path();
-            let metadata = child
-                .metadata()
-                .map_err(|source| Error::path(path.clone(), source))?;
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-                continue;
-            }
-            if metadata.is_dir() {
-                self.grant(&path, entries)?;
-                self.grant_existing_children(&path, entries)?;
-            } else {
-                self.grant(
-                    &path,
-                    &[Entry {
-                        access: entries[1].access,
-                        applies_to: Scope::ThisOnly,
-                    }],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     /// Grant traverse on every directory above `path`.
     fn grant_ancestors(&self, path: &Path) -> Result<()> {
         for ancestor in path.ancestors().skip(1) {
@@ -296,13 +254,8 @@ impl Container {
             if ancestor.parent().is_none() || in_system_directory(ancestor) {
                 continue;
             }
-            self.grant(
-                ancestor,
-                &[Entry {
-                    access: TRAVERSE,
-                    applies_to: Scope::ThisOnly,
-                }],
-            )?;
+            acl::grant_this_only(ancestor, self.sid().as_string(), TRAVERSE)
+                .map_err(|source| Error::path(ancestor, source))?;
         }
         Ok(())
     }

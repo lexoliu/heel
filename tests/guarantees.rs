@@ -184,8 +184,7 @@ async fn the_working_directory_is_readable_and_writable() {
 async fn a_granted_directory_opens_the_tree_already_in_it() {
     // A grant names a tree, not its future contents: a file staged before the
     // sandbox exists is inside the grant exactly as much as one written
-    // after. Windows once opened the directory and nothing in it, because
-    // ACL inheritance only reaches children created after the entry does.
+    // after.
     let dir = tempfile::tempdir().expect("tempdir");
     let nested = dir.path().join("nested");
     std::fs::create_dir(&nested).expect("creates");

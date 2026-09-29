@@ -124,7 +124,10 @@ rappct = { version = "0.13.3", features = ["net", "tracing"] }
 # of the `windows` crate is a different type from the same handle in another.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
