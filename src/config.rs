@@ -590,8 +590,10 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
 
     /// Lower the scheduling priority of sandboxed processes.
     ///
-    /// The priority covers the sandboxed process and everything it spawns. The
-    /// default lowers nothing, which is also what keeps the faster
+    /// A nice level is relative to this process, as `nice -n` is: the sandbox
+    /// runs that many steps below its host, capped at the kernel's lowest
+    /// priority. The priority covers the sandboxed process and everything it
+    /// spawns. The default lowers nothing, which is also what keeps the faster
     /// `posix_spawn` path available when no resource limit is set either.
     pub fn priority(mut self, priority: ProcessPriority) -> Self {
         self.data.priority = priority;

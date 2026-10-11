@@ -118,33 +118,27 @@ fn own_nice() -> i32 {
     unsafe { libc::getpriority(libc::PRIO_PROCESS as _, 0) }
 }
 
-/// A nice level `steps` below where this process already is.
-///
-/// A sandbox can only lower priority, and the process running the tests may
-/// itself be niced — an agent shell and a batch scheduler both do it — so the
-/// level under test is picked relative to the host rather than assumed to
-/// start from zero.
-fn lower_than_own(steps: u8) -> NiceLevel {
-    let own = u8::try_from(own_nice().max(0)).expect("a nice value is small");
-    NiceLevel::new(own.saturating_add(steps).clamp(1, NiceLevel::HIGHEST.get()))
-        .expect("the level is clamped into range")
+/// Where a sandbox configured with `level` lands, given this process's own
+/// priority: that many steps below it, but no further than the bottom.
+fn expected_nice(level: NiceLevel) -> i32 {
+    (own_nice() + i32::from(level.get())).min(i32::from(NiceLevel::HIGHEST.get()))
 }
 
 #[tokio::test]
 async fn a_lowered_priority_reaches_a_grandchild() {
-    let level = lower_than_own(3);
+    let level = NiceLevel::new(3).unwrap();
     let observed = observe(ProcessPriority::new(
         CpuPriority::Nice(level),
         IoPriority::Utility,
     ))
     .await;
 
-    // `setpriority` takes an absolute value, so the grandchild ends up at
-    // exactly the level configured rather than three steps below itself.
+    // The level is relative, so the grandchild sits three steps below the
+    // process that configured the sandbox — wherever that process itself runs.
     assert_eq!(
         observed,
         Observed {
-            nice: i32::from(level.get()),
+            nice: expected_nice(level),
             io: UTILITY_POLICY,
         }
     );
@@ -158,10 +152,12 @@ async fn the_background_policy_reaches_a_grandchild() {
     ))
     .await;
 
+    // The largest reduction cannot overshoot the bottom, whether the host it
+    // steps down from is at the default or already niced.
     assert_eq!(
         observed,
         Observed {
-            nice: i32::from(NiceLevel::HIGHEST.get()),
+            nice: expected_nice(NiceLevel::HIGHEST),
             io: BACKGROUND_POLICY,
         }
     );

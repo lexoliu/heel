@@ -94,7 +94,7 @@ impl LinuxBackend {
         let ruleset = landlock_rules::build_ruleset(request.config, request.proxy_port)?;
         let allow_tcp = request.proxy_port.is_some() || request.config.ipc_socket().is_some();
         let filter = seccomp_filter::build_filter(allow_tcp)?;
-        let setup = PreExecSetup::new(request.config);
+        let setup = PreExecSetup::new(request.config)?;
 
         let mut cmd = Command::new(request.program);
         cmd.args(request.args);

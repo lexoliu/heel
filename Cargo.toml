@@ -97,6 +97,9 @@ dunce = "1.0.5"
 # Unix process management
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# `getpriority` reports failure through errno, and -1 is also a valid nice
+# value, so the call needs errno cleared and read rather than guessed at.
+errno = "0.3"
 
 # PTY support for interactive shells
 [target.'cfg(target_os = "macos")'.dependencies]

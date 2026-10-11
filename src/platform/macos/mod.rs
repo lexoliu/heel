@@ -87,7 +87,7 @@ impl MacOSBackend {
         // The hook runs before `sandbox-exec` is executed, so the limits and
         // the priority cover the launcher, the sandboxed program and every
         // descendant either creates.
-        let setup = PreExecSetup::new(request.config);
+        let setup = PreExecSetup::new(request.config)?;
         if !setup.is_empty() {
             // SAFETY: the closure only issues `setrlimit`, `setpriority` and
             // `setiopolicy_np`, which are async-signal-safe and
