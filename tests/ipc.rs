@@ -104,6 +104,57 @@ fn stderr(output: &std::process::Output) -> String {
 }
 
 #[tokio::test]
+async fn explicit_path_preserves_ipc_and_caller_entries() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sandbox = sandbox_with(IpcRouter::new().register(Echo {
+        calls: Arc::clone(&calls),
+    }))
+    .await;
+    let custom = std::path::PathBuf::from("/opt/managed tools");
+    let base = std::env::join_paths(
+        std::iter::once(custom).chain(std::env::split_paths(heel::DEFAULT_SANDBOX_PATH)),
+    )
+    .expect("caller PATH is valid");
+    let base = base.to_str().expect("caller PATH is UTF-8");
+    let output = sandbox
+        .command("/bin/sh")
+        .args(["-c", "echo-args alpha beta && printf '%s' \"$PATH\""])
+        .env("PATH", "/discarded/path")
+        .env("PATH", base)
+        .output()
+        .await
+        .expect("shell runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let rendered = stdout(&output);
+    let (response, effective_path) = rendered.split_once('\n').expect("handler and PATH output");
+    assert_eq!(response, "first=alpha second=beta flag=false piped=");
+    let entries: Vec<_> = std::env::split_paths(effective_path).collect();
+    assert_eq!(
+        &entries[1..],
+        std::env::split_paths(base).collect::<Vec<_>>()
+    );
+    assert!(!effective_path.contains("/discarded/path"));
+}
+
+#[tokio::test]
+async fn empty_explicit_path_keeps_ipc_callable() {
+    let sandbox = sandbox_with(IpcRouter::new().register(Structured)).await;
+    let output = sandbox
+        .command("/bin/sh")
+        .args(["-c", "structured"])
+        .env("PATH", "")
+        .output()
+        .await
+        .expect("shell runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).split_whitespace().collect::<String>(),
+        "[1,2,3]"
+    );
+}
+
+#[tokio::test]
 async fn positional_arguments_reach_the_host_handler() {
     let calls = Arc::new(AtomicUsize::new(0));
     let sandbox = sandbox_with(IpcRouter::new().register(Echo {
