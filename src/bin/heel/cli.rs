@@ -233,9 +233,10 @@ pub struct CommonArgs {
     #[arg(long)]
     pub max_processes: Option<u64>,
 
-    /// Run the sandbox at a lower CPU priority: a nice value from 1 to 19.
+    /// Run the sandbox 1 to 19 steps below this process's CPU priority.
     ///
-    /// A sandbox can only lower its priority, so 0 and negative values are
+    /// Relative, like `nice -n`, and capped at the kernel's lowest priority. A
+    /// sandbox can only lower its priority, so 0 and negative values are
     /// rejected rather than silently ignored.
     #[arg(long)]
     pub nice: Option<u8>,

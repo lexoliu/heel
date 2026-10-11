@@ -1,36 +1,45 @@
 //! Scheduling priority for sandboxed processes.
 //!
-//! A sandbox may only lower the priority of what it runs. That is what the
-//! types here express: there is no value that raises a process above the
-//! default, so a host that runs heavy commands next to latency-sensitive work
-//! can keep them out of the way without being able to do the opposite.
+//! A sandbox may only lower the priority of what it runs, and it lowers it
+//! relative to its host: a level of 5 means five steps below whatever the
+//! spawning process already runs at, like `nice -n 5`. That is what the types
+//! here express — there is no value that raises a process — so a host that
+//! runs heavy commands next to latency-sensitive work can keep them out of the
+//! way, and a host that is itself already niced stays above what it spawns.
 //!
 //! The priority is applied to the sandboxed process itself, so everything it
 //! spawns inherits it.
 
 use std::fmt;
 
-/// The lowest nice value a sandbox may ask for.
+/// The smallest reduction a sandbox may ask for.
 ///
-/// Zero is the default priority and negative values raise it, so neither is a
-/// nice level a sandbox can express.
+/// Zero would leave the priority where it is and a negative step would raise
+/// it, so neither is a nice level a sandbox can express.
 const MIN_NICE: u8 = 1;
 
-/// The highest nice value the kernel accepts.
+/// The largest reduction, which is also the kernel's lowest priority.
 const MAX_NICE: u8 = 19;
 
-/// A nice value a sandbox may apply: `1..=19`, where larger is lower priority.
+/// How many steps below its host a sandbox runs: `1..=19`, larger being lower.
+///
+/// The level is relative, as `nice -n` is: a sandbox configured with 5 runs
+/// five steps below the process that spawned it, and 19 puts it at the lowest
+/// priority the kernel has. A host already nicer than that leaves the sandbox
+/// at the bottom alongside it rather than failing, since there is nowhere
+/// further down to go.
 ///
 /// The range is part of the type, so a backend never has to check it: a value
-/// that exists is a value the kernel will accept.
+/// that exists is a reduction the kernel will accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NiceLevel(u8);
 
 impl NiceLevel {
-    /// The gentlest reduction, one step below the default priority.
+    /// The gentlest reduction, one step below the host.
     pub const LOWEST: Self = Self(MIN_NICE);
 
-    /// The largest reduction the kernel accepts.
+    /// The largest reduction, which reaches the kernel's lowest priority from
+    /// any host.
     pub const HIGHEST: Self = Self(MAX_NICE);
 
     /// Create a nice level.
@@ -45,7 +54,7 @@ impl NiceLevel {
         Ok(Self(level))
     }
 
-    /// The nice value, as the kernel takes it.
+    /// The number of steps, as the configuration gave it.
     #[must_use]
     pub const fn get(self) -> u8 {
         self.0
@@ -80,11 +89,14 @@ pub struct InvalidNiceLevel {
 /// How much CPU time a sandboxed process competes for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CpuPriority {
-    /// The priority the process would have had anyway.
+    /// The priority the process would have had anyway: its host's.
     #[default]
     Normal,
 
-    /// Run at a lower priority than everything at the default.
+    /// Run the given number of steps below the host, as `nice -n` does.
+    ///
+    /// The reduction is capped at the kernel's lowest priority, so a host that
+    /// is already there keeps the sandbox beside it.
     Nice(NiceLevel),
 }
 
@@ -103,6 +115,9 @@ pub enum IoPriority {
 }
 
 /// The scheduling priority of a sandboxed process and its descendants.
+///
+/// Both halves are relative to the host: the CPU level counts steps below the
+/// spawning process, and the I/O policy yields to whatever else is running.
 ///
 /// The default leaves both the CPU and the I/O priority untouched, which is
 /// also what keeps the faster `posix_spawn` path available when no other
@@ -126,7 +141,7 @@ pub struct ProcessPriority {
 }
 
 impl ProcessPriority {
-    /// Lower the CPU and the I/O priority together.
+    /// Lower the CPU and the I/O priority together, relative to the host.
     #[must_use]
     pub const fn new(cpu: CpuPriority, io: IoPriority) -> Self {
         Self { cpu, io }

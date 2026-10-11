@@ -52,7 +52,9 @@ pub struct LimitsSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct PrioritySection {
+    /// Steps below the invoking process's CPU priority, from 1 to 19.
     pub nice: Option<u8>,
+    /// Disk I/O priority: `normal`, `utility` or `background`.
     pub io: Option<IoPriorityArg>,
 }
 
@@ -300,9 +302,9 @@ fn merge_limits(file: &LimitsSection, cli: &CommonArgs) -> ResourceLimits {
 
 /// Combine the file's scheduling priority with the command line's.
 ///
-/// A nice level outside `1..=19` is rejected here rather than clamped: a
-/// sandbox can only lower its priority, so a value that does not is a mistake
-/// about what the setting does.
+/// A nice level outside `1..=19` is rejected here rather than clamped: the
+/// level counts steps below the invoking process, so a value that steps
+/// nowhere or upwards is a mistake about what the setting does.
 fn merge_priority(file: &PrioritySection, cli: &CommonArgs) -> CliResult<ProcessPriority> {
     let cpu = match cli.nice.or(file.nice) {
         Some(level) => CpuPriority::Nice(NiceLevel::new(level)?),

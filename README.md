@@ -27,7 +27,7 @@ Heel is designed for running LLM-generated code in a secure environment. It is n
 - **Network access goes through a policy.** Under the default `DenyAll` no proxy exists and the kernel refuses outbound connections; any other policy routes every connection through a local proxy that applies the policy per request.
 - **Reads are opt-in above a baseline.** Every path outside the working directory is granted explicitly, as a path plus the `Access` the sandbox has to it, and an explicit grant always beats a default protection.
 - **Resource limits apply to the whole process tree**, installed with `setrlimit` between fork and exec on Unix, and carried by a job object on Windows.
-- **Scheduling priority can only go down.** `--nice 1..19` and `--io-priority utility|background` lower what the sandbox competes for, inherited by everything it spawns: `setpriority` plus `setiopolicy_np` on macOS, `setpriority` plus `ioprio_set` on Linux, and the job object's priority class on Windows, which has no documented way to lower another process's I/O priority.
+- **Scheduling priority can only go down.** `--nice 1..19` lowers the sandbox by that many steps relative to the host, like `nice -n`, capped at the kernel's lowest priority, and `--io-priority utility|background` makes it yield disk bandwidth; both are inherited by everything it spawns. The mechanism is `setpriority` plus `setiopolicy_np` on macOS, `setpriority` plus `ioprio_set` on Linux, and the job object's priority class on Windows, where the class is already defined against normal and there is no documented way to lower another process's I/O priority.
 
 ### Isolation levels
 

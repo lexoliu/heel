@@ -4,13 +4,15 @@
 //! it forks and before it execs, so they cover the sandboxed process and every
 //! descendant it creates. Both are flattened into plain integers beforehand:
 //! the post-fork path is allowed to issue syscalls and nothing else, so it must
-//! not allocate, lock, or read a configuration.
+//! not allocate, lock, or read a configuration. The host's own nice value is
+//! read there too: a configured level is a reduction relative to it, while
+//! `setpriority` takes an absolute target.
 
 use std::io;
 
 use crate::config::SandboxConfigData;
 use crate::platform::rlimit::PreparedLimits;
-use crate::priority::{CpuPriority, IoPriority, ProcessPriority};
+use crate::priority::{CpuPriority, IoPriority, NiceLevel, ProcessPriority};
 
 /// Everything one `pre_exec` hook installs, prepared before the fork.
 #[derive(Debug)]
@@ -21,11 +23,16 @@ pub(crate) struct PreExecSetup {
 
 impl PreExecSetup {
     /// Flatten a configuration into the syscalls to issue after forking.
-    pub(crate) fn new(config: &SandboxConfigData) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host's own scheduling priority cannot be read,
+    /// since the sandbox's is expressed relative to it.
+    pub(crate) fn new(config: &SandboxConfigData) -> io::Result<Self> {
+        Ok(Self {
             limits: PreparedLimits::new(config.limits()),
-            priority: PreparedPriority::new(config.priority()),
-        }
+            priority: PreparedPriority::new(config.priority())?,
+        })
     }
 
     /// Whether there is nothing to install.
@@ -61,16 +68,21 @@ struct PreparedPriority {
 
 impl PreparedPriority {
     /// Flatten a configured priority.
-    fn new(priority: ProcessPriority) -> Self {
+    ///
+    /// A nice level is a reduction relative to the host, but `setpriority`
+    /// takes an absolute value, so the host's own level is read here — before
+    /// the fork, where reading a value is still allowed — and the absolute
+    /// target computed from it.
+    fn new(priority: ProcessPriority) -> io::Result<Self> {
         let nice = match priority.cpu() {
             CpuPriority::Normal => None,
-            CpuPriority::Nice(level) => Some(libc::c_int::from(level.get())),
+            CpuPriority::Nice(level) => Some(lowered_nice(current_nice()?, level)),
         };
 
-        Self {
+        Ok(Self {
             nice,
             io_policy: io_policy(priority.io()),
-        }
+        })
     }
 
     /// Whether neither half was lowered; see [`PreExecSetup::is_empty`].
@@ -96,6 +108,33 @@ impl PreparedPriority {
 
         Ok(())
     }
+}
+
+/// The nice value the calling process currently runs at.
+///
+/// `getpriority` returns -1 both for a process at nice -1 and for a failure,
+/// which is why errno is cleared first and consulted after.
+fn current_nice() -> io::Result<libc::c_int> {
+    errno::set_errno(errno::Errno(0));
+
+    // SAFETY: reads the calling process's own nice value.
+    let current = unsafe { libc::getpriority(libc::PRIO_PROCESS as _, 0) };
+    if current == -1 && errno::errno().0 != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(current)
+}
+
+/// Where `level` steps below `current` lands.
+///
+/// The kernel's lowest priority is the ceiling: asking to go further down than
+/// it allows leaves the process at the bottom rather than failing, which is
+/// what "lower than the host" means for a host that is already there.
+fn lowered_nice(current: libc::c_int, level: NiceLevel) -> libc::c_int {
+    current
+        .saturating_add(libc::c_int::from(level.get()))
+        .min(libc::c_int::from(NiceLevel::HIGHEST.get()))
 }
 
 /// macOS I/O policies, from `<sys/resource.h>`.
@@ -243,7 +282,8 @@ mod tests {
     fn a_default_configuration_installs_nothing() {
         // The `posix_spawn` fast path depends on this: a hook that applies
         // nothing still costs a fork.
-        assert!(PreExecSetup::new(&config(|builder| builder.build())).is_empty());
+        let setup = PreExecSetup::new(&config(|builder| builder.build())).unwrap();
+        assert!(setup.is_empty());
     }
 
     #[cfg(target_os = "macos")]
@@ -254,7 +294,7 @@ mod tests {
                 .limits(ResourceLimits::builder().max_processes(8).build())
                 .build()
         });
-        assert!(!PreExecSetup::new(&limited).is_empty());
+        assert!(!PreExecSetup::new(&limited).unwrap().is_empty());
 
         let niced = config(|builder| {
             builder
@@ -264,7 +304,7 @@ mod tests {
                 ))
                 .build()
         });
-        assert!(!PreExecSetup::new(&niced).is_empty());
+        assert!(!PreExecSetup::new(&niced).unwrap().is_empty());
 
         let throttled = config(|builder| {
             builder
@@ -274,12 +314,12 @@ mod tests {
                 ))
                 .build()
         });
-        assert!(!PreExecSetup::new(&throttled).is_empty());
+        assert!(!PreExecSetup::new(&throttled).unwrap().is_empty());
     }
 
     #[test]
     fn a_normal_priority_prepares_no_syscall() {
-        let prepared = PreparedPriority::new(ProcessPriority::default());
+        let prepared = PreparedPriority::new(ProcessPriority::default()).unwrap();
         assert_eq!(prepared.nice, None);
         assert_eq!(prepared.io_policy, None);
     }
@@ -289,10 +329,23 @@ mod tests {
         let prepared = PreparedPriority::new(ProcessPriority::new(
             CpuPriority::Nice(NiceLevel::new(7).unwrap()),
             IoPriority::Utility,
-        ));
+        ))
+        .unwrap();
 
-        assert_eq!(prepared.nice, Some(7));
+        // Seven steps below this process, wherever it happens to run.
+        let expected = (current_nice().unwrap() + 7).min(19);
+        assert_eq!(prepared.nice, Some(expected));
         assert!(prepared.io_policy.is_some());
+    }
+
+    #[test]
+    fn a_reduction_stops_at_the_lowest_priority() {
+        // A host that is already near the bottom cannot be stepped past it,
+        // and asking to is not an error: the sandbox lands beside its host.
+        assert_eq!(lowered_nice(15, NiceLevel::new(10).unwrap()), 19);
+        assert_eq!(lowered_nice(19, NiceLevel::LOWEST), 19);
+        assert_eq!(lowered_nice(0, NiceLevel::HIGHEST), 19);
+        assert_eq!(lowered_nice(-20, NiceLevel::new(5).unwrap()), -15);
     }
 
     #[test]
@@ -301,13 +354,14 @@ mod tests {
         // that may only issue syscalls, so the test takes the same path and
         // reads both values back from where they were set.
         //
-        // The largest level is the one every host can reach: raising priority
-        // is refused, and the process running the tests may itself be niced.
-        let expected_nice = libc::c_int::from(NiceLevel::HIGHEST.get());
+        // Any level works whatever the test harness runs at, because the
+        // target is computed from the harness's own nice value.
+        let expected_nice = (current_nice().unwrap() + 3).min(19);
         let prepared = PreparedPriority::new(ProcessPriority::new(
-            CpuPriority::Nice(NiceLevel::HIGHEST),
+            CpuPriority::Nice(NiceLevel::new(3).unwrap()),
             IoPriority::Utility,
-        ));
+        ))
+        .unwrap();
         let expected_io = prepared.io_policy.unwrap();
 
         // SAFETY: the child below issues syscalls and then `_exit`s, never

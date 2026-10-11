@@ -28,6 +28,10 @@ use crate::priority::{CpuPriority, IoPriority, ProcessPriority};
 /// Unix spreads the reduction over nineteen steps and Windows over two
 /// classes, so the range is split: the gentler half asks to lose only to
 /// ordinary work, the lower half to run on whatever is left.
+///
+/// The class is applied as it is, not relative to the launching process:
+/// Windows priority classes are already defined against the normal class, so
+/// below-normal and idle are below ordinary work whatever the host runs at.
 const IDLE_FROM_NICE: u8 = 15;
 
 /// The priority class a configured CPU priority asks for, if any.
