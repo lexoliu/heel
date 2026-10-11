@@ -258,8 +258,8 @@ const TEMP_DIR_VARS: &[&str] = &["TMPDIR"];
 /// Build the environment a sandboxed process starts with.
 ///
 /// The sandbox injects what a process needs to reach the facilities it is
-/// allowed to use; `user_envs` is applied last, so an explicit setting always
-/// wins over an injected one. Shared by piped commands and interactive
+/// allowed to use; explicit settings win, except PATH retains the IPC shim
+/// directory ahead of the caller's entries. Shared by piped commands and interactive
 /// sessions, which must not drift apart in what they expose.
 pub(crate) fn sandbox_environment(
     config: &SandboxConfigData,
@@ -282,8 +282,6 @@ pub(crate) fn sandbox_environment(
         envs.insert((*key).to_string(), working_dir.clone());
     }
 
-    envs.insert("PATH".to_string(), sandbox_path(config, user_envs));
-
     if let Some(socket) = config.ipc_socket() {
         envs.insert(
             "HEEL_IPC_ENDPOINT".to_string(),
@@ -295,6 +293,7 @@ pub(crate) fn sandbox_environment(
         envs.insert(key.clone(), value.clone());
     }
 
+    envs.insert("PATH".to_string(), sandbox_path(config, user_envs));
     envs.into_iter().collect()
 }
 
