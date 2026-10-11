@@ -11,7 +11,7 @@ use blocking::unblock;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::child::unix::UnixChild;
-use crate::platform::rlimit::PreparedLimits;
+use crate::platform::preexec::PreExecSetup;
 use crate::platform::{Backend, Child, SpawnRequest};
 
 /// Lowest kernel version with Landlock ABI v4.
@@ -94,7 +94,7 @@ impl LinuxBackend {
         let ruleset = landlock_rules::build_ruleset(request.config, request.proxy_port)?;
         let allow_tcp = request.proxy_port.is_some() || request.config.ipc_socket().is_some();
         let filter = seccomp_filter::build_filter(allow_tcp)?;
-        let limits = PreparedLimits::new(request.config.limits());
+        let setup = PreExecSetup::new(request.config);
 
         let mut cmd = Command::new(request.program);
         cmd.args(request.args);
@@ -114,11 +114,14 @@ impl LinuxBackend {
         let mut filter = Some(filter);
 
         // SAFETY: the closure only applies pre-built rulesets and filters and
-        // installs resource limits, all of which are plain syscalls. Nothing
-        // here allocates or takes a lock, as `pre_exec` requires.
+        // installs resource limits and scheduling priority, all of which are
+        // plain syscalls. Nothing here allocates or takes a lock, as
+        // `pre_exec` requires.
         unsafe {
             cmd.pre_exec(move || {
-                limits.apply()?;
+                // Before Landlock and seccomp, so the limits and the priority
+                // are in place whatever the rest of the hook restricts.
+                setup.apply()?;
 
                 // Both values are consumed on first use; a second call would
                 // mean the command was spawned twice from one builder, which

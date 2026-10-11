@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::grant::{Access, Grant};
 use crate::ipc::IpcRouter;
 use crate::network::{DenyAll, NetworkPolicy};
+use crate::priority::ProcessPriority;
 use crate::security::SecurityConfig;
 use crate::workdir::generate_working_dir_name;
 
@@ -287,6 +288,7 @@ pub struct SandboxConfigData {
     writable_file_system: bool,
     env_passthrough: Vec<String>,
     limits: ResourceLimits,
+    priority: ProcessPriority,
     /// Path of the IPC socket, once the server is listening. `None` disables IPC.
     ipc_socket: Option<PathBuf>,
     /// Explicit path to the `heel` binary that IPC shims execute.
@@ -347,6 +349,11 @@ impl SandboxConfigData {
     /// Resource limits applied to sandboxed processes.
     pub fn limits(&self) -> &ResourceLimits {
         &self.limits
+    }
+
+    /// The scheduling priority sandboxed processes run at.
+    pub fn priority(&self) -> ProcessPriority {
+        self.priority
     }
 
     /// The IPC socket path, once the IPC server is listening.
@@ -462,6 +469,7 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 writable_file_system: false,
                 env_passthrough: Vec::new(),
                 limits: ResourceLimits::default(),
+                priority: ProcessPriority::default(),
                 ipc_socket: None,
                 heel_binary: None,
                 // Deny /dev/tty writes by default so all output is captured.
@@ -577,6 +585,16 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
     /// Apply resource limits to sandboxed processes.
     pub fn limits(mut self, limits: ResourceLimits) -> Self {
         self.data.limits = limits;
+        self
+    }
+
+    /// Lower the scheduling priority of sandboxed processes.
+    ///
+    /// The priority covers the sandboxed process and everything it spawns. The
+    /// default lowers nothing, which is also what keeps the faster
+    /// `posix_spawn` path available when no resource limit is set either.
+    pub fn priority(mut self, priority: ProcessPriority) -> Self {
+        self.data.priority = priority;
         self
     }
 

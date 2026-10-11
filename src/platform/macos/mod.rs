@@ -12,7 +12,7 @@ use blocking::unblock;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::child::unix::UnixChild;
-use crate::platform::rlimit::PreparedLimits;
+use crate::platform::preexec::PreExecSetup;
 use crate::platform::{Backend, Child, SpawnRequest};
 
 /// Absolute path to the system sandbox launcher.
@@ -82,13 +82,18 @@ impl MacOSBackend {
         }
 
         // Installing a `pre_exec` hook rules out the `posix_spawn` fast path,
-        // so it is only added when there is actually a limit to apply.
-        if !request.config.limits().is_empty() {
-            let limits = PreparedLimits::new(request.config.limits());
-            // SAFETY: the closure only issues `setrlimit`, which is
-            // async-signal-safe and allocation-free, as `pre_exec` requires.
+        // so it is only added when there is actually something to apply.
+        //
+        // The hook runs before `sandbox-exec` is executed, so the limits and
+        // the priority cover the launcher, the sandboxed program and every
+        // descendant either creates.
+        let setup = PreExecSetup::new(request.config);
+        if !setup.is_empty() {
+            // SAFETY: the closure only issues `setrlimit`, `setpriority` and
+            // `setiopolicy_np`, which are async-signal-safe and
+            // allocation-free, as `pre_exec` requires.
             unsafe {
-                cmd.pre_exec(move || limits.apply());
+                cmd.pre_exec(move || setup.apply());
             }
         }
 

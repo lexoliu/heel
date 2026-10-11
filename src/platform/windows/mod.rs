@@ -13,12 +13,13 @@
 mod acl;
 mod child;
 mod container;
+mod priority;
 
 use std::path::Path;
 use std::process::Output;
 
 use rappct::launch::{
-    JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io, merge_parent_env,
+    JobGuard, JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io, merge_parent_env,
 };
 
 pub(crate) use child::AppContainerChild;
@@ -160,6 +161,24 @@ impl WindowsBackend {
                     describe(&prepared.options),
                 ))
             })?;
+
+        // The job object is what carries the priority, and it is the one the
+        // process was assigned to at launch, so lowering it here covers the
+        // process and everything it goes on to create.
+        let configured = request.config.priority();
+        if !configured.is_normal() {
+            let job = launched
+                .job_guard
+                .as_ref()
+                .map(JobGuard::as_handle)
+                .ok_or_else(|| {
+                    Error::InitFailed(format!(
+                        "no job object was created for {}, so its priority cannot be lowered",
+                        request.program
+                    ))
+                })?;
+            priority::apply(job, configured)?;
+        }
 
         let pid = launched.pid;
         let child = AppContainerChild::new(launched, prepared.loopback)?;
