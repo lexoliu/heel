@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/lexoliu/heel/compare/heel-v0.3.0...heel-v0.3.1) - 2026-10-11
+
+### Fixed
+
+- retain IPC commands with explicit PATH
+- *(windows)* let one ACL write cover a granted tree ([#46](https://github.com/lexoliu/heel/pull/46))
+- *(windows)* reach the pipe list through a WRITE_DAC client
+- *(windows)* grant the pipe through its object name
+- *(windows)* wrap the descriptor out-parameter in Some
+- *(windows)* open the IPC pipe to the container
+- *(windows)* let a write grant rename and remove what it wrote
+- *(windows)* open the null device to the container so children can spawn ([#43](https://github.com/lexoliu/heel/pull/43))
+- *(windows)* grant ACLs through verbatim paths past MAX_PATH ([#42](https://github.com/lexoliu/heel/pull/42))
+- *(windows)* open the existing contents of granted directories to the container ([#41](https://github.com/lexoliu/heel/pull/41))
+- *(network)* write audit records before the connection proceeds ([#39](https://github.com/lexoliu/heel/pull/39))
+- *(windows)* make Sandbox/Child Send+Sync again ([#36](https://github.com/lexoliu/heel/pull/36))
+
+### Other
+
+- Make a nice level relative to the host
+- Add scheduling priority for sandboxed processes
+- run the workflow once per pull request commit ([#47](https://github.com/lexoliu/heel/pull/47))
+- *(windows)* probe each filesystem operation from inside the container
+- *(windows)* dump the container view of the grant on denial
+- *(windows)* name the operation a write grant denies
+- track crate-ci/typos by its v1 tag ([#40](https://github.com/lexoliu/heel/pull/40))
+- run tests with cargo nextest ([#37](https://github.com/lexoliu/heel/pull/37))
+
 ## [0.3.0](https://github.com/lexoliu/heel/compare/heel-v0.2.0...heel-v0.3.0) - 2026-09-13
 
 ### Other
