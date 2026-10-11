@@ -88,6 +88,7 @@ mod grant;
 pub mod ipc;
 mod network;
 mod platform;
+mod priority;
 #[cfg(target_os = "macos")]
 pub(crate) mod pty;
 mod python;
@@ -109,6 +110,7 @@ pub use network::{
     NetworkPolicy,
 };
 pub use platform::Child;
+pub use priority::{CpuPriority, InvalidNiceLevel, IoPriority, NiceLevel, ProcessPriority};
 pub use python::VenvManager;
 pub use sandbox::Sandbox;
 pub use security::{SecurityConfig, SecurityConfigBuilder, SecurityOverrides};
