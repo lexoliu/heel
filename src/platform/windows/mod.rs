@@ -13,11 +13,13 @@
 mod acl;
 mod child;
 mod container;
+mod priority;
 
+use std::path::Path;
 use std::process::Output;
 
 use rappct::launch::{
-    JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io, merge_parent_env,
+    JobGuard, JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io, merge_parent_env,
 };
 
 pub(crate) use child::AppContainerChild;
@@ -74,9 +76,9 @@ impl WindowsBackend {
     /// the configured paths to it.
     ///
     /// The paths are granted here rather than at the first launch because
-    /// Windows grants by inheritance, and an inheritable entry only reaches
-    /// files created after it exists. Granting later would leave anything the
-    /// caller had already put in the working directory unreadable.
+    /// Windows grants by inheritance: setting the entries propagates them to
+    /// what the tree already holds, and they must all be in place before the
+    /// process starts creating its own files so those inherit them too.
     ///
     /// # Errors
     ///
@@ -86,6 +88,15 @@ impl WindowsBackend {
         let container = Container::create()?;
         container.grant_configured_paths(config)?;
         Ok(Self { container })
+    }
+
+    /// Open the sandbox's IPC endpoint to the container.
+    ///
+    /// The endpoint is a named pipe — a kernel object whose default access
+    /// control list names nothing an AppContainer token carries — so the pipe
+    /// bound for `socket` is granted once the server has bound it.
+    pub(crate) fn grant_ipc_endpoint(&self, socket: &Path) -> Result<()> {
+        self.container.grant_ipc_endpoint(socket)
     }
 
     /// Prepare everything one launch needs.
@@ -150,6 +161,24 @@ impl WindowsBackend {
                     describe(&prepared.options),
                 ))
             })?;
+
+        // The job object is what carries the priority, and it is the one the
+        // process was assigned to at launch, so lowering it here covers the
+        // process and everything it goes on to create.
+        let configured = request.config.priority();
+        if !configured.is_normal() {
+            let job = launched
+                .job_guard
+                .as_ref()
+                .map(JobGuard::as_handle)
+                .ok_or_else(|| {
+                    Error::InitFailed(format!(
+                        "no job object was created for {}, so its priority cannot be lowered",
+                        request.program
+                    ))
+                })?;
+            priority::apply(job, configured)?;
+        }
 
         let pid = launched.pid;
         let child = AppContainerChild::new(launched, prepared.loopback)?;
@@ -313,6 +342,17 @@ impl Backend for WindowsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The public types must stay Send+Sync: callers hold a `Sandbox`/`Child`
+    // inside async state (per-chat actors, daemons) whose futures spawn onto
+    // multi-threaded executors. `rappct` internals lose the auto impls to raw
+    // pointers; the unsafe impls on `Container`/`AppContainerChild` restore
+    // them — this keeps that from regressing silently.
+    const _: () = {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<crate::Sandbox>();
+        assert_send_sync::<crate::Child>();
+    };
 
     #[test]
     fn plain_arguments_are_not_quoted() {

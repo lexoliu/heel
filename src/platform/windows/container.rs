@@ -17,8 +17,10 @@ use rappct::net::LoopbackExemptionGuard;
 use rappct::profile::AppContainerProfile;
 use rappct::sid::AppContainerSid;
 
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_TRAVERSE,
+    DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_TRAVERSE,
 };
 
 use super::acl::{self, Entry, Scope};
@@ -32,8 +34,16 @@ const INTERNET_CLIENT: &str = "internetClient";
 /// Read a file, or list a directory.
 const READ: u32 = FILE_GENERIC_READ.0;
 
-/// Write a file, or create entries in a directory.
-const WRITE: u32 = FILE_GENERIC_WRITE.0;
+/// Write a file, or create and remove entries in a directory.
+///
+/// The generic write mask alone does not deliver what `Access::WRITE`
+/// promises, because Windows prices removal separately: renaming a file is a
+/// delete of its old name and wants `DELETE` on the file or
+/// `FILE_DELETE_CHILD` on its parent, and removing a directory wants `DELETE`
+/// on it. Without them a writer that stages output and renames it into place
+/// — rustc emitting `.rmeta` is the shape that hit this — meets access denied
+/// inside a tree it was told is writable.
+const WRITE: u32 = FILE_GENERIC_WRITE.0 | DELETE.0 | FILE_DELETE_CHILD.0;
 
 /// Enter a directory. The same bit means "run" on a file, which is the whole
 /// reason directories and files are granted separately below.
@@ -85,6 +95,13 @@ pub(crate) struct Container {
     profile: Option<AppContainerProfile>,
 }
 
+// SAFETY: the profile owns a SID, which is read-only kernel data after
+// creation — `rappct` stores it as a raw pointer, so auto Send/Sync are lost,
+// but no API mutates it and deallocation is a single Drop.
+unsafe impl Send for Container {}
+// SAFETY: as for Send; shared `&` access exposes only read-only operations.
+unsafe impl Sync for Container {}
+
 impl Container {
     /// Create the profile for a new sandbox.
     pub(crate) fn create() -> Result<Self> {
@@ -122,11 +139,11 @@ impl Container {
         // can enter by default. Each ancestor gets traverse and nothing else,
         // and the grant does not inherit, so their other children stay closed.
         self.grant_ancestors(config.working_dir())?;
-        self.grant(config.working_dir(), &access_tree(Access::WRITE))?;
+        self.grant_path(config.working_dir(), Access::WRITE)?;
 
         for grant in config.grants() {
             self.grant_ancestors(grant.path())?;
-            self.grant(grant.path(), &access_tree(grant.access()))?;
+            self.grant_path(grant.path(), grant.access())?;
         }
 
         if let Some(python) = config.python() {
@@ -138,10 +155,95 @@ impl Container {
             } else {
                 Access::EXEC
             };
-            self.grant(python.venv().path(), &access_tree(access))?;
+            self.grant_path(python.venv().path(), access)?;
         }
 
+        self.grant_null_device();
+
         Ok(())
+    }
+
+    /// Open the sandbox's IPC endpoint to this container.
+    ///
+    /// On Windows the endpoint is a named pipe — a kernel object with an
+    /// access control list of its own, which by default names nothing an
+    /// AppContainer token carries. The filesystem grants never reach it, so
+    /// the package SID has to be added on the pipe itself or every connect is
+    /// denied, which is the failure a capture wrapper meets the first time it
+    /// reports an artifact.
+    ///
+    /// `socket` is the path the endpoint was bound for; the pipe name is
+    /// derived from it the same way the server derives it.
+    pub(crate) fn grant_ipc_endpoint(&self, socket: &Path) -> Result<()> {
+        const PIPE_ACCESS: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
+
+        acl::grant_pipe(
+            &crate::ipc::pipe_name(socket),
+            self.sid().as_string(),
+            PIPE_ACCESS,
+        )
+        .map_err(|source| {
+            Error::InitFailed(format!(
+                "cannot open the IPC endpoint to the container: {source}"
+            ))
+        })
+    }
+
+    /// Open the null device to this container.
+    ///
+    /// A process spawned with a null stdin opens `NUL`, which resolves to the
+    /// kernel device `\Device\Null`. The device's access control list names
+    /// nothing an AppContainer token carries, so the open is denied inside the
+    /// container — and with it every spawn `std::process::Command::output`
+    /// performs, because it wires the child's stdin to `NUL`. That is the
+    /// failure a build tool hits when it probes a staged wrapper: the child is
+    /// denied before it starts. Granting the package SID on the device object
+    /// opens it to this container and nothing else.
+    ///
+    /// The device belongs to the machine rather than to this sandbox, so a
+    /// host without the rights to change its access control list keeps a
+    /// working sandbox for everything that does not touch `NUL` — the grant
+    /// is attempted and a failure is reported rather than fatal.
+    fn grant_null_device(&self) {
+        const NULL_DEVICE: &str = r"\\.\NUL";
+        const READ_WRITE: u32 = GENERIC_READ.0 | GENERIC_WRITE.0;
+
+        match acl::grant_object(NULL_DEVICE, self.sid().as_string(), READ_WRITE) {
+            Ok(()) => tracing::debug!("opened the null device to the container"),
+            Err(source) => tracing::warn!(
+                %source,
+                "cannot open the null device to the container; children that open NUL will be denied"
+            ),
+        }
+    }
+
+    /// Open one configured path to this container.
+    ///
+    /// A file takes the file entry on itself and nothing else: the directory
+    /// entry's traverse bit means "run" on a file, so handing it the
+    /// directory mask would make every readable file executable. A directory
+    /// takes both entries — the directory entry applies to it as well, which
+    /// is what lets the container enter it.
+    ///
+    /// One call covers the whole tree. `SetNamedSecurityInfoW` propagates a
+    /// directory's inheritable entries to every child that already exists,
+    /// and children created later inherit them on creation, so the tree is
+    /// written once by the system. Walking it and granting each child again
+    /// re-propagated every subtree once per directory above it — a
+    /// toolchain tree cost minutes per sandbox.
+    fn grant_path(&self, path: &Path, access: Access) -> Result<()> {
+        let entries = access_tree(access);
+        if path.is_dir() {
+            self.grant(path, &entries)
+        } else {
+            self.grant(
+                path,
+                &[Entry {
+                    access: entries[1].access,
+                    applies_to: Scope::ThisOnly,
+                }],
+            )
+        }
     }
 
     /// Grant traverse on every directory above `path`.
@@ -152,13 +254,8 @@ impl Container {
             if ancestor.parent().is_none() || in_system_directory(ancestor) {
                 continue;
             }
-            self.grant(
-                ancestor,
-                &[Entry {
-                    access: TRAVERSE,
-                    applies_to: Scope::ThisOnly,
-                }],
-            )?;
+            acl::grant_this_only(ancestor, self.sid().as_string(), TRAVERSE)
+                .map_err(|source| Error::path(ancestor, source))?;
         }
         Ok(())
     }

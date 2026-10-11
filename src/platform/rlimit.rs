@@ -49,6 +49,15 @@ impl PreparedLimits {
         Self { limits: prepared }
     }
 
+    /// Whether there is no limit to install.
+    ///
+    /// Only macOS asks: it is the one backend that can skip its `pre_exec`
+    /// hook entirely, since Linux always has Landlock and seccomp to install.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.limits.is_empty()
+    }
+
     /// Install the limits on the current process.
     ///
     /// Safe to call from `pre_exec`: it only issues `setrlimit` syscalls.

@@ -233,6 +233,18 @@ pub struct CommonArgs {
     #[arg(long)]
     pub max_processes: Option<u64>,
 
+    /// Run the sandbox 1 to 19 steps below this process's CPU priority.
+    ///
+    /// Relative, like `nice -n`, and capped at the kernel's lowest priority. A
+    /// sandbox can only lower its priority, so 0 and negative values are
+    /// rejected rather than silently ignored.
+    #[arg(long)]
+    pub nice: Option<u8>,
+
+    /// Disk I/O priority for sandboxed processes.
+    #[arg(long, value_enum)]
+    pub io_priority: Option<IoPriorityArg>,
+
     /// Working directory for the sandbox.
     #[arg(long)]
     pub working_dir: Option<PathBuf>,
@@ -373,6 +385,28 @@ pub enum NetworkMode {
     Allow,
     /// Allow only the listed domains.
     AllowList,
+}
+
+/// How much disk bandwidth sandboxed processes compete for.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IoPriorityArg {
+    /// The I/O priority the processes would have had anyway.
+    Normal,
+    /// Yield to interactive work, without being throttled outright.
+    Utility,
+    /// Only use bandwidth nothing else wants.
+    Background,
+}
+
+impl From<IoPriorityArg> for heel::IoPriority {
+    fn from(arg: IoPriorityArg) -> Self {
+        match arg {
+            IoPriorityArg::Normal => Self::Normal,
+            IoPriorityArg::Utility => Self::Utility,
+            IoPriorityArg::Background => Self::Background,
+        }
+    }
 }
 
 /// Tool used to create a Python virtual environment.

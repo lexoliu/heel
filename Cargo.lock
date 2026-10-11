@@ -664,6 +664,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dunce",
+ "errno",
  "executor-core",
  "futures-lite",
  "http-body-util",

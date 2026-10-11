@@ -3,10 +3,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use heel::{Access, Grant, ResourceLimits, SecurityConfig, SecurityOverrides, VenvBackend};
+use heel::{
+    Access, CpuPriority, Grant, IoPriority, NiceLevel, ProcessPriority, ResourceLimits,
+    SecurityConfig, SecurityOverrides, VenvBackend,
+};
 use serde::Deserialize;
 
-use crate::cli::{CommonArgs, Isolation, NetworkMode, PythonArgs, VenvBackendArg};
+use crate::cli::{CommonArgs, IoPriorityArg, Isolation, NetworkMode, PythonArgs, VenvBackendArg};
 use crate::error::{CliError, CliResult};
 
 /// The TOML config file.
@@ -27,6 +30,8 @@ pub struct FileConfig {
     pub grants: BTreeMap<PathBuf, Access>,
     /// Resource limits.
     pub limits: LimitsSection,
+    /// Scheduling priority.
+    pub priority: PrioritySection,
     /// Working directory settings.
     pub workdir: WorkdirSection,
     /// Environment settings.
@@ -42,6 +47,15 @@ pub struct LimitsSection {
     pub max_cpu_time: Option<u64>,
     pub max_file_size: Option<u64>,
     pub max_processes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PrioritySection {
+    /// Steps below the invoking process's CPU priority, from 1 to 19.
+    pub nice: Option<u8>,
+    /// Disk I/O priority: `normal`, `utility` or `background`.
+    pub io: Option<IoPriorityArg>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -79,6 +93,7 @@ pub struct MergedConfig {
     pub security: SecurityConfig,
     pub grants: Vec<Grant>,
     pub limits: ResourceLimits,
+    pub priority: ProcessPriority,
     pub working_dir: Option<PathBuf>,
     pub keep_working_dir: bool,
     pub env_passthroughs: Vec<String>,
@@ -159,6 +174,7 @@ pub fn merge_config(file: FileConfig, cli: &CommonArgs) -> CliResult<MergedConfi
         security,
         grants: merge_grants(file.grants, cli),
         limits: merge_limits(&file.limits, cli),
+        priority: merge_priority(&file.priority, cli)?,
         working_dir: cli.working_dir.clone().or(file.workdir.path),
         keep_working_dir: cli.keep_working_dir || file.workdir.keep,
         env_passthroughs: concat(file.env.passthrough, &cli.env_passthroughs),
@@ -282,6 +298,24 @@ fn merge_limits(file: &LimitsSection, cli: &CommonArgs) -> ResourceLimits {
     }
 
     builder.build()
+}
+
+/// Combine the file's scheduling priority with the command line's.
+///
+/// A nice level outside `1..=19` is rejected here rather than clamped: the
+/// level counts steps below the invoking process, so a value that steps
+/// nowhere or upwards is a mistake about what the setting does.
+fn merge_priority(file: &PrioritySection, cli: &CommonArgs) -> CliResult<ProcessPriority> {
+    let cpu = match cli.nice.or(file.nice) {
+        Some(level) => CpuPriority::Nice(NiceLevel::new(level)?),
+        None => CpuPriority::Normal,
+    };
+    let io = cli
+        .io_priority
+        .or(file.io)
+        .map_or(IoPriority::Normal, Into::into);
+
+    Ok(ProcessPriority::new(cpu, io))
 }
 
 #[cfg(test)]
@@ -477,6 +511,54 @@ mod tests {
 
         assert_eq!(merged.limits.max_memory_bytes(), Some(99));
         assert_eq!(merged.limits.max_cpu_time_secs(), Some(2));
+    }
+
+    #[test]
+    fn the_priority_prefers_the_command_line() {
+        let file: FileConfig =
+            toml::from_str("[priority]\nnice = 3\nio = \"utility\"").expect("parses");
+        let merged = merge_config(file, &common_args(&["--nice", "12"])).expect("merges");
+
+        assert_eq!(
+            merged.priority,
+            ProcessPriority::new(
+                CpuPriority::Nice(NiceLevel::new(12).unwrap()),
+                IoPriority::Utility,
+            )
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_priority_lowers_nothing() {
+        let merged = merge_config(FileConfig::default(), &common_args(&[])).expect("merges");
+        assert!(merged.priority.is_normal());
+    }
+
+    #[test]
+    fn the_io_priority_comes_from_either_source() {
+        let merged = merge_config(
+            FileConfig::default(),
+            &common_args(&["--io-priority", "background"]),
+        )
+        .expect("merges");
+        assert_eq!(merged.priority.io(), IoPriority::Background);
+
+        let file: FileConfig = toml::from_str("[priority]\nio = \"background\"").expect("parses");
+        let merged = merge_config(file, &common_args(&[])).expect("merges");
+        assert_eq!(merged.priority.io(), IoPriority::Background);
+    }
+
+    #[test]
+    fn a_nice_level_that_would_raise_priority_is_rejected() {
+        // Zero is the default priority, so asking for it is a mistake about
+        // what the flag does rather than a request to be clamped.
+        let error = merge_config(FileConfig::default(), &common_args(&["--nice", "0"]))
+            .expect_err("must fail");
+        assert!(matches!(error, CliError::InvalidNiceLevel(_)), "{error}");
+
+        let file: FileConfig = toml::from_str("[priority]\nnice = 20").expect("parses");
+        let error = merge_config(file, &common_args(&[])).expect_err("must fail");
+        assert!(matches!(error, CliError::InvalidNiceLevel(_)), "{error}");
     }
 
     #[test]

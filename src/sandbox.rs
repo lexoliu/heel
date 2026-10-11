@@ -242,6 +242,15 @@ impl<N: NetworkPolicy> Sandbox<N> {
             None => (None, None),
         };
 
+        // The endpoint is a named pipe — a kernel object whose access control
+        // list names nothing an AppContainer token carries — so the pipe must
+        // be opened to this sandbox's container once the server has bound it.
+        // The other transports reach it through the filesystem grants.
+        #[cfg(windows)]
+        if let Some(server) = &ipc_server {
+            backend.grant_ipc_endpoint(server.socket_path())?;
+        }
+
         match &proxy {
             Some(proxy) => tracing::info!(
                 proxy = %proxy.addr(),
@@ -489,6 +498,8 @@ mod tests {
 
     #[test]
     fn working_directory_is_removed_on_drop() {
+        // A failed removal is only reported as a trace from `Drop`.
+        show_backend_diagnostics();
         smol::block_on(async {
             let sandbox = Sandbox::new().await.unwrap();
             let working_dir = sandbox.working_dir().to_path_buf();

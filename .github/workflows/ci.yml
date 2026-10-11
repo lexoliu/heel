@@ -6,8 +6,11 @@ permissions:
   id-token: write
 
 on:
+  # Topic branches are tested through their pull request. A push trigger on
+  # every branch ran the whole workflow a second time for each commit of an
+  # open pull request, so pushes run it only where no pull request does.
   push:
-    branches: ["**"]
+    branches: [dev, main]
   pull_request:
     branches: ["**"]
   # A push whose webhook is dropped -- during a GitHub incident, say -- leaves a
@@ -71,7 +74,8 @@ jobs:
         with:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - uses: taiki-e/install-action@nextest
+      - run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5.5.4
         with:
           use_oidc: true
@@ -81,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: crate-ci/typos@master
+      - uses: crate-ci/typos@v1
 
   audit:
     name: Security Audit
