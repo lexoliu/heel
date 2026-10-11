@@ -16,6 +16,9 @@ pub mod linux;
 pub(crate) mod child;
 
 #[cfg(unix)]
+pub(crate) mod preexec;
+
+#[cfg(unix)]
 pub(crate) mod rlimit;
 
 #[cfg(target_os = "windows")]

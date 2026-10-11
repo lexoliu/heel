@@ -39,6 +39,9 @@ pub enum CliError {
         source: heel::ParseAccessError,
     },
 
+    #[error("invalid --nice value: {0}")]
+    InvalidNiceLevel(#[from] heel::InvalidNiceLevel),
+
     #[error("--network allow-list requires at least one --allow-domain")]
     MissingAllowDomains,
 
