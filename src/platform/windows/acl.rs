@@ -15,7 +15,9 @@ use std::io;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::Path;
 
-use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree, WIN32_ERROR,
+};
 use windows::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
     GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetEntriesInAclW,
@@ -140,6 +142,35 @@ pub(crate) fn grant_pipe(name: &str, sid: &str, access: u32) -> io::Result<()> {
     grant_handle(handle, sid, access)
 }
 
+/// Run a `Get*SecurityInfo` call until it answers or fails for real.
+///
+/// The calls do not handle a security descriptor that changes mid-call:
+/// the object's list can move between the size they first query and the
+/// read they then make, which is reported as `ERROR_INSUFFICIENT_BUFFER`.
+/// A shared tree changes under any reader — a grant that lands on an
+/// ancestor is propagated to everything below it — so a descriptor can
+/// move without heel touching it, and the API's own answer to that race
+/// is to ask again. The loop stays bounded so a descriptor that cannot
+/// be read still fails after `ATTEMPTS` tries.
+fn reread(object: &str, mut attempt: impl FnMut() -> WIN32_ERROR) -> io::Result<()> {
+    const ATTEMPTS: u32 = 5;
+
+    let mut status = attempt();
+    let mut remaining = ATTEMPTS - 1;
+    while status == ERROR_INSUFFICIENT_BUFFER && remaining > 0 {
+        remaining -= 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        status = attempt();
+    }
+
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot read the access control list of {object}: {status:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Add `access` for `sid` to the kernel object `handle` refers to.
 ///
 /// The handle must already carry `WRITE_DAC`, which the caller arranges by
@@ -148,24 +179,23 @@ fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut current: *mut ACL = std::ptr::null_mut();
 
-    // SAFETY: the out-parameters are valid destinations.
-    let status = unsafe {
-        GetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut current),
-            None,
-            Some(&mut descriptor),
-        )
-    };
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot read the access control list of the kernel object: {status:?}"
-        )));
-    }
+    reread("the kernel object", || {
+        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        current = std::ptr::null_mut();
+        // SAFETY: the out-parameters are valid destinations.
+        unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut current),
+                None,
+                Some(&mut descriptor),
+            )
+        }
+    })?;
     let _descriptor = LocalBuffer(descriptor.0);
 
     let updated = merge(
@@ -240,24 +270,23 @@ pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut current: *mut ACL = std::ptr::null_mut();
 
-    // SAFETY: the path is NUL-terminated and the out-parameters are valid.
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut current),
-            None,
-            &mut descriptor,
-        )
-    };
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot read the access control list of {name}: {status:?}"
-        )));
-    }
+    reread(&name, || {
+        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        current = std::ptr::null_mut();
+        // SAFETY: the path is NUL-terminated and the out-parameters are valid.
+        unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut current),
+                None,
+                &mut descriptor,
+            )
+        }
+    })?;
     let _descriptor = LocalBuffer(descriptor.0);
 
     let mut control = 0u16;
@@ -357,24 +386,23 @@ fn apply(name: &str, sddl: &str, entries: &[Entry], kind: SE_OBJECT_TYPE) -> io:
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut current: *mut ACL = std::ptr::null_mut();
 
-    // SAFETY: the path is NUL-terminated and the out-parameters are valid.
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            kind,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut current),
-            None,
-            &mut descriptor,
-        )
-    };
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot read the access control list of {name}: {status:?}"
-        )));
-    }
+    reread(name, || {
+        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        current = std::ptr::null_mut();
+        // SAFETY: the path is NUL-terminated and the out-parameters are valid.
+        unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                kind,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut current),
+                None,
+                &mut descriptor,
+            )
+        }
+    })?;
     let _descriptor = LocalBuffer(descriptor.0);
 
     let updated = merge(sddl, current, entries, name)?;
@@ -400,4 +428,77 @@ fn apply(name: &str, sddl: &str, entries: &[Entry], kind: SE_OBJECT_TYPE) -> io:
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+
+    use super::*;
+
+    /// A descriptor that moves under the reader must not fail the read.
+    ///
+    /// `GetNamedSecurityInfoW` reports a descriptor that changes mid-call as
+    /// `ERROR_INSUFFICIENT_BUFFER`, and a descriptor anywhere in a shared
+    /// tree can move while something else writes. One thread alternates the
+    /// directory's list between two sizes — so every write changes it —
+    /// while the other keeps reading; the reader is expected to ask again
+    /// rather than to fail.
+    #[test]
+    fn a_descriptor_changing_under_the_reader_is_read_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = Entry {
+            access: FILE_GENERIC_READ.0,
+            applies_to: Scope::ThisOnly,
+        };
+
+        // Two lists for the directory: one naming Everyone alone, one naming
+        // Everyone and the local system account. Alternating them changes
+        // the descriptor's size on every write.
+        let one = merge("S-1-1-0", std::ptr::null_mut(), &[entry], "the directory")
+            .expect("one-entry list");
+        let two =
+            merge("S-1-5-18", one.0.cast(), &[entry], "the directory").expect("two-entry list");
+        let first = one.0 as usize;
+        let second = two.0 as usize;
+
+        let wide: Vec<u16> = dir
+            .path()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let writer = std::thread::spawn(move || {
+            let mut lists = [first, second].into_iter().cycle();
+            while !flag.load(Ordering::Relaxed) {
+                // SAFETY: `one` and `two` are valid lists that outlive this
+                // thread — the main thread frees them only after joining it.
+                let status = unsafe {
+                    SetNamedSecurityInfoW(
+                        PCWSTR(wide.as_ptr()),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        None,
+                        None,
+                        Some(lists.next().expect("the list cycles") as *const ACL as *mut ACL),
+                        None,
+                    )
+                };
+                assert!(status.is_ok(), "the writer's list applies: {status:?}");
+            }
+        });
+
+        for _ in 0..500 {
+            grant_this_only(dir.path(), "S-1-1-0", FILE_GENERIC_READ.0)
+                .expect("the reader's grant applies");
+        }
+        done.store(true, Ordering::Relaxed);
+        writer.join().expect("the writer finishes");
+    }
 }
