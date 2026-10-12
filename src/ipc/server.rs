@@ -152,7 +152,7 @@ impl IpcServer {
     /// it is woken with a connection that is immediately dropped. The shutdown
     /// channel is closed first, so the thread sees the closure and exits rather
     /// than serving the wake-up as a request.
-    pub(crate) fn stop(&self) {
+    fn stop(&self) {
         self.shutdown.stop();
 
         if let Ok(name) = endpoint::name(&self.socket_path) {

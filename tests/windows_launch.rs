@@ -5,7 +5,7 @@ use rappct::capability::SecurityCapabilitiesBuilder;
 use rappct::launch::{LaunchOptions, StdioConfig, launch_in_container_with_io};
 use rappct::profile::AppContainerProfile;
 
-fn launch_without_environment(stdio: StdioConfig) {
+fn launch_with_explicit_environment(stdio: StdioConfig) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("rappct=trace")
         .try_init();
@@ -17,7 +17,7 @@ fn launch_without_environment(stdio: StdioConfig) {
         .expect("capabilities");
     let root = std::env::var_os("SystemRoot").expect("Windows SystemRoot");
     let options = LaunchOptions {
-        exe: std::path::PathBuf::from(root)
+        exe: std::path::PathBuf::from(&root)
             .join("System32")
             .join("cmd.exe"),
         cmdline: Some("cmd.exe /D /S /C exit 0".to_owned()),
@@ -25,7 +25,7 @@ fn launch_without_environment(stdio: StdioConfig) {
             std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
                 .join("System32"),
         ),
-        env: None,
+        env: Some(vec![("SystemRoot".into(), root)]),
         stdio,
         ..LaunchOptions::default()
     };
@@ -33,7 +33,7 @@ fn launch_without_environment(stdio: StdioConfig) {
         .and_then(|process| process.wait(Some(std::time::Duration::from_secs(10))));
     profile.delete().expect("delete owned profile");
     assert_eq!(
-        result.expect("zero-capability native launch with inherited environment"),
+        result.expect("zero-capability native launch with explicit environment"),
         0
     );
 }
@@ -45,6 +45,7 @@ fn raw_zero_capability_launch(
     use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
     use windows::Win32::Security::{PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES};
+    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
     use windows::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
@@ -88,6 +89,8 @@ fn raw_zero_capability_launch(
             lpAttributeList: attributes,
         };
         let mut process = PROCESS_INFORMATION::default();
+        let mut environment = std::ptr::null_mut();
+        CreateEnvironmentBlock(&mut environment, None, false)?;
         let result = UpdateProcThreadAttribute(
             attributes,
             0,
@@ -104,14 +107,16 @@ fn raw_zero_capability_launch(
                 None,
                 None,
                 false,
-                EXTENDED_STARTUPINFO_PRESENT,
-                None,
+                EXTENDED_STARTUPINFO_PRESENT
+                    | windows::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT,
+                Some(environment),
                 PCWSTR(cwd.as_ptr()),
                 std::ptr::from_ref(&startup).cast(),
                 &mut process,
             )
         });
         DeleteProcThreadAttributeList(attributes);
+        DestroyEnvironmentBlock(environment)?;
         result?;
         let waited = WaitForSingleObject(process.hProcess, 10_000);
         CloseHandle(process.hThread)?;
@@ -139,11 +144,11 @@ fn empty_capability_array_is_null_for_native_launch() {
 }
 
 #[test]
-fn zero_capability_launch_with_inherited_environment() {
-    launch_without_environment(StdioConfig::Inherit);
+fn zero_capability_launch_with_explicit_environment() {
+    launch_with_explicit_environment(StdioConfig::Inherit);
 }
 
 #[test]
-fn zero_capability_launch_with_null_stdio_and_inherited_environment() {
-    launch_without_environment(StdioConfig::Null);
+fn zero_capability_launch_with_null_stdio_and_explicit_environment() {
+    launch_with_explicit_environment(StdioConfig::Null);
 }

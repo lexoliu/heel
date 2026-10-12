@@ -427,7 +427,6 @@ impl<N: NetworkPolicy> Sandbox<N> {
 impl<N: NetworkPolicy> Drop for Sandbox<N> {
     fn drop(&mut self) {
         if let Some(server) = self.ipc_server.take() {
-            server.stop();
             drop(server);
             tracing::debug!("stopped IPC server");
         }
