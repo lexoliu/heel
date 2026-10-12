@@ -25,7 +25,16 @@ impl LaunchFixture {
     }
 }
 
-fn launch_with_explicit_environment(stdio: StdioConfig) {
+fn parent_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut environment: Vec<_> = std::env::vars_os().collect();
+    environment.sort_unstable_by_key(|(key, _)| key.to_ascii_lowercase());
+    environment
+}
+
+fn assert_native_launch(
+    stdio: StdioConfig,
+    environment: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("rappct=trace")
         .try_init();
@@ -34,24 +43,19 @@ fn launch_with_explicit_environment(stdio: StdioConfig) {
         .build()
         .expect("capabilities");
     let root = std::env::var_os("SystemRoot").expect("Windows SystemRoot");
-    let mut environment: Vec<_> = std::env::vars_os().collect();
-    environment.sort_unstable_by_key(|(key, _)| key.to_ascii_lowercase());
     let options = LaunchOptions {
         exe: std::path::PathBuf::from(&root)
             .join("System32")
             .join("cmd.exe"),
         cmdline: Some("cmd.exe /D /S /C exit 0".to_owned()),
         cwd: Some(fixture.directory.path().to_owned()),
-        env: Some(environment),
+        env: environment,
         stdio,
         ..LaunchOptions::default()
     };
     let result = launch_in_container_with_io(&capabilities, &options)
         .and_then(|process| process.wait(Some(std::time::Duration::from_secs(10))));
-    assert_eq!(
-        result.expect("zero-capability native launch with explicit environment"),
-        0
-    );
+    assert_eq!(result.expect("zero-capability native launch"), 0);
 }
 
 fn raw_zero_capability_launch(
@@ -158,10 +162,20 @@ fn empty_capability_array_is_null_for_native_launch() {
 
 #[test]
 fn zero_capability_launch_with_explicit_environment() {
-    launch_with_explicit_environment(StdioConfig::Inherit);
+    assert_native_launch(StdioConfig::Inherit, Some(parent_environment()));
 }
 
 #[test]
 fn zero_capability_launch_with_null_stdio_and_explicit_environment() {
-    launch_with_explicit_environment(StdioConfig::Null);
+    assert_native_launch(StdioConfig::Null, Some(parent_environment()));
+}
+
+#[test]
+fn zero_capability_launch_with_inherited_environment() {
+    assert_native_launch(StdioConfig::Inherit, None);
+}
+
+#[test]
+fn zero_capability_launch_with_null_stdio_and_inherited_environment() {
+    assert_native_launch(StdioConfig::Null, None);
 }
