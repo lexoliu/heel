@@ -144,12 +144,12 @@ pub(crate) fn grant_pipe(name: &str, sid: &str, access: u32) -> io::Result<()> {
 
 /// Run a `Get*SecurityInfo` call until it answers or fails for real.
 ///
-/// The calls do not handle a security descriptor that changes mid-call:
-/// the object's list can move between the size they first query and the
-/// read they then make, which is reported as `ERROR_INSUFFICIENT_BUFFER`.
-/// A shared tree changes under any reader — a grant that lands on an
-/// ancestor is propagated to everything below it — so a descriptor can
-/// move without heel touching it, and the API's own answer to that race
+/// The calls are documented not to handle a security descriptor that
+/// changes mid-call: the object's list can move between the size they
+/// first query and the read they then make, which is reported as
+/// `ERROR_INSUFFICIENT_BUFFER`. None of heel's writes targets another
+/// sandbox's objects, but a writer outside this process cannot be ruled
+/// out, so a descriptor can move under any reader — and the API's answer
 /// is to ask again. The loop stays bounded so a descriptor that cannot
 /// be read still fails after `ATTEMPTS` tries.
 fn reread(object: &str, mut attempt: impl FnMut() -> WIN32_ERROR) -> io::Result<()> {
