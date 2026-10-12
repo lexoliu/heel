@@ -262,16 +262,21 @@ impl<N: NetworkPolicy> Sandbox<N> {
         // to the sandbox does so before the caller can put anything in it.
         // Windows grants by inheritance, and inheritance only reaches files
         // created once the grant is in place.
-        let backend = platform::create_native_backend(&config_data)?;
+        let backend_config = config_data.clone();
+        let backend = unblock(move || {
+            let backend = platform::create_native_backend(&backend_config)?;
 
-        // The endpoint is a named pipe — a kernel object whose access control
-        // list names nothing an AppContainer token carries — so the pipe must
-        // be opened to this sandbox's container once the server has bound it.
-        // The other transports reach it through the filesystem grants.
-        #[cfg(windows)]
-        if let Some(server) = &ipc_server {
-            backend.grant_ipc_endpoint(server.socket_path())?;
-        }
+            // The endpoint is a named pipe — a kernel object whose access control
+            // list names nothing an AppContainer token carries — so the pipe must
+            // be opened to this sandbox's container once the server has bound it.
+            // The other transports reach it through the filesystem grants.
+            #[cfg(windows)]
+            if let Some(socket) = backend_config.ipc_socket() {
+                backend.grant_ipc_endpoint(socket)?;
+            }
+            Ok::<_, crate::Error>(backend)
+        })
+        .await?;
 
         match &proxy {
             Some(proxy) => tracing::info!(

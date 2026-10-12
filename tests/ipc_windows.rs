@@ -32,6 +32,9 @@ impl IpcCommand for Echo {
 }
 
 async fn sandbox() -> Sandbox {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("heel=debug,rappct=trace")
+        .try_init();
     Sandbox::with_config_and_executor(
         SandboxConfigBuilder::default()
             .ipc(IpcRouter::new().register(Echo))

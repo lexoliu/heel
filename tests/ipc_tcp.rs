@@ -33,6 +33,9 @@ impl IpcCommand for Echo {
 
 #[tokio::test]
 async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("heel=debug,rappct=trace")
+        .try_init();
     let fixture = blocking::unblock(|| {
         let dir = tempfile::tempdir().expect("fixture directory");
         let binary = fixtures::compile(
