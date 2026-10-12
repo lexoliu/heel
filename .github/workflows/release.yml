@@ -114,6 +114,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: windows-2022
             target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
     defaults:
       run:
         shell: bash
@@ -125,13 +127,13 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build heel
-        run: cargo build --locked --bin heel --target "${{ matrix.target }}"
+        run: cargo build --locked --release --bin heel --target "${{ matrix.target }}"
 
       - name: Prepare release asset
         id: asset
         run: |
           asset_name="heel-${{ matrix.target }}"
-          binary_path="target/${{ matrix.target }}/debug/heel"
+          binary_path="target/${{ matrix.target }}/release/heel"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             asset_name="${asset_name}.exe"
             binary_path="${binary_path}.exe"
