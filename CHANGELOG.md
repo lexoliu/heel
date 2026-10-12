@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking
 
 - `SandboxConfigBuilder` has a second type parameter for its IPC route. `ipc()` returns the builder in the configured state, so `builder = builder.ipc(router)` no longer compiles; bind the result to a new variable instead. Configuring both a local router and an external endpoint is a compile error.
+- `DEFAULT_SANDBOX_PATH` exists only on Unix. Use `default_sandbox_path()`, which also covers Windows.
 
 ### Added
 
