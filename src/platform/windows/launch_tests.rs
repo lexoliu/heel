@@ -5,13 +5,26 @@ use rappct::capability::SecurityCapabilitiesBuilder;
 use rappct::launch::{LaunchOptions, StdioConfig, launch_in_container_with_io};
 use rappct::profile::AppContainerProfile;
 
+fn launch_profile() -> AppContainerProfile {
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+
+    let name = format!("heel-launch-probe-{:016x}", rand::random::<u64>());
+    let profile =
+        AppContainerProfile::ensure(&name, "heel native launch regression", None).expect("profile");
+    super::acl::grant_object(
+        r"\\.\NUL",
+        profile.sid.as_string(),
+        GENERIC_READ.0 | GENERIC_WRITE.0,
+    )
+    .expect("grant native standard stream device");
+    profile
+}
+
 fn launch_with_explicit_environment(stdio: StdioConfig) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("rappct=trace")
         .try_init();
-    let name = format!("heel-launch-probe-{:016x}", rand::random::<u64>());
-    let profile =
-        AppContainerProfile::ensure(&name, "heel launch regression", None).expect("profile");
+    let profile = launch_profile();
     let capabilities = SecurityCapabilitiesBuilder::new(&profile.sid)
         .build()
         .expect("capabilities");
@@ -129,9 +142,7 @@ fn raw_zero_capability_launch(
 #[test]
 fn empty_capability_array_is_null_for_native_launch() {
     let _ = tracing_subscriber::fmt().try_init();
-    let name = format!("heel-raw-launch-{:016x}", rand::random::<u64>());
-    let profile = AppContainerProfile::ensure(&name, "heel native parameter regression", None)
-        .expect("profile");
+    let profile = launch_profile();
     let null_result = raw_zero_capability_launch(&profile, true);
     let dangling_result = raw_zero_capability_launch(&profile, false);
     tracing::info!(

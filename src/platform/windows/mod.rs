@@ -13,6 +13,8 @@
 mod acl;
 mod child;
 mod container;
+#[cfg(test)]
+mod launch_tests;
 mod priority;
 
 use std::path::Path;
