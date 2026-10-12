@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/lexoliu/heel/compare/heel-v0.4.0...heel-v0.4.1) - 2026-10-12
+
+### Fixed
+
+- heel no longer requires exactly `http` 1.3.1, which forced every consumer's lockfile down to that version.
+- Release assets are optimized builds, and Windows ARM64 (`aarch64-pc-windows-msvc`) now has one.
+
 ## [0.4.0](https://github.com/lexoliu/heel/compare/heel-v0.3.1...heel-v0.4.0) - 2026-10-12
 
 ### Breaking
