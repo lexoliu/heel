@@ -5,36 +5,109 @@
 //! by ACL and nothing else is reachable; a job object carries the resource
 //! limits and kills the process tree.
 //!
-//! `std::process::Command` cannot launch into a container: that needs process
-//! and thread attributes it does not expose. The launch therefore goes through
-//! `rappct`, which returns pipe handles rather than `std::process` streams,
-//! which is why [`crate::platform::child::Child`] is generic over its handle.
+//! `std::process::Command` cannot launch into a container: the container
+//! assignment, the job and the std handles all live in process attributes it
+//! does not expose. The launch is therefore made directly, which returns pipe
+//! handles rather than `std::process` streams — and that is why
+//! [`crate::platform::child::Child`] is generic over its handle.
 
 mod acl;
+mod capability;
 mod child;
 mod container;
+mod launch;
+#[cfg(test)]
+mod launch_tests;
+mod loopback;
 mod priority;
+mod profile;
+mod sid;
 
+use std::ffi::OsString;
+use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Output;
 
-use rappct::launch::{
-    JobGuard, JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io, merge_parent_env,
-};
-
 pub(crate) use child::AppContainerChild;
 use container::Container;
+use loopback::LoopbackExemption;
+use sid::Sid;
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::{Backend, Child, SpawnRequest};
 
+/// A launch-prep failure that names the call which produced it.
+///
+/// Backend internals return this so the boundaries can wrap it once — in
+/// `Error::InitFailed` — and `with_causes` prints the call and the OS error
+/// the call returned, exactly once each.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Win32Failure {
+    /// A Win32 call returned an error; `call` names it.
+    #[error("{call} failed")]
+    Win32 {
+        /// The call that failed.
+        call: &'static str,
+        /// The error it returned.
+        #[source]
+        source: windows::core::Error,
+    },
+    /// A Rust-side call failed; `call` names it.
+    #[error("{call} failed")]
+    Io {
+        /// The call that failed.
+        call: &'static str,
+        /// The error it returned.
+        #[source]
+        source: io::Error,
+    },
+    /// A value the launch needed was malformed before any call ran.
+    #[error("{0}")]
+    Invalid(String),
+    /// An error that already carries heel context.
+    #[error(transparent)]
+    Internal(#[from] Error),
+}
+
+impl Win32Failure {
+    /// Build a failure for the Win32 call `call` — for use with `map_err`.
+    fn call(call: &'static str) -> impl FnOnce(windows::core::Error) -> Self {
+        move |source| Self::Win32 { call, source }
+    }
+
+    /// Build a failure for the Rust-side call `call` — for use with `map_err`.
+    fn io(call: &'static str) -> impl FnOnce(io::Error) -> Self {
+        move |source| Self::Io { call, source }
+    }
+}
+
+/// Variables a launched process inherits from the parent when the request is
+/// silent.
+///
+/// A custom environment replaces the parent's entirely, and a process without
+/// `SystemRoot` or `ComSpec` fails before its first instruction, so these are
+/// filled in when nothing supplied them. Windows compares names
+/// case-insensitively, so the check does too — a `PATH` the caller spelled
+/// `Path` must not be duplicated.
+const INHERITED_VARIABLES: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "PATH",
+];
+
 /// Machine facts a Windows process expects to find in its environment.
 ///
-/// The launcher already fills in `SystemRoot`, `windir`, `ComSpec`, `PATHEXT`
-/// and the temp variables. These are the rest of what the loader and the C
-/// runtime consult, and they describe the machine rather than the user, so
-/// passing them through leaks nothing: the user's own variables stay out.
+/// The inherited variables already fill in `SystemRoot`, `windir`, `ComSpec`,
+/// `PATHEXT` and the temp variables. These are the rest of what the loader
+/// and the C runtime consult, and they describe the machine rather than the
+/// user, so passing them through leaks nothing: the user's own variables stay
+/// out.
 const MACHINE_FACTS: &[&str] = &[
     "SystemDrive",
     "OS",
@@ -101,13 +174,19 @@ impl WindowsBackend {
 
     /// Prepare everything one launch needs.
     ///
-    /// Returns the options, the capabilities and the loopback exemption, which
-    /// must outlive the process it is granted for.
+    /// Returns the program, the capability and the loopback exemption, the
+    /// last of which must outlive the process it is granted for.
     fn prepare(&self, request: &SpawnRequest<'_>) -> Result<Prepared> {
         // The container has to read the program to run it. Anything under the
         // system directories is already open to every package; a program
         // elsewhere is not, so it is granted explicitly.
-        let program = which::which(request.program)
+        let path = request
+            .envs
+            .iter()
+            .rev()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value);
+        let program = which::which_in(request.program, path, request.working_dir())
             .map_err(|source| Error::path(request.program, std::io::Error::other(source)))?;
         self.container.grant_program(&program)?;
 
@@ -118,31 +197,9 @@ impl WindowsBackend {
             None => None,
         };
 
-        let limits = request.config.limits();
-        let options = LaunchOptions {
-            exe: program,
-            cmdline: Some(command_line(request)),
-            cwd: Some(request.working_dir().to_path_buf()),
-            env: Some(environment(request)),
-            stdio: stdio(request.stdout),
-            // The launcher configures the three streams together, so the
-            // request's stdout decides for all of them; every caller in this
-            // crate asks for the same thing on all three anyway.
-            suspended: false,
-            join_job: Some(JobLimits {
-                memory_bytes: limits
-                    .max_memory_bytes()
-                    .and_then(|v| usize::try_from(v).ok()),
-                cpu_rate_percent: None,
-                // The sandbox owns the tree: when the job closes, it goes.
-                kill_on_job_close: true,
-            }),
-            startup_timeout: None,
-        };
-
         Ok(Prepared {
-            options,
-            capabilities: self.container.capabilities(request.proxy_port.is_some())?,
+            program,
+            capability: self.container.capabilities(request.proxy_port.is_some())?,
             loopback,
         })
     }
@@ -151,37 +208,36 @@ impl WindowsBackend {
     fn launch(&self, request: SpawnRequest<'_>) -> Result<Child> {
         let prepared = self.prepare(&request)?;
 
-        let launched = launch_in_container_with_io(&prepared.capabilities, &prepared.options)
-            .map_err(|source| {
-                Error::InitFailed(format!(
-                    "cannot launch {} in the AppContainer from {}: {}; environment was {}",
-                    request.program,
-                    request.working_dir().display(),
-                    with_causes(&source),
-                    describe(&prepared.options),
-                ))
-            })?;
+        let limits = request.config.limits();
+        // The launcher configures the three streams together, so the
+        // request's stdout decides for all of them; every caller in this
+        // crate asks for the same thing on all three anyway.
+        let options = launch::Launch {
+            package: self.container.sid(),
+            capability: prepared.capability.as_ref(),
+            exe: prepared.program,
+            cmdline: command_line(&request),
+            cwd: request.working_dir().to_path_buf(),
+            env: environment(&request),
+            stdio: stdio(request.stdout),
+            memory_bytes: limits
+                .max_memory_bytes()
+                .and_then(|v| usize::try_from(v).ok()),
+            priority: request.config.priority(),
+        };
 
-        // The job object is what carries the priority, and it is the one the
-        // process was assigned to at launch, so lowering it here covers the
-        // process and everything it goes on to create.
-        let configured = request.config.priority();
-        if !configured.is_normal() {
-            let job = launched
-                .job_guard
-                .as_ref()
-                .map(JobGuard::as_handle)
-                .ok_or_else(|| {
-                    Error::InitFailed(format!(
-                        "no job object was created for {}, so its priority cannot be lowered",
-                        request.program
-                    ))
-                })?;
-            priority::apply(job, configured)?;
-        }
+        let launched = launch::launch(&options).map_err(|source| {
+            Error::InitFailed(format!(
+                "cannot launch {} in the AppContainer from {}: {}; environment was {}",
+                request.program,
+                request.working_dir().display(),
+                with_causes(&source),
+                describe(&options.env),
+            ))
+        })?;
 
         let pid = launched.pid;
-        let child = AppContainerChild::new(launched, prepared.loopback)?;
+        let child = AppContainerChild::new(launched, prepared.loopback);
         tracing::debug!(program = %request.program, pid, "sandbox: spawned");
 
         Ok(Child::new(child))
@@ -193,15 +249,16 @@ impl WindowsBackend {
 /// Windows processes need a handful of variables from the parent -- `SystemRoot`
 /// above all -- or the loader and much of the Win32 API fail before the
 /// program's first instruction. The sandbox's own variables win where the two
-/// overlap, because `merge_parent_env` only fills in what is missing.
+/// overlap, because an inherited variable is added only when nothing supplied
+/// it.
 ///
 /// The result has to be sorted case-insensitively by name: `CreateProcessW`
 /// refuses an unsorted block with `ERROR_ENVVAR_NOT_FOUND`, which names no
-/// variable and reads like something else entirely. `merge_parent_env` appends
-/// to whatever it is given, so sorting has to happen after it rather than at
-/// the point the variables are collected.
-fn environment(request: &SpawnRequest<'_>) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = request
+/// variable and reads like something else entirely. Inherited variables are
+/// appended to whatever the request supplied, so sorting has to happen after
+/// them rather than at the point the variables are collected.
+fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = request
         .envs
         .iter()
         .map(|(key, value)| (key.into(), value.into()))
@@ -215,7 +272,18 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(std::ffi::OsString, std::ffi:
         }
     }
 
-    let mut env = merge_parent_env(env);
+    for name in INHERITED_VARIABLES {
+        if let Some(value) = std::env::var_os(name)
+            && !env.iter().any(|(existing, _)| {
+                existing
+                    .as_encoded_bytes()
+                    .eq_ignore_ascii_case(name.as_bytes())
+            })
+        {
+            env.push(((*name).into(), value));
+        }
+    }
+
     env.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_lowercase());
     env
 }
@@ -227,11 +295,7 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(std::ffi::OsString, std::ffi:
 /// entries themselves have to be in the message to be diagnosable at all. Only
 /// names and value lengths are shown: values carry proxy URLs and paths, and a
 /// failure message is not the place to print them.
-fn describe(options: &LaunchOptions) -> String {
-    let Some(env) = options.env.as_ref() else {
-        return "inherited".to_string();
-    };
-
+fn describe(env: &[(OsString, OsString)]) -> String {
     let entries = env
         .iter()
         .map(|(name, value)| {
@@ -263,11 +327,23 @@ pub(crate) fn with_causes(error: &dyn std::error::Error) -> String {
         .join(": ")
 }
 
+/// Encode `value` as a NUL-terminated UTF-16 string for `*_W` parameters.
+fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    value
+        .as_ref()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 /// Everything one launch needs, built before the process starts.
 struct Prepared {
-    options: LaunchOptions,
-    capabilities: rappct::capability::SecurityCapabilities,
-    loopback: Option<rappct::net::LoopbackExemptionGuard>,
+    /// The resolved path to the program to run.
+    program: std::path::PathBuf,
+    /// `internetClient`, when the process may reach the proxy.
+    capability: Option<Sid>,
+    /// The loopback exemption, held for the life of the process.
+    loopback: Option<LoopbackExemption>,
 }
 
 /// Build the command line the process sees.
@@ -316,11 +392,11 @@ fn quote(argument: &str) -> String {
 }
 
 /// Map a standard-stream configuration onto the launcher's.
-fn stdio(configured: crate::command::StdioConfig) -> StdioConfig {
+fn stdio(configured: crate::command::StdioConfig) -> launch::Stdio {
     match configured {
-        crate::command::StdioConfig::Inherit => StdioConfig::Inherit,
-        crate::command::StdioConfig::Piped => StdioConfig::Pipe,
-        crate::command::StdioConfig::Null => StdioConfig::Null,
+        crate::command::StdioConfig::Inherit => launch::Stdio::Inherit,
+        crate::command::StdioConfig::Piped => launch::Stdio::Pipe,
+        crate::command::StdioConfig::Null => launch::Stdio::Null,
     }
 }
 
@@ -345,9 +421,9 @@ mod tests {
 
     // The public types must stay Send+Sync: callers hold a `Sandbox`/`Child`
     // inside async state (per-chat actors, daemons) whose futures spawn onto
-    // multi-threaded executors. `rappct` internals lose the auto impls to raw
-    // pointers; the unsafe impls on `Container`/`AppContainerChild` restore
-    // them — this keeps that from regressing silently.
+    // multi-threaded executors. Everything the backend owns is an ordinary
+    // `Send`/`Sync` value — owned SIDs, `OwnedHandle`s, `File`s — and this
+    // keeps a stray raw pointer from regressing it silently.
     const _: () = {
         const fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<crate::Sandbox>();

@@ -66,6 +66,19 @@ impl SandboxHandle {
 /// combination that would record nothing, a deny-all policy with no proxy.
 pub async fn create_sandbox(config: &MergedConfig) -> CliResult<SandboxHandle> {
     let builder = SandboxConfigBuilder::default();
+    match &config.ipc_endpoint {
+        Some(endpoint) => {
+            let endpoint = heel::ipc::TcpIpcEndpoint::resolve(endpoint, config.ipc_timeout).await?;
+            create_with_builder(config, builder.external_ipc(endpoint)).await
+        }
+        None => create_with_builder(config, builder).await,
+    }
+}
+
+async fn create_with_builder<I>(
+    config: &MergedConfig,
+    builder: SandboxConfigBuilder<heel::DenyAll, I>,
+) -> CliResult<SandboxHandle> {
     let audit = config
         .audit_log
         .as_deref()
@@ -99,8 +112,8 @@ pub async fn create_sandbox(config: &MergedConfig) -> CliResult<SandboxHandle> {
 }
 
 /// Apply the merged configuration to a sandbox config builder.
-fn build<N: NetworkPolicy>(
-    builder: SandboxConfigBuilder<N>,
+fn build<N: NetworkPolicy, I>(
+    builder: SandboxConfigBuilder<N, I>,
     config: &MergedConfig,
 ) -> SandboxConfig<N> {
     let mut builder = builder

@@ -20,7 +20,7 @@ jobs:
         # per architecture: a rule compiled in on x86_64 and compiled out on
         # aarch64 leaves a hole that nothing else here would show. That is not
         # hypothetical -- `clone3` went unfiltered on aarch64 exactly that way.
-        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,6 +31,15 @@ jobs:
       - name: Build
         run: cargo build --verbose --all-features
 
+      - name: Native Windows sandbox launch
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./target/debug/heel.exe run --network deny --working-dir "$env:RUNNER_TEMP/heel-native-preflight" -- cmd.exe /D /S /C "echo native-sandbox-ready"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        env:
+          RUST_LOG: heel=debug,rappct=trace
+
       # The isolation suite runs real programs in real sandboxes and asserts
       # that forbidden operations fail, so it is the check that matters most
       # here; it is part of the test run rather than a separate example.
@@ -38,8 +47,11 @@ jobs:
       # list, so one failing binary cannot hide the suites that assert what
       # the sandbox denies.
       - uses: taiki-e/install-action@nextest
+        if: ${{ !cancelled() }}
       - name: Test
-        run: cargo nextest run --all-features
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: cargo nextest run --all-features --no-fail-fast --config-file .devin/nextest.toml --profile ci
         env:
           # The backends report a refused launch through one opaque error; their
           # traces name the step that actually failed.

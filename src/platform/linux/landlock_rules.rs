@@ -314,14 +314,13 @@ fn configured_rules(config: &SandboxConfigData, abi: ABI) -> Vec<ConfiguredRule>
         access: writable_access(abi),
     }];
 
-    // The generated IPC shims live inside the working directory and are written
-    // by the host before the sandbox starts, so they are the one place in it
-    // that may be executed. This mirrors the macOS profile, which carves out the
+    // The generated IPC shims live in a private directory and are written
+    // by the host before the sandbox starts, so that subtree is granted
+    // read and execute. This mirrors the macOS profile, which carves out the
     // same directory.
-    if config.ipc_socket().is_some() {
-        let layout = crate::ipc::IpcLayout::new(config.working_dir());
+    if let Some(bin_dir) = config.ipc_bin_dir() {
         rules.push(ConfiguredRule {
-            path: layout.bin_dir().to_path_buf(),
+            path: bin_dir.to_path_buf(),
             access: make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute }),
         });
     }

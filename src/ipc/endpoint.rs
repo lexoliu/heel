@@ -36,14 +36,30 @@ pub(crate) fn name(path: &Path) -> io::Result<Name<'static>> {
 
 /// The name the pipe bound for `path` carries in `\\.\pipe\`.
 ///
-/// The last two path components are used, so the per-sandbox directory name
-/// that makes the socket unique is preserved in the pipe name.
+/// The complete native path is hashed so nested socket directories preserve
+/// sandbox identity within the system-wide pipe namespace.
 #[cfg(windows)]
 pub(crate) fn pipe_name(path: &Path) -> String {
-    path.components()
-        .rev()
-        .take(2)
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("-")
+    use sha2::{Digest, Sha256};
+    use std::os::windows::ffi::OsStrExt;
+
+    let bytes = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    format!("heel-{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_socket_paths_retain_the_sandbox_identity() {
+        let first = Path::new(r"C:\Temp\heel-first\socket\s");
+        let second = Path::new(r"C:\Temp\heel-second\socket\s");
+        assert_ne!(pipe_name(first), pipe_name(second));
+        assert_eq!(pipe_name(first), pipe_name(first));
+    }
 }

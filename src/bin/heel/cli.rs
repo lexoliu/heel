@@ -135,6 +135,10 @@ impl PythonArgs {
 /// rather than in shell script.
 #[derive(Args)]
 pub struct IpcArgs {
+    /// TCP IPC connection and request deadline.
+    #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
+    pub timeout: std::time::Duration,
+
     /// IPC command name to invoke.
     pub command: String,
 
@@ -162,6 +166,14 @@ pub struct IpcArgs {
 /// `heel run /bin/sh -c "..."` instead of leaving it for the program.
 #[derive(Args)]
 pub struct CommonArgs {
+    /// Trusted TCP IPC peer relayed over a protected local socket.
+    #[arg(long)]
+    pub ipc_endpoint: Option<String>,
+
+    /// Deadline for connecting and forwarding one IPC request.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    pub ipc_timeout: Option<std::time::Duration>,
+
     /// Path to a TOML config file.
     #[arg(short, long)]
     pub config: Option<PathBuf>,

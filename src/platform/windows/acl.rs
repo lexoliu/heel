@@ -8,7 +8,7 @@
 //! files, without execute.
 //!
 //! That distinction is why these calls are made directly rather than through
-//! `rappct`, whose ACL helper applies a single mask to a directory and
+//! a generic ACL helper, which applies a single mask to a directory and
 //! everything beneath it.
 
 use std::io;
