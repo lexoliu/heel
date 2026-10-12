@@ -50,7 +50,8 @@ jobs:
         if: ${{ !cancelled() }}
       - name: Test
         if: ${{ !cancelled() }}
-        run: cargo nextest run --all-features --no-fail-fast
+        timeout-minutes: 10
+        run: cargo nextest run --all-features --no-fail-fast --config-file .devin/nextest.toml --profile ci
         env:
           # The backends report a refused launch through one opaque error; their
           # traces name the step that actually failed.

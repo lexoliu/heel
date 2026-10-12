@@ -1,0 +1,2 @@
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 4, grace-period = "10s", on-timeout = "fail" }
