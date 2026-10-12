@@ -1,6 +1,2 @@
 [profile.ci]
 slow-timeout = { period = "30s", terminate-after = 4, grace-period = "10s", on-timeout = "fail" }
-
-[[profile.ci.overrides]]
-filter = 'test(empty_capability_array_is_null_for_native_launch)'
-success-output = "immediate"

@@ -731,7 +731,6 @@ dependencies = [
  "polling",
  "pty-process",
  "rand",
- "rappct",
  "remove_dir_all",
  "rmp-serde",
  "seccompiler",
@@ -1278,17 +1277,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
-]
-
-[[package]]
-name = "rappct"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11762a6aea3b0a87a51b21cb2085d252f10c01cd0f3f505e1da002cf6e2427da"
-dependencies = [
- "thiserror",
- "tracing",
- "windows",
 ]
 
 [[package]]

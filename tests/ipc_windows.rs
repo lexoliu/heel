@@ -33,7 +33,7 @@ impl IpcCommand for Echo {
 
 async fn sandbox() -> Sandbox {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("heel=debug,rappct=trace")
+        .with_env_filter("heel=debug")
         .try_init();
     Sandbox::with_config_and_executor(
         SandboxConfigBuilder::default()

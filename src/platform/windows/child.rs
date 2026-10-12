@@ -1,103 +1,62 @@
 //! The process handle the Windows backend produces.
 //!
-//! The launcher returns a process identifier and pipe handles, but keeps its own
-//! process handle private and its `wait` consumes the value, so it cannot serve
-//! `try_wait` or `kill`. This opens a handle of its own instead. The launcher's
-//! value is kept alive alongside it for two reasons: it owns the job object,
-//! whose closure kills the process tree, and while it holds a process handle the
-//! kernel will not reuse the identifier.
+//! The launcher returns the process and job handles it created, so the child
+//! owns them directly — no second `OpenProcess`, and the job is the one the
+//! process was assigned to at creation. The job handle is also what carries
+//! the kill: closing it ends the whole tree, and `kill` asks it to.
 
 use std::fs::File;
 use std::io;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
 
-use rappct::launch::LaunchedIo;
-use rappct::net::LoopbackExemptionGuard;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_FAILED, WAIT_TIMEOUT};
-use windows::Win32::Storage::FileSystem::SYNCHRONIZE;
+use windows::Win32::Foundation::{HANDLE, STILL_ACTIVE, WAIT_FAILED, WAIT_TIMEOUT};
 use windows::Win32::System::JobObjects::TerminateJobObject;
-use windows::Win32::System::Threading::{
-    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_INFORMATION,
-    PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
-};
+use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 
+use super::launch::Launched;
+use super::loopback::LoopbackExemption;
 use crate::platform::child::ProcessHandle;
-
-/// An owned process handle, closed when it goes out of scope.
-#[derive(Debug)]
-struct OwnedProcess(HANDLE);
-
-// SAFETY: a process handle is not tied to the thread that opened it; the kernel
-// permits any thread to wait on, query or terminate through it.
-unsafe impl Send for OwnedProcess {}
-// SAFETY: as for Send — concurrent `&` access only reads the handle value.
-unsafe impl Sync for OwnedProcess {}
-
-impl Drop for OwnedProcess {
-    fn drop(&mut self) {
-        // SAFETY: the handle came from `OpenProcess` and is closed exactly once.
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
 
 /// A process running inside an AppContainer.
 #[derive(Debug)]
 pub(crate) struct AppContainerChild {
-    /// Owns the job object and the launcher's process handle; see the module
-    /// comment for why it is kept rather than destructured.
-    launched: LaunchedIo,
-    process: OwnedProcess,
-    /// Held for the life of the process: dropping it withdraws the container's
-    /// permission to reach the proxy on loopback.
-    _loopback: Option<LoopbackExemptionGuard>,
+    /// The process itself, adopted from `PROCESS_INFORMATION`.
+    process: OwnedHandle,
+    /// The job the process was assigned to at creation: kill-on-close.
+    job: OwnedHandle,
+    /// The parent's ends of the pipes, when the launch asked for them.
+    stdin: Option<File>,
+    /// Same, for standard output.
+    stdout: Option<File>,
+    /// Same, for standard error.
+    stderr: Option<File>,
+    /// Held for the life of the process: dropping it withdraws the
+    /// container's permission to reach the proxy on loopback.
+    _loopback: Option<LoopbackExemption>,
     pid: u32,
 }
 
-// SAFETY: every field is a kernel object (process/job/file handles) or a
-// read-only SID. None of them is tied to the thread that created it — Win32
-// permits any thread to wait on, signal, or pass them to syscalls — and the
-// only mutation runs once in Drop.
-unsafe impl Send for AppContainerChild {}
-// SAFETY: as for Send; shared `&` access exposes only read-only operations.
-unsafe impl Sync for AppContainerChild {}
-
 impl AppContainerChild {
     /// Adopt a freshly launched process.
-    pub(crate) fn new(
-        launched: LaunchedIo,
-        loopback: Option<LoopbackExemptionGuard>,
-    ) -> io::Result<Self> {
-        let pid = launched.pid;
-
-        // SAFETY: `pid` names the process just launched, which the value in
-        // `launched` still holds a handle to, so the identifier is still valid.
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_ACCESS_RIGHTS(
-                    PROCESS_QUERY_INFORMATION.0 | PROCESS_TERMINATE.0 | SYNCHRONIZE.0,
-                ),
-                false,
-                pid,
-            )
-        }
-        .map_err(|source| {
-            io::Error::other(format!("cannot open the sandboxed process {pid}: {source}"))
-        })?;
-
-        Ok(Self {
-            launched,
-            process: OwnedProcess(handle),
+    pub(crate) fn new(launched: Launched, loopback: Option<LoopbackExemption>) -> Self {
+        Self {
+            process: launched.process,
+            job: launched.job,
+            stdin: launched.stdin,
+            stdout: launched.stdout,
+            stderr: launched.stderr,
             _loopback: loopback,
-            pid,
-        })
+            pid: launched.pid,
+        }
     }
 
     /// The process's exit code, or `None` while it is still running.
     fn exit_code(&self) -> io::Result<Option<u32>> {
         let mut code = 0u32;
         // SAFETY: the handle is open and `code` is a valid destination.
-        unsafe { GetExitCodeProcess(self.process.0, &mut code) }
+        unsafe { GetExitCodeProcess(self.process_handle(), &mut code) }
             .map_err(|source| io::Error::other(format!("cannot read the exit code: {source}")))?;
 
         // A process that genuinely exits with this value is indistinguishable
@@ -111,11 +70,16 @@ impl AppContainerChild {
     /// Wait for the process, for at most `timeout_ms`.
     fn wait_for(&self, timeout_ms: u32) -> io::Result<bool> {
         // SAFETY: the handle is open and waitable.
-        let result = unsafe { WaitForSingleObject(self.process.0, timeout_ms) };
+        let result = unsafe { WaitForSingleObject(self.process_handle(), timeout_ms) };
         if result == WAIT_FAILED {
             return Err(io::Error::last_os_error());
         }
         Ok(result != WAIT_TIMEOUT)
+    }
+
+    /// The process handle in `HANDLE` form.
+    fn process_handle(&self) -> HANDLE {
+        HANDLE(self.process.as_raw_handle())
     }
 }
 
@@ -139,14 +103,9 @@ impl ProcessHandle for AppContainerChild {
 
     fn kill(&mut self) -> io::Result<()> {
         // Terminating the job takes the whole process tree, which is what the
-        // other backends do by signalling a process group. Without a job there
-        // is only the process itself to terminate.
-        let terminated = match self.launched.job_guard.as_ref() {
-            // SAFETY: the guard owns the job handle for as long as it lives.
-            Some(job) => unsafe { TerminateJobObject(job.as_handle(), 1) },
-            // SAFETY: the handle is open and was opened with PROCESS_TERMINATE.
-            None => unsafe { TerminateProcess(self.process.0, 1) },
-        };
+        // other backends do by signalling a process group.
+        // SAFETY: the guard owns the job handle for as long as it lives.
+        let terminated = unsafe { TerminateJobObject(HANDLE(self.job.as_raw_handle()), 1) };
 
         // A process that has already exited cannot be terminated, which is the
         // state this call is trying to reach.
@@ -159,14 +118,14 @@ impl ProcessHandle for AppContainerChild {
     }
 
     fn stdin(&mut self) -> &mut Option<File> {
-        &mut self.launched.stdin
+        &mut self.stdin
     }
 
     fn stdout(&mut self) -> &mut Option<File> {
-        &mut self.launched.stdout
+        &mut self.stdout
     }
 
     fn stderr(&mut self) -> &mut Option<File> {
-        &mut self.launched.stderr
+        &mut self.stderr
     }
 }

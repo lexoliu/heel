@@ -12,11 +12,6 @@
 
 use std::path::Path;
 
-use rappct::capability::{SecurityCapabilities, SecurityCapabilitiesBuilder};
-use rappct::net::LoopbackExemptionGuard;
-use rappct::profile::AppContainerProfile;
-use rappct::sid::AppContainerSid;
-
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -24,12 +19,13 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use super::acl::{self, Entry, Scope};
+use super::capability;
+use super::loopback::LoopbackExemption;
+use super::profile::Profile;
+use super::sid::Sid;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::grant::Access;
-
-/// Capability that permits outbound connections.
-const INTERNET_CLIENT: &str = "internetClient";
 
 /// Read a file, or list a directory.
 const READ: u32 = FILE_GENERIC_READ.0;
@@ -91,42 +87,21 @@ fn access_tree(access: Access) -> [Entry; 2] {
 /// sandboxes never share a SID and therefore never share ACL grants.
 #[derive(Debug)]
 pub(crate) struct Container {
-    /// `Option` only so that `Drop` can consume it; it is always `Some` before.
-    profile: Option<AppContainerProfile>,
+    /// The profile this sandbox's processes run in.
+    profile: Profile,
 }
-
-// SAFETY: the profile owns a SID, which is read-only kernel data after
-// creation — `rappct` stores it as a raw pointer, so auto Send/Sync are lost,
-// but no API mutates it and deallocation is a single Drop.
-unsafe impl Send for Container {}
-// SAFETY: as for Send; shared `&` access exposes only read-only operations.
-unsafe impl Sync for Container {}
 
 impl Container {
     /// Create the profile for a new sandbox.
     pub(crate) fn create() -> Result<Self> {
-        let name = format!("heel-{:016x}", rand::random::<u64>());
-        let profile = AppContainerProfile::ensure(&name, "heel sandbox", Some("heel sandbox"))
-            .map_err(|source| {
-                Error::InitFailed(format!(
-                    "cannot create AppContainer profile {name}: {source}"
-                ))
-            })?;
-
-        tracing::debug!(profile = %name, "created AppContainer profile");
         Ok(Self {
-            profile: Some(profile),
+            profile: Profile::create()?,
         })
     }
 
     /// The package SID that ACL grants and capabilities are keyed on.
-    pub(crate) fn sid(&self) -> &AppContainerSid {
-        // Always `Some` until `Drop`, which is the only place it is taken.
-        &self
-            .profile
-            .as_ref()
-            .expect("the profile is present until the container is dropped")
-            .sid
+    pub(crate) fn sid(&self) -> &Sid {
+        self.profile.sid()
     }
 
     /// Open the configured paths to this container.
@@ -289,21 +264,18 @@ impl Container {
             .map_err(|source| Error::path(path, source))
     }
 
-    /// The capabilities a process gets, given whether it may reach the network.
+    /// The capability a process gets, given whether it may reach the network.
     ///
     /// `network` is true when a proxy is running: the sandboxed process talks to
-    /// the proxy, and the proxy is what applies the policy.
-    pub(crate) fn capabilities(&self, network: bool) -> Result<SecurityCapabilities> {
-        let mut builder = SecurityCapabilitiesBuilder::new(self.sid());
+    /// the proxy, and the proxy is what applies the policy. With no proxy the
+    /// process gets no capability at all — `internetClient` is the difference
+    /// between outbound network and none.
+    pub(crate) fn capabilities(&self, network: bool) -> Result<Option<Sid>> {
         if network {
-            builder = builder.with_named(&[INTERNET_CLIENT]);
+            capability::internet_client().map(Some)
+        } else {
+            Ok(None)
         }
-        builder.build().map_err(|source| {
-            Error::InitFailed(format!(
-                "cannot derive container capabilities: {}",
-                super::with_causes(&source)
-            ))
-        })
     }
 
     /// Let this container reach the sandbox proxy on loopback.
@@ -316,8 +288,8 @@ impl Container {
     /// Registering one requires administrator rights. Failing here is an error
     /// rather than a downgrade: a sandbox whose traffic cannot reach the proxy
     /// is a sandbox whose network policy is not enforced.
-    pub(crate) fn exempt_loopback(&self) -> Result<LoopbackExemptionGuard> {
-        LoopbackExemptionGuard::new(self.sid()).map_err(|source| {
+    pub(crate) fn exempt_loopback(&self) -> Result<LoopbackExemption> {
+        LoopbackExemption::add(self.sid().clone()).map_err(|source| {
             Error::NotEnforced(format!(
                 "cannot add the loopback exemption the network proxy needs, so the network \
                  policy would not be applied: {source}. Registering one requires administrator \
@@ -337,16 +309,4 @@ fn in_system_directory(path: &Path) -> bool {
         .iter()
         .filter_map(|variable| std::env::var(variable).ok())
         .any(|root| path.starts_with(&root.to_lowercase()))
-}
-
-impl Drop for Container {
-    fn drop(&mut self) {
-        let Some(profile) = self.profile.take() else {
-            return;
-        };
-        let name = profile.name.clone();
-        if let Err(error) = profile.delete() {
-            tracing::warn!(profile = %name, %error, "failed to delete AppContainer profile");
-        }
-    }
 }
