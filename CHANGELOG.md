@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/lexoliu/heel/compare/heel-v0.3.1...heel-v0.4.0) - 2026-10-12
+
+### Breaking
+
+- `SandboxConfigBuilder` has a second type parameter for its IPC route. `ipc()` returns the builder in the configured state, so `builder = builder.ipc(router)` no longer compiles; bind the result to a new variable instead. Configuring both a local router and an external endpoint is a compile error.
+
+### Added
+
+- `SandboxConfigBuilder::external_ipc` and `TcpIpcEndpoint`: the sandbox's IPC commands reach one TCP endpoint on the host. heel relays to it from outside the sandbox, so the sandboxed process gets no TCP access.
+- `IpcRequest`, `IpcResponse` and `default_sandbox_path` are public.
+
+### Fixed
+
+- Windows 11 ARM64: sandboxes without network access failed to launch with `ERROR_INVALID_PARAMETER`.
+- Windows: IPC commands were written as shell scripts, which native Windows programs cannot run. They are now `.exe` entrypoints found through the sandbox `PATH`.
+- Windows: a child joins its job object, with the memory limit and priority already applied, at creation rather than after it has started.
+- Windows: `StdioConfig::Inherit` passes the parent's standard handles to the child.
+- Windows: reading an access control list no longer fails when the descriptor changes during the read.
+- Sandbox creation no longer blocks async executor threads.
+- The IPC server is stopped once on drop instead of twice.
+
+### Removed
+
+- The `rappct` dependency. The Windows backend calls Win32 directly.
+
 ## [0.3.1](https://github.com/lexoliu/heel/compare/heel-v0.3.0...heel-v0.3.1) - 2026-10-11
 
 ### Fixed
