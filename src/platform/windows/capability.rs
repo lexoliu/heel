@@ -10,37 +10,34 @@ use windows::Win32::Security::{
     CreateWellKnownSid, GetLengthSid, PSID, SECURITY_MAX_SID_SIZE, WinCapabilityInternetClientSid,
 };
 
+use super::Win32Failure;
 use super::sid::Sid;
-use crate::error::{Error, Result};
 
 /// The `internetClient` capability SID, owned by the caller.
 ///
 /// A sandbox asks for it when a proxy is running: the sandboxed process talks
 /// to the proxy, and the proxy is what applies the policy.
-pub(crate) fn internet_client() -> Result<Sid> {
-    // Every well-known SID fits in `SECURITY_MAX_SID_SIZE` bytes.
-    let mut bytes = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+pub(crate) fn internet_client() -> Result<Sid, Win32Failure> {
+    // Every well-known SID fits in `SECURITY_MAX_SID_SIZE` bytes, kept in
+    // `u32` storage so its sub-authority fields stay naturally aligned.
+    let mut words = vec![0u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(size_of::<u32>())];
     let mut length = SECURITY_MAX_SID_SIZE;
-    // SAFETY: `bytes` holds `length` writable bytes, which is the buffer
+    // SAFETY: `words` covers `length` writable bytes, which is the buffer
     // contract, and no domain SID applies to a capability SID.
     unsafe {
         CreateWellKnownSid(
             WinCapabilityInternetClientSid,
             None,
-            Some(PSID(bytes.as_mut_ptr().cast())),
+            Some(PSID(words.as_mut_ptr().cast())),
             &raw mut length,
         )
     }
-    .map_err(|source| {
-        Error::InitFailed(format!(
-            "CreateWellKnownSid(internetClient) failed: {source}"
-        ))
-    })?;
+    .map_err(Win32Failure::call("CreateWellKnownSid"))?;
 
     // The call writes the SID at the front of the buffer; `GetLengthSid`
-    // names its real size.
-    // SAFETY: the call just wrote a valid SID into `bytes`.
-    let used = unsafe { GetLengthSid(PSID(bytes.as_ptr().cast_mut().cast())) } as usize;
-    bytes.truncate(used);
-    Sid::from_bytes(bytes)
+    // names its real size in bytes.
+    // SAFETY: the call just wrote a valid SID into `words`.
+    let used = unsafe { GetLengthSid(PSID(words.as_ptr().cast_mut().cast())) } as usize;
+    words.truncate(used.div_ceil(size_of::<u32>()));
+    Sid::from_words(words)
 }

@@ -24,6 +24,7 @@ mod profile;
 mod sid;
 
 use std::ffi::OsString;
+use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Output;
@@ -36,6 +37,51 @@ use sid::Sid;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::platform::{Backend, Child, SpawnRequest};
+
+/// A launch-prep failure that names the call which produced it.
+///
+/// Backend internals return this so the boundaries can wrap it once — in
+/// `Error::InitFailed` — and `with_causes` prints the call and the OS error
+/// the call returned, exactly once each.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Win32Failure {
+    /// A Win32 call returned an error; `call` names it.
+    #[error("{call} failed")]
+    Win32 {
+        /// The call that failed.
+        call: &'static str,
+        /// The error it returned.
+        #[source]
+        source: windows::core::Error,
+    },
+    /// A Rust-side call failed; `call` names it.
+    #[error("{call} failed")]
+    Io {
+        /// The call that failed.
+        call: &'static str,
+        /// The error it returned.
+        #[source]
+        source: io::Error,
+    },
+    /// A value the launch needed was malformed before any call ran.
+    #[error("{0}")]
+    Invalid(String),
+    /// An error that already carries heel context.
+    #[error(transparent)]
+    Internal(#[from] Error),
+}
+
+impl Win32Failure {
+    /// Build a failure for the Win32 call `call` — for use with `map_err`.
+    fn call(call: &'static str) -> impl FnOnce(windows::core::Error) -> Self {
+        move |source| Self::Win32 { call, source }
+    }
+
+    /// Build a failure for the Rust-side call `call` — for use with `map_err`.
+    fn io(call: &'static str) -> impl FnOnce(io::Error) -> Self {
+        move |source| Self::Io { call, source }
+    }
+}
 
 /// Variables a launched process inherits from the parent when the request is
 /// silent.

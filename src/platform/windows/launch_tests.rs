@@ -118,11 +118,9 @@ fn internet_client_builds_one_enabled_entry() {
     let capabilities = SecurityCapabilities::new(&package, Some(&capability));
     assert!(!capabilities.value.Capabilities.is_null());
     assert_eq!(capabilities.value.CapabilityCount, 1);
-    let entry = capabilities
-        ._entry
-        .as_ref()
-        .as_ref()
-        .expect("one capability entry");
+    // SAFETY: `Capabilities` names the one entry `capabilities` owns, which
+    // outlives this read.
+    let entry = unsafe { &*capabilities.value.Capabilities };
     assert_eq!(entry.Attributes, SE_GROUP_ENABLED as u32);
     // SAFETY: both are valid SIDs for the duration of the call.
     assert!(unsafe { EqualSid(entry.Sid, capability.as_psid()) }.is_ok());

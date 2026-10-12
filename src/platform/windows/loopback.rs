@@ -47,7 +47,8 @@ impl Config {
         let status = unsafe { NetworkIsolationGetAppContainerConfig(&mut count, &mut entries) };
         if status != 0 {
             return Err(io::Error::other(format!(
-                "NetworkIsolationGetAppContainerConfig failed: {status}"
+                "NetworkIsolationGetAppContainerConfig failed: {}",
+                io::Error::from_raw_os_error(status.cast_signed())
             )));
         }
         Ok(Self { count, entries })
@@ -70,7 +71,8 @@ impl Config {
         let status = unsafe { NetworkIsolationSetAppContainerConfig(entries) };
         if status != 0 {
             return Err(io::Error::other(format!(
-                "NetworkIsolationSetAppContainerConfig failed: {status}"
+                "NetworkIsolationSetAppContainerConfig failed: {}",
+                io::Error::from_raw_os_error(status.cast_signed())
             )));
         }
         Ok(())

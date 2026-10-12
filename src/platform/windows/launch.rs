@@ -51,9 +51,11 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 
 use super::sid::Sid;
-use super::{priority, wide};
-use crate::error::{Error, Result};
+use super::{Win32Failure, priority, wide};
 use crate::priority::ProcessPriority;
+
+/// A launch-prep result; the failure names the call that produced it.
+type Result<T> = std::result::Result<T, Win32Failure>;
 
 /// How the child's three standard streams are wired.
 ///
@@ -153,8 +155,9 @@ impl SecurityCapabilities {
 
 /// An initialized `PROC_THREAD_ATTRIBUTE_LIST`, deleted on drop.
 struct AttributeList {
-    /// The buffer the list lives in; kept for ownership alone.
-    _storage: Vec<u8>,
+    /// The buffer the list lives in, pointer-aligned as the kernel structure
+    /// requires; kept for ownership alone.
+    _storage: Vec<usize>,
     /// The list itself.
     pointer: LPPROC_THREAD_ATTRIBUTE_LIST,
 }
@@ -166,16 +169,12 @@ impl AttributeList {
         // SAFETY: a null list with a valid size out-parameter asks for the
         // required size without writing anything.
         let _ = unsafe { InitializeProcThreadAttributeList(None, count, None, &mut bytes) };
-        let mut storage = vec![0u8; bytes];
+        let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
         let pointer = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
         // SAFETY: `storage` is exactly the buffer the sizing call described,
         // and it is not used for anything else.
         unsafe { InitializeProcThreadAttributeList(Some(pointer), count, None, &mut bytes) }
-            .map_err(|source| {
-                Error::InitFailed(format!(
-                    "InitializeProcThreadAttributeList failed: {source}"
-                ))
-            })?;
+            .map_err(Win32Failure::call("InitializeProcThreadAttributeList"))?;
         Ok(Self {
             _storage: storage,
             pointer,
@@ -204,11 +203,7 @@ impl AttributeList {
                 None,
             )
         }
-        .map_err(|source| {
-            Error::InitFailed(format!(
-                "UpdateProcThreadAttribute({attribute:#x}) failed: {source}"
-            ))
-        })
+        .map_err(|source| Win32Failure::call("UpdateProcThreadAttribute")(source))
     }
 }
 
@@ -315,7 +310,7 @@ pub(super) fn launch(launch: &Launch<'_>) -> Result<Launched> {
             &mut information,
         )
     }
-    .map_err(|source| Error::InitFailed(format!("CreateProcessW failed: {source}")))?;
+    .map_err(Win32Failure::call("CreateProcessW"))?;
 
     // The thread handle is not used; the process handle belongs to the child.
     // SAFETY: both are valid handles the call just returned.
@@ -338,7 +333,7 @@ pub(super) fn launch(launch: &Launch<'_>) -> Result<Launched> {
 fn create_job(memory_bytes: Option<usize>) -> Result<OwnedHandle> {
     // SAFETY: anonymous job with default security; the returned handle is ours.
     let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-        .map_err(|source| Error::InitFailed(format!("CreateJobObjectW failed: {source}")))?;
+        .map_err(Win32Failure::call("CreateJobObjectW"))?;
     // SAFETY: the call just returned it, and ownership moves to the guard.
     let job = unsafe { OwnedHandle::from_raw_handle(job.0) };
 
@@ -358,13 +353,11 @@ fn create_job(memory_bytes: Option<usize>) -> Result<OwnedHandle> {
             JobObjectExtendedLimitInformation,
             (&raw const info).cast(),
             u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).map_err(|source| {
-                Error::InitFailed(format!("job limit structure is too large: {source}"))
+                Win32Failure::Invalid(format!("job limit structure is too large: {source}"))
             })?,
         )
     }
-    .map_err(|source| {
-        Error::InitFailed(format!("SetInformationJobObject(limits) failed: {source}"))
-    })?;
+    .map_err(Win32Failure::call("SetInformationJobObject"))?;
     Ok(job)
 }
 
@@ -379,7 +372,7 @@ fn std_handles(mode: Stdio) -> Result<StdHandles> {
 
 /// Open the null device three times: once to read, twice to write.
 fn null_handles() -> Result<StdHandles> {
-    let open = |access: u32, what: &'static str| -> Result<OwnedHandle> {
+    let open = |access: u32| -> Result<OwnedHandle> {
         let path = wide("\\\\.\\NUL");
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -398,9 +391,7 @@ fn null_handles() -> Result<StdHandles> {
                 None,
             )
         }
-        .map_err(|source| {
-            Error::InitFailed(format!("CreateFileW(NUL) for {what} failed: {source}"))
-        })?;
+        .map_err(Win32Failure::call("CreateFileW(NUL)"))?;
         // SAFETY: the call just returned the handle, which the guard now owns.
         Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
     };
@@ -408,9 +399,9 @@ fn null_handles() -> Result<StdHandles> {
     Ok(StdHandles {
         parent: [None, None, None],
         child: [
-            Some(open(FILE_GENERIC_READ.0, "stdin")?),
-            Some(open(FILE_GENERIC_WRITE.0, "stdout")?),
-            Some(open(FILE_GENERIC_WRITE.0, "stderr")?),
+            Some(open(FILE_GENERIC_READ.0)?),
+            Some(open(FILE_GENERIC_WRITE.0)?),
+            Some(open(FILE_GENERIC_WRITE.0)?),
         ],
     })
 }
@@ -420,7 +411,7 @@ fn null_handles() -> Result<StdHandles> {
 /// A parent without a handle — a GUI process has no console — gets `None`,
 /// which is passed to the child as a null handle rather than failing.
 fn inherited_handles() -> Result<StdHandles> {
-    fn duplicate(which: STD_HANDLE, what: &'static str) -> Result<Option<OwnedHandle>> {
+    fn duplicate(which: STD_HANDLE) -> Result<Option<OwnedHandle>> {
         // SAFETY: `which` is a valid std-handle selector.
         let source = match unsafe { GetStdHandle(which) } {
             Ok(handle) if !handle.is_invalid() => handle,
@@ -441,7 +432,7 @@ fn inherited_handles() -> Result<StdHandles> {
                 DUPLICATE_SAME_ACCESS,
             )
         }
-        .map_err(|source| Error::InitFailed(format!("DuplicateHandle({what}) failed: {source}")))?;
+        .map_err(Win32Failure::call("DuplicateHandle"))?;
         // SAFETY: the call just wrote the handle, which the guard now owns.
         Ok(Some(unsafe { OwnedHandle::from_raw_handle(target.0) }))
     }
@@ -449,9 +440,9 @@ fn inherited_handles() -> Result<StdHandles> {
     Ok(StdHandles {
         parent: [None, None, None],
         child: [
-            duplicate(STD_INPUT_HANDLE, "stdin")?,
-            duplicate(STD_OUTPUT_HANDLE, "stdout")?,
-            duplicate(STD_ERROR_HANDLE, "stderr")?,
+            duplicate(STD_INPUT_HANDLE)?,
+            duplicate(STD_OUTPUT_HANDLE)?,
+            duplicate(STD_ERROR_HANDLE)?,
         ],
     })
 }
@@ -460,12 +451,10 @@ fn inherited_handles() -> Result<StdHandles> {
 /// are not.
 fn piped_handles() -> Result<StdHandles> {
     fn pipe() -> Result<(OwnedHandle, OwnedHandle)> {
-        let (reader, writer) = std::io::pipe().map_err(|source| {
-            Error::InitFailed(format!("cannot create an anonymous pipe: {source}"))
-        })?;
+        let (reader, writer) = std::io::pipe().map_err(Win32Failure::io("std::io::pipe"))?;
         Ok((reader.into(), writer.into()))
     }
-    fn mark(handle: &OwnedHandle, inheritable: bool, what: &'static str) -> Result<()> {
+    fn mark(handle: &OwnedHandle, inheritable: bool) -> Result<()> {
         // SAFETY: the handle is open and only its inherit flag is changed.
         unsafe {
             SetHandleInformation(
@@ -478,21 +467,19 @@ fn piped_handles() -> Result<StdHandles> {
                 },
             )
         }
-        .map_err(|source| {
-            Error::InitFailed(format!("SetHandleInformation({what}) failed: {source}"))
-        })
+        .map_err(Win32Failure::call("SetHandleInformation"))
     }
 
     let (child_stdin, parent_stdin) = pipe()?;
     let (parent_stdout, child_stdout) = pipe()?;
     let (parent_stderr, child_stderr) = pipe()?;
 
-    mark(&child_stdin, true, "stdin")?;
-    mark(&child_stdout, true, "stdout")?;
-    mark(&child_stderr, true, "stderr")?;
-    mark(&parent_stdin, false, "stdin")?;
-    mark(&parent_stdout, false, "stdout")?;
-    mark(&parent_stderr, false, "stderr")?;
+    mark(&child_stdin, true)?;
+    mark(&child_stdout, true)?;
+    mark(&child_stderr, true)?;
+    mark(&parent_stdin, false)?;
+    mark(&parent_stdout, false)?;
+    mark(&parent_stderr, false)?;
 
     Ok(StdHandles {
         parent: [
@@ -515,6 +502,11 @@ fn environment_block(env: &[(OsString, OsString)]) -> Result<Vec<u16>> {
         block.extend(value.encode_wide());
         block.push(0);
     }
+    // An empty block is still NUL-terminated twice — the format's final
+    // terminator follows the last entry's own.
+    if env.is_empty() {
+        block.push(0);
+    }
     block.push(0);
     Ok(block)
 }
@@ -526,7 +518,7 @@ fn environment_block(env: &[(OsString, OsString)]) -> Result<Vec<u16>> {
 fn check_entry(name: &OsStr, value: &OsStr) -> Result<()> {
     let name_wide: Vec<u16> = name.encode_wide().collect();
     if name_wide.is_empty() {
-        return Err(Error::InitFailed(
+        return Err(Win32Failure::Invalid(
             "the launch environment has an entry with an empty name".to_string(),
         ));
     }
@@ -534,14 +526,14 @@ fn check_entry(name: &OsStr, value: &OsStr) -> Result<()> {
     // early. Windows tolerates a leading `=` — `=C:` names a drive's private
     // variable — so only a `=` past the first character is rejected.
     if name_wide[1..].contains(&u16::from(b'=')) {
-        return Err(Error::InitFailed(format!(
+        return Err(Win32Failure::Invalid(format!(
             "the launch environment name {} contains `=`",
             name.to_string_lossy()
         )));
     }
     for (what, text) in [("name", name), ("value", value)] {
         if text.encode_wide().any(|unit| unit == 0) {
-            return Err(Error::InitFailed(format!(
+            return Err(Win32Failure::Invalid(format!(
                 "the launch environment {what} for {} contains a NUL",
                 name.to_string_lossy()
             )));

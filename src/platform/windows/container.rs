@@ -94,9 +94,14 @@ pub(crate) struct Container {
 impl Container {
     /// Create the profile for a new sandbox.
     pub(crate) fn create() -> Result<Self> {
-        Ok(Self {
-            profile: Profile::create()?,
-        })
+        let name = format!("heel-{:016x}", rand::random::<u64>());
+        let profile = Profile::create(&name).map_err(|source| {
+            Error::InitFailed(format!(
+                "cannot create AppContainer profile {name}: {}",
+                super::with_causes(&source)
+            ))
+        })?;
+        Ok(Self { profile })
     }
 
     /// The package SID that ACL grants and capabilities are keyed on.
@@ -272,7 +277,12 @@ impl Container {
     /// between outbound network and none.
     pub(crate) fn capabilities(&self, network: bool) -> Result<Option<Sid>> {
         if network {
-            capability::internet_client().map(Some)
+            capability::internet_client().map(Some).map_err(|source| {
+                Error::InitFailed(format!(
+                    "cannot derive container capabilities: {}",
+                    super::with_causes(&source)
+                ))
+            })
         } else {
             Ok(None)
         }

@@ -10,8 +10,7 @@ use windows::Win32::Security::Isolation::{CreateAppContainerProfile, DeleteAppCo
 use windows::core::PCWSTR;
 
 use super::sid::Sid;
-use super::wide;
-use crate::error::{Error, Result};
+use super::{Win32Failure, wide};
 
 /// The AppContainer profile a sandbox's processes run in.
 ///
@@ -26,14 +25,13 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
-    /// Create the profile for a new sandbox.
+    /// Create the profile for a new sandbox, under `name`.
     ///
     /// Any failure — including an already-existing profile, which a random
     /// name makes a bug rather than a case — is reported with the error
     /// `CreateAppContainerProfile` returned.
-    pub(crate) fn create() -> Result<Self> {
-        let name = format!("heel-{:016x}", rand::random::<u64>());
-        let name_wide = wide(&name);
+    pub(crate) fn create(name: &str) -> Result<Self, Win32Failure> {
+        let name_wide = wide(name);
         let display = wide("heel sandbox");
         let description = wide("heel sandbox");
 
@@ -48,15 +46,14 @@ impl Profile {
                 None,
             )
         }
-        .map_err(|source| {
-            Error::InitFailed(format!(
-                "CreateAppContainerProfile({name}) failed: {source}"
-            ))
-        })?;
+        .map_err(Win32Failure::call("CreateAppContainerProfile"))?;
 
         let sid = Sid::from_owned_psid(sid)?;
         tracing::debug!(profile = %name, sid = %sid.as_string(), "created AppContainer profile");
-        Ok(Self { name, sid })
+        Ok(Self {
+            name: name.to_owned(),
+            sid,
+        })
     }
 
     /// The package SID that ACL grants and capabilities are keyed on.
