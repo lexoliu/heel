@@ -47,7 +47,7 @@ fn seccomp_error_to_io(error: seccompiler::Error) -> std::io::Error {
 
 /// Build the filter for a sandbox configuration.
 ///
-/// `allow_tcp` is true when the sandbox has a proxy or an IPC endpoint to reach;
+/// `allow_tcp` is true only when the sandbox has a network proxy to reach;
 /// when false, TCP sockets cannot be created at all.
 pub(crate) fn build_filter(allow_tcp: bool) -> Result<PreparedFilter> {
     let arch = detect_arch()?;

@@ -47,8 +47,10 @@ jobs:
       # list, so one failing binary cannot hide the suites that assert what
       # the sandbox denies.
       - uses: taiki-e/install-action@nextest
+        if: ${{ !cancelled() }}
       - name: Test
-        run: cargo nextest run --all-features
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --all-features --no-fail-fast
         env:
           # The backends report a refused launch through one opaque error; their
           # traces name the step that actually failed.

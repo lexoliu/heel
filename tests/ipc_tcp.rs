@@ -8,6 +8,9 @@ use heel::ipc::{IpcCommand, IpcRouter, TcpIpcEndpoint};
 use heel::{Sandbox, SandboxConfigBuilder};
 use serde::Deserialize;
 
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
 struct Echo;
 
 #[derive(Deserialize)]
@@ -30,13 +33,23 @@ impl IpcCommand for Echo {
 
 #[tokio::test]
 async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
-    let listener = async_net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("binds");
+    let fixture = blocking::unblock(|| {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let binary = fixtures::compile(
+            dir.path(),
+            include_str!("fixtures/tcp_probe.rs"),
+            "tcp-probe",
+        );
+        (dir, binary)
+    });
+    let (listener, (_fixture_dir, probe)) =
+        futures_lite::future::zip(async_net::TcpListener::bind("127.0.0.1:0"), fixture).await;
+    let listener = listener.expect("binds");
     let address = listener.local_addr().expect("address");
     let router = IpcRouter::new().register(Echo);
     let sandbox = Sandbox::with_config_and_executor(
         SandboxConfigBuilder::default()
+            .executable(&probe)
             .external_ipc(TcpIpcEndpoint::new(address, Duration::from_secs(5)))
             .heel_binary(env!("CARGO_BIN_EXE_heel"))
             .build(),
@@ -79,32 +92,16 @@ async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
         String::from_utf8_lossy(&output.stdout).trim(),
         "live-handler-ok"
     );
-    #[cfg(windows)]
-    let curl = "curl.exe";
-    #[cfg(not(windows))]
-    let curl = "/usr/bin/curl";
-    let uri = http::Uri::builder()
-        .scheme("http")
-        .authority(address.to_string())
-        .path_and_query("/")
-        .build()
-        .expect("URI");
     let denied = sandbox
-        .command(curl)
-        .args([
-            "--noproxy",
-            "*",
-            "--max-time",
-            "2",
-            uri.to_string().as_str(),
-        ])
+        .command(probe.to_str().expect("fixture path is UTF-8"))
+        .arg(address.to_string())
         .output()
         .await
-        .expect("curl runs");
+        .expect("probe runs");
     assert_eq!(
         denied.status.code(),
-        Some(7),
-        "TCP must fail to connect, not time out after connecting: {}",
+        Some(2),
+        "the live listener must not be reachable by a child TCP connection: {}",
         String::from_utf8_lossy(&denied.stderr)
     );
 }

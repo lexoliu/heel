@@ -19,6 +19,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use heel::ipc::{IpcCommand, IpcRouter, NoArgs};
 use heel::{Access, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
 /// Run `script` with `cmd.exe` inside `sandbox`.
 async fn cmd(sandbox: &Sandbox<impl heel::NetworkPolicy>, script: &str) -> Output {
     sandbox
@@ -70,31 +73,12 @@ async fn the_temp_directory_is_private_to_the_container() {
 
 /// Compile a fixture program into `dir` and return its path.
 fn compile_fixture(dir: &Path, fixture: &str, output: &str) -> PathBuf {
-    let source = dir.join(format!("{fixture}.rs"));
-    std::fs::write(
-        &source,
-        match fixture {
-            "run_child" => include_str!("fixtures/run_child.rs"),
-            "fs_probe" => include_str!("fixtures/fs_probe.rs"),
-            other => unreachable!("no fixture named {other}"),
-        },
-    )
-    .expect("the host writes the fixture source");
-    let binary = dir.join(output);
-    let output_result = std::process::Command::new("rustc")
-        .arg("--edition=2021")
-        .arg("-O")
-        .arg("-o")
-        .arg(&binary)
-        .arg(&source)
-        .output()
-        .expect("the host compiles the fixture");
-    assert!(
-        output_result.status.success(),
-        "rustc: {}",
-        String::from_utf8_lossy(&output_result.stderr)
-    );
-    binary
+    let source = match fixture {
+        "run_child" => include_str!("fixtures/run_child.rs"),
+        "fs_probe" => include_str!("fixtures/fs_probe.rs"),
+        other => unreachable!("no fixture named {other}"),
+    };
+    fixtures::compile(dir, source, output)
 }
 
 #[tokio::test]

@@ -136,6 +136,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
 ] }
 
+[target."cfg(windows)".dependencies]
+sha2 = "=0.10.9"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 executor-core = { version = "0.7", features = ["tokio"] }
