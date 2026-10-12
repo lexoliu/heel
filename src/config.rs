@@ -461,11 +461,18 @@ impl<N: NetworkPolicy> SandboxConfig<N> {
     }
 }
 
+/// Builder state before an IPC route has been selected.
+pub struct IpcUnconfigured;
+
+/// Builder state with exactly one IPC route selected.
+pub struct IpcConfigured;
+
 /// Builder for [`SandboxConfig`].
-pub struct SandboxConfigBuilder<N: NetworkPolicy = DenyAll> {
+pub struct SandboxConfigBuilder<N: NetworkPolicy = DenyAll, I = IpcUnconfigured> {
     network: N,
     data: SandboxConfigData,
     ipc: Option<IpcRouter>,
+    ipc_state: std::marker::PhantomData<I>,
 }
 
 impl Default for SandboxConfigBuilder<DenyAll> {
@@ -494,19 +501,21 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 allow_tty_write: false,
             },
             ipc: None,
+            ipc_state: std::marker::PhantomData,
         }
     }
 }
 
-impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
+impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Set the network policy, changing the configuration's type.
-    pub fn network<M: NetworkPolicy>(self, policy: M) -> SandboxConfigBuilder<M> {
+    pub fn network<M: NetworkPolicy>(self, policy: M) -> SandboxConfigBuilder<M, I> {
         let mut data = self.data;
         data.network_deny_all = M::DENIES_ALL;
         SandboxConfigBuilder {
             network: policy,
             data,
             ipc: self.ipc,
+            ipc_state: self.ipc_state,
         }
     }
 
@@ -617,35 +626,49 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
         self.data.priority = priority;
         self
     }
+}
+
+impl<N: NetworkPolicy> SandboxConfigBuilder<N, IpcUnconfigured> {
+    fn configured(self) -> SandboxConfigBuilder<N, IpcConfigured> {
+        SandboxConfigBuilder {
+            network: self.network,
+            data: self.data,
+            ipc: self.ipc,
+            ipc_state: std::marker::PhantomData,
+        }
+    }
 
     /// Expose host-side commands to sandboxed processes over IPC.
     ///
-    /// # Panics
+    /// # IPC state
     ///
-    /// Panics if an external IPC endpoint was already configured.
-    pub fn ipc(mut self, router: IpcRouter) -> Self {
-        assert!(
-            self.data.external_ipc.is_none(),
-            "local and external IPC cannot be combined"
-        );
+    /// Selects the sole IPC route; a configured builder cannot select another.
+    pub fn ipc(mut self, router: IpcRouter) -> SandboxConfigBuilder<N, IpcConfigured> {
         self.ipc = Some(router);
-        self
+        self.configured()
     }
 
     /// Relay sandbox IPC to one explicitly trusted peer, keeping child networking denied.
     ///
-    /// # Panics
+    /// # IPC state
     ///
-    /// Panics if a local IPC router was already configured.
-    pub fn external_ipc(mut self, endpoint: crate::ipc::TcpIpcEndpoint) -> Self {
-        assert!(
-            self.ipc.is_none(),
-            "local and external IPC cannot be combined"
-        );
+    /// Selects the sole IPC route; a configured builder cannot select another.
+    /// ```compile_fail
+    /// use heel::{SandboxConfigBuilder, ipc::{IpcRouter, TcpIpcEndpoint}};
+    /// use std::time::Duration;
+    /// let peer = TcpIpcEndpoint::new("127.0.0.1:7000".parse().unwrap(), Duration::from_secs(1));
+    /// SandboxConfigBuilder::default().ipc(IpcRouter::new()).external_ipc(peer);
+    /// ```
+    pub fn external_ipc(
+        mut self,
+        endpoint: crate::ipc::TcpIpcEndpoint,
+    ) -> SandboxConfigBuilder<N, IpcConfigured> {
         self.data.external_ipc = Some(endpoint);
-        self
+        self.configured()
     }
+}
 
+impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Use a specific `heel` binary for the generated IPC command shims.
     ///
     /// Without this the binary is found through `HEEL_BIN`, the running

@@ -100,9 +100,9 @@ mod workdir;
 pub use command::DEFAULT_SANDBOX_PATH;
 pub use command::{Command, StdioConfig, default_sandbox_path};
 pub use config::{
-    PythonConfig, PythonConfigBuilder, ResourceLimits, ResourceLimitsBuilder, SandboxConfig,
-    SandboxConfigBuilder, SandboxConfigData, VenvBackend, VenvConfig, VenvConfigBuilder,
-    python_data_science_preset, python_dev_preset, strict_preset,
+    IpcConfigured, IpcUnconfigured, PythonConfig, PythonConfigBuilder, ResourceLimits,
+    ResourceLimitsBuilder, SandboxConfig, SandboxConfigBuilder, SandboxConfigData, VenvBackend,
+    VenvConfig, VenvConfigBuilder, python_data_science_preset, python_dev_preset, strict_preset,
 };
 pub use error::{Error, Result};
 pub use grant::{Access, Grant, ParseAccessError};
