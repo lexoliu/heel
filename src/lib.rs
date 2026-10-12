@@ -96,7 +96,9 @@ mod sandbox;
 mod security;
 mod workdir;
 
-pub use command::{Command, DEFAULT_SANDBOX_PATH, StdioConfig};
+#[cfg(unix)]
+pub use command::DEFAULT_SANDBOX_PATH;
+pub use command::{Command, StdioConfig, default_sandbox_path};
 pub use config::{
     PythonConfig, PythonConfigBuilder, ResourceLimits, ResourceLimitsBuilder, SandboxConfig,
     SandboxConfigBuilder, SandboxConfigData, VenvBackend, VenvConfig, VenvConfigBuilder,

@@ -16,18 +16,29 @@ use crate::error::{CliError, CliResult};
 const ENDPOINT_VAR: &str = "HEEL_IPC_ENDPOINT";
 
 /// Send the request and print whatever the handler returned.
-pub fn execute(args: IpcArgs) -> CliResult<()> {
+pub async fn execute(args: IpcArgs) -> CliResult<()> {
     let endpoint = std::env::var_os(ENDPOINT_VAR).ok_or(CliError::MissingIpcEndpoint)?;
-    let params = build_params(&args, read_stdin)?;
-
-    let mut client = IpcClient::connect(&endpoint)?;
-    let payload = client.call_raw(&args.command, &rmp_serde::to_vec_named(&params)?)?;
-
-    let rendered = render(&payload)?;
-    if !rendered.is_empty() {
-        println!("{rendered}");
-    }
-    Ok(())
+    let peer = match endpoint
+        .to_str()
+        .filter(|value| value.starts_with("tcp://"))
+    {
+        Some(value) => Some(heel::ipc::TcpIpcEndpoint::resolve(value, args.timeout).await?),
+        None => None,
+    };
+    blocking::unblock(move || {
+        let params = rmp_serde::to_vec_named(&build_params(&args, read_stdin)?)?;
+        let payload = match peer {
+            Some(peer) => IpcClient::connect_tcp(peer.address(), peer.timeout())?
+                .call_raw(&args.command, &params)?,
+            None => IpcClient::connect(&endpoint)?.call_raw(&args.command, &params)?,
+        };
+        let rendered = render(&payload)?;
+        if !rendered.is_empty() {
+            println!("{rendered}");
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Turn command-line arguments into the named parameters the handler expects.
@@ -130,6 +141,7 @@ mod tests {
 
     fn args(command: &str, positional: &[&str], stdin_arg: Option<&str>, rest: &[&str]) -> IpcArgs {
         IpcArgs {
+            timeout: std::time::Duration::from_secs(30),
             command: command.to_string(),
             positional: positional.iter().map(|s| s.to_string()).collect(),
             stdin_arg: stdin_arg.map(str::to_string),

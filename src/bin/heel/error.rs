@@ -27,6 +27,17 @@ pub enum CliError {
         source: Box<toml::de::Error>,
     },
 
+    #[cfg(windows)]
+    #[error("failed to decode native IPC metadata at {path}: {source}")]
+    NativeMetadata {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[cfg(windows)]
+    #[error("native IPC entrypoint has no UTF-8 command name")]
+    InvalidNativeCommand,
+
     #[error("invalid --env value (expected KEY=VALUE): {value}")]
     InvalidEnvFormat { value: String },
 

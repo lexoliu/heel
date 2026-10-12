@@ -53,12 +53,14 @@ mod endpoint;
 mod protocol;
 mod router;
 pub(crate) mod server;
+mod tcp;
 mod wrappers;
 
 pub use client::IpcClient;
 pub use command::{IpcCommand, NoArgs};
-pub use protocol::IpcError;
+pub use protocol::{IpcError, IpcRequest, IpcResponse};
 pub use router::{CommandMeta, IpcRouter};
+pub use tcp::TcpIpcEndpoint;
 pub use wrappers::{HEEL_DIR_NAME, SOCKET_NAME, WRAPPER_DIR_NAME};
 
 // Internal to the sandbox lifecycle, not part of the public surface.

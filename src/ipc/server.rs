@@ -35,6 +35,20 @@ use crate::ipc::router::IpcRouter;
 #[cfg(unix)]
 const MAX_SOCKET_PATH_LEN: usize = 100;
 
+pub(crate) trait IpcDispatcher: Send + Sync + 'static {
+    fn handle(
+        &self,
+        method: &str,
+        params: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, IpcError>> + Send;
+}
+
+impl IpcDispatcher for IpcRouter {
+    async fn handle(&self, method: &str, params: Vec<u8>) -> Result<Vec<u8>, IpcError> {
+        IpcRouter::handle(self, method, params).await
+    }
+}
+
 /// A running IPC server.
 #[derive(Debug)]
 pub(crate) struct IpcServer {
@@ -48,9 +62,9 @@ impl IpcServer {
     /// The parent directory must already exist; it is expected to be the
     /// sandbox's private socket directory, which is created with owner-only
     /// permissions.
-    pub(crate) async fn new<E: Executor + Clone + 'static>(
+    pub(crate) async fn new<E: Executor + Clone + 'static, D: IpcDispatcher>(
         socket_path: PathBuf,
-        router: IpcRouter,
+        router: D,
         executor: E,
     ) -> Result<Self, IpcError> {
         #[cfg(unix)]
@@ -209,7 +223,7 @@ fn read_frame(stream: &mut Stream) -> io::Result<Option<Vec<u8>>> {
 /// task instead would make the async dispatch below unreachable, and wrapping it
 /// in an adapter that buffers reads ahead would race the writes on the same
 /// socket.
-async fn handle_connection(stream: Stream, router: Arc<IpcRouter>) {
+async fn handle_connection<D: IpcDispatcher>(stream: Stream, router: Arc<D>) {
     let mut stream = stream;
 
     loop {

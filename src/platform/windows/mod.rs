@@ -107,7 +107,13 @@ impl WindowsBackend {
         // The container has to read the program to run it. Anything under the
         // system directories is already open to every package; a program
         // elsewhere is not, so it is granted explicitly.
-        let program = which::which(request.program)
+        let path = request
+            .envs
+            .iter()
+            .rev()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value);
+        let program = which::which_in(request.program, path, request.working_dir())
             .map_err(|source| Error::path(request.program, std::io::Error::other(source)))?;
         self.container.grant_program(&program)?;
 

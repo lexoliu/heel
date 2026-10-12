@@ -65,7 +65,11 @@ impl SandboxHandle {
 /// verdict without changing any of them. Merging has already rejected the one
 /// combination that would record nothing, a deny-all policy with no proxy.
 pub async fn create_sandbox(config: &MergedConfig) -> CliResult<SandboxHandle> {
-    let builder = SandboxConfigBuilder::default();
+    let mut builder = SandboxConfigBuilder::default();
+    if let Some(endpoint) = &config.ipc_endpoint {
+        builder = builder
+            .external_ipc(heel::ipc::TcpIpcEndpoint::resolve(endpoint, config.ipc_timeout).await?);
+    }
     let audit = config
         .audit_log
         .as_deref()

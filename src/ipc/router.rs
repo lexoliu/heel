@@ -18,7 +18,7 @@ type ErasedHandler = Arc<
 >;
 
 /// How a command's arguments may be written on the sandbox command line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandMeta {
     /// Argument names that may be given positionally, in order.
     pub positional_args: Cow<'static, [Cow<'static, str>]>,
@@ -78,6 +78,10 @@ impl IpcRouter {
         let stdin_arg = command.stdin_arg();
 
         assert_valid_identifier("command name", &name);
+        assert!(
+            name.as_ref() != "heel",
+            "heel is reserved for the IPC launcher"
+        );
         for arg in positional_args.iter() {
             assert_valid_identifier("positional argument name", arg);
         }
@@ -111,7 +115,7 @@ impl IpcRouter {
     }
 
     /// Dispatch one request. Called by the IPC server.
-    pub(crate) async fn handle(&self, method: &str, params: Vec<u8>) -> Result<Vec<u8>, IpcError> {
+    pub async fn handle(&self, method: &str, params: Vec<u8>) -> Result<Vec<u8>, IpcError> {
         let handler = self
             .handlers
             .get(method)

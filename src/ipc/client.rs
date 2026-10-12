@@ -20,11 +20,11 @@ use crate::ipc::protocol::{IpcError, IpcRequest, IpcResponse, MAX_FRAME_BYTES};
 /// Calls are blocking: the client runs in a short-lived helper process whose
 /// only job is to issue one request.
 #[derive(Debug)]
-pub struct IpcClient {
-    stream: Stream,
+pub struct IpcClient<S = Stream> {
+    stream: S,
 }
 
-impl IpcClient {
+impl IpcClient<Stream> {
     /// Connect to the IPC socket at `path`.
     ///
     /// Inside a sandbox the path comes from `HEEL_IPC_ENDPOINT`.
@@ -33,7 +33,23 @@ impl IpcClient {
             stream: Stream::connect(endpoint::name(path.as_ref())?)?,
         })
     }
+}
 
+impl IpcClient<std::net::TcpStream> {
+    /// Connect to a TCP IPC peer, bounding connection and I/O time by `timeout`.
+    pub fn connect_tcp(
+        address: std::net::SocketAddr,
+        timeout: std::time::Duration,
+    ) -> Result<Self, IpcError> {
+        let stream = std::net::TcpStream::connect_timeout(&address, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.set_nodelay(true)?;
+        Ok(Self { stream })
+    }
+}
+
+impl<S: Read + Write> IpcClient<S> {
     /// Call `method` with already-encoded MessagePack arguments.
     ///
     /// Returns the encoded response payload, or the error the handler reported.
@@ -128,6 +144,37 @@ mod tests {
         )
         .await
         .expect("server starts")
+    }
+
+    #[tokio::test]
+    async fn round_trips_typed_calls_over_tcp() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        let server = blocking::unblock(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).expect("reads length");
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).expect("reads request");
+            let request = IpcRequest::decode(&body).expect("decodes request");
+            assert_eq!(request.method, "sum");
+            let args: SumArgs = rmp_serde::from_slice(&request.params).expect("arguments");
+            let response = IpcResponse::success(
+                rmp_serde::to_vec(&(args.a + args.b)).expect("encodes response"),
+            );
+            stream
+                .write_all(&response.encode())
+                .expect("writes response");
+        });
+        let client = blocking::unblock(move || {
+            let mut client = IpcClient::connect_tcp(address, std::time::Duration::from_secs(5))
+                .expect("connects");
+            client
+                .call::<_, i64>("sum", &SumArgs { a: 2, b: 40 })
+                .expect("calls")
+        });
+        let (_, result) = futures_lite::future::zip(server, client).await;
+        assert_eq!(result, 42);
     }
 
     #[tokio::test]
