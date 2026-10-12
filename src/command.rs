@@ -6,7 +6,6 @@ use std::process::{ExitStatus, Output, Stdio};
 
 use crate::config::SandboxConfigData;
 use crate::error::Result;
-use crate::ipc::IpcLayout;
 use crate::platform::{Backend, Child, NativeBackend, SpawnRequest};
 use crate::sandbox::ProcessTracker;
 
@@ -21,8 +20,31 @@ use crate::sandbox::ProcessTracker;
 pub const DEFAULT_SANDBOX_PATH: &str =
     "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// The `PATH` a sandboxed process gets when nothing else specifies one.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub const DEFAULT_SANDBOX_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// Platform-native command search path without inheriting the host's PATH.
+///
+/// # Panics
+///
+/// On Windows, panics if the operating system's SystemRoot is unavailable or cannot form a PATH.
+pub fn default_sandbox_path() -> String {
+    #[cfg(unix)]
+    {
+        DEFAULT_SANDBOX_PATH.to_owned()
+    }
+    #[cfg(windows)]
+    {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot")
+                .expect("Windows requires SystemRoot to prepare the sandbox PATH"),
+        );
+        std::env::join_paths([root.join("System32"), root])
+            .expect("Windows system directories must form a PATH")
+            .into_string()
+            .expect("Windows system directories must be UTF-8")
+    }
+}
 
 /// Standard I/O configuration for a sandboxed command.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -282,15 +304,15 @@ pub(crate) fn sandbox_environment(
         envs.insert((*key).to_string(), working_dir.clone());
     }
 
+    for (key, value) in user_envs {
+        envs.insert(key.clone(), value.clone());
+    }
+
     if let Some(socket) = config.ipc_socket() {
         envs.insert(
             "HEEL_IPC_ENDPOINT".to_string(),
             socket.display().to_string(),
         );
-    }
-
-    for (key, value) in user_envs {
-        envs.insert(key.clone(), value.clone());
     }
 
     envs.insert("PATH".to_string(), sandbox_path(config, user_envs));
@@ -315,13 +337,12 @@ fn sandbox_path(config: &SandboxConfigData, user_envs: &[(String, String)]) -> S
                 .then(|| std::env::var("PATH").ok())
                 .flatten()
         })
-        .unwrap_or_else(|| DEFAULT_SANDBOX_PATH.to_string());
+        .unwrap_or_else(default_sandbox_path);
 
-    if config.ipc_socket().is_none() {
+    let Some(bin_dir) = config.ipc_bin_dir() else {
         return base;
-    }
-
-    let bin_dir = IpcLayout::new(config.working_dir()).bin_dir().to_path_buf();
+    };
+    let bin_dir = bin_dir.to_path_buf();
     let entries = std::iter::once(bin_dir).chain(std::env::split_paths(&base));
     match std::env::join_paths(entries) {
         Ok(joined) => joined.to_string_lossy().into_owned(),

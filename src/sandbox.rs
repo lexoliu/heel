@@ -17,6 +17,17 @@ use crate::network::{DenyAll, NetworkPolicy, NetworkProxy};
 use crate::platform::{self, NativeBackend};
 use crate::workdir::WorkingDir;
 
+fn create_ipc_socket_dir() -> Result<(WorkingDir, PathBuf)> {
+    let root = WorkingDir::create(
+        &crate::ipc::socket_root().join(crate::workdir::generate_socket_dir_name()),
+        true,
+    )?;
+    let mut socket_dir = WorkingDir::create(&root.path().join("socket"), true)?;
+    socket_dir.keep();
+    let socket = socket_dir.path().join(crate::ipc::SOCKET_NAME);
+    Ok((root, socket))
+}
+
 /// Locate the `heel` binary that IPC wrappers execute.
 ///
 /// Resolution is explicit and never builds anything: the configured path, then
@@ -219,12 +230,6 @@ impl<N: NetworkPolicy> Sandbox<N> {
         let working_dir = unblock(move || WorkingDir::create(&requested_dir, auto)).await?;
         config_data.set_working_dir(working_dir.path().to_path_buf());
 
-        // After the working directory exists, so a backend that has to open it
-        // to the sandbox does so before the caller can put anything in it.
-        // Windows grants by inheritance, and inheritance only reaches files
-        // created once the grant is in place.
-        let backend = platform::create_native_backend(&config_data)?;
-
         // DenyAll needs no proxy: the backend denies outbound traffic outright,
         // which is a stronger guarantee than a userspace rejection.
         let proxy = if N::DENIES_ALL {
@@ -233,23 +238,45 @@ impl<N: NetworkPolicy> Sandbox<N> {
             Some(NetworkProxy::new(policy, executor.clone()).await?)
         };
 
-        let (ipc_server, ipc_socket_dir) = match router {
-            Some(router) => {
+        let (ipc_server, ipc_socket_dir) = match (router, config_data.external_ipc()) {
+            (Some(router), None) => {
                 let (server, socket_dir) =
-                    Self::start_ipc(&mut config_data, working_dir.path(), router, executor).await?;
+                    Self::start_ipc(&mut config_data, router, executor).await?;
                 (Some(server), Some(socket_dir))
             }
-            None => (None, None),
+            (None, Some(endpoint)) => {
+                let (socket_dir, socket) = unblock(create_ipc_socket_dir).await?;
+                config_data.push_grant(
+                    resolve_heel_binary(config_data.heel_binary())?,
+                    Access::EXEC,
+                );
+                config_data.set_ipc_socket(Some(socket.clone()));
+                let server = IpcServer::new(socket, endpoint, executor).await?;
+                (Some(server), Some(socket_dir))
+            }
+            (None, None) => (None, None),
+            (Some(_), Some(_)) => unreachable!("local and external IPC are mutually exclusive"),
         };
 
-        // The endpoint is a named pipe — a kernel object whose access control
-        // list names nothing an AppContainer token carries — so the pipe must
-        // be opened to this sandbox's container once the server has bound it.
-        // The other transports reach it through the filesystem grants.
-        #[cfg(windows)]
-        if let Some(server) = &ipc_server {
-            backend.grant_ipc_endpoint(server.socket_path())?;
-        }
+        // After the working directory exists, so a backend that has to open it
+        // to the sandbox does so before the caller can put anything in it.
+        // Windows grants by inheritance, and inheritance only reaches files
+        // created once the grant is in place.
+        let backend_config = config_data.clone();
+        let backend = unblock(move || {
+            let backend = platform::create_native_backend(&backend_config)?;
+
+            // The endpoint is a named pipe — a kernel object whose access control
+            // list names nothing an AppContainer token carries — so the pipe must
+            // be opened to this sandbox's container once the server has bound it.
+            // The other transports reach it through the filesystem grants.
+            #[cfg(windows)]
+            if let Some(socket) = backend_config.ipc_socket() {
+                backend.grant_ipc_endpoint(socket)?;
+            }
+            Ok::<_, crate::Error>(backend)
+        })
+        .await?;
 
         match &proxy {
             Some(proxy) => tracing::info!(
@@ -280,29 +307,27 @@ impl<N: NetworkPolicy> Sandbox<N> {
     /// socket, which the sandbox owns and removes on drop.
     async fn start_ipc<E: Executor + Clone + 'static>(
         config_data: &mut SandboxConfigData,
-        working_dir: &std::path::Path,
         router: crate::ipc::IpcRouter,
         executor: E,
     ) -> Result<(IpcServer, WorkingDir)> {
-        let layout = IpcLayout::new(working_dir);
         let heel_binary = resolve_heel_binary(config_data.heel_binary())?;
 
         // Writing the shims and creating the socket directory are both blocking
         // filesystem work; the router is handed to the worker and handed back so
         // it can move on to the server.
         let write_binary = heel_binary.clone();
-        let (router, socket_dir) =
-            unblock(move || -> Result<(crate::ipc::IpcRouter, WorkingDir)> {
+        let (router, socket_dir, bin_dir, socket) = unblock(
+            move || -> Result<(crate::ipc::IpcRouter, WorkingDir, PathBuf, PathBuf)> {
+                let (socket_dir, socket) = create_ipc_socket_dir()?;
+                let layout = IpcLayout::new(socket_dir.path());
                 layout.write(&router, &write_binary)?;
-                let socket_dir = WorkingDir::create(
-                    &crate::ipc::socket_root().join(crate::workdir::generate_socket_dir_name()),
-                    true,
-                )?;
-                Ok((router, socket_dir))
-            })
-            .await?;
-
-        let socket = socket_dir.path().join(crate::ipc::SOCKET_NAME);
+                let bin_dir = layout.bin_dir().to_path_buf();
+                Ok((router, socket_dir, bin_dir, socket))
+            },
+        )
+        .await?;
+        config_data.push_grant(bin_dir.clone(), Access::EXEC);
+        config_data.set_ipc_bin_dir(bin_dir);
 
         // The launcher execs the host binary, so it must be executable from
         // inside the sandbox even if it lives under a restricted path.
@@ -402,7 +427,6 @@ impl<N: NetworkPolicy> Sandbox<N> {
 impl<N: NetworkPolicy> Drop for Sandbox<N> {
     fn drop(&mut self) {
         if let Some(server) = self.ipc_server.take() {
-            server.stop();
             drop(server);
             tracing::debug!("stopped IPC server");
         }

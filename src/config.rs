@@ -291,8 +291,10 @@ pub struct SandboxConfigData {
     priority: ProcessPriority,
     /// Path of the IPC socket, once the server is listening. `None` disables IPC.
     ipc_socket: Option<PathBuf>,
+    ipc_bin_dir: Option<PathBuf>,
     /// Explicit path to the `heel` binary that IPC shims execute.
     heel_binary: Option<PathBuf>,
+    external_ipc: Option<crate::ipc::TcpIpcEndpoint>,
     allow_tty_write: bool,
 }
 
@@ -361,9 +363,23 @@ impl SandboxConfigData {
         self.ipc_socket.as_deref()
     }
 
+    /// Private executable directory holding this sandbox's IPC entrypoints.
+    pub fn ipc_bin_dir(&self) -> Option<&Path> {
+        self.ipc_bin_dir.as_deref()
+    }
+
+    pub(crate) fn set_ipc_bin_dir(&mut self, path: PathBuf) {
+        self.ipc_bin_dir = Some(path);
+    }
+
     /// The configured `heel` binary that IPC shims execute, if one was set.
     pub fn heel_binary(&self) -> Option<&Path> {
         self.heel_binary.as_deref()
+    }
+
+    /// Trusted peer served through a protected local relay without child TCP access.
+    pub fn external_ipc(&self) -> Option<crate::ipc::TcpIpcEndpoint> {
+        self.external_ipc
     }
 
     /// Whether the sandboxed process may write to the controlling terminal.
@@ -445,11 +461,18 @@ impl<N: NetworkPolicy> SandboxConfig<N> {
     }
 }
 
+/// Builder state before an IPC route has been selected.
+pub struct IpcUnconfigured;
+
+/// Builder state with exactly one IPC route selected.
+pub struct IpcConfigured;
+
 /// Builder for [`SandboxConfig`].
-pub struct SandboxConfigBuilder<N: NetworkPolicy = DenyAll> {
+pub struct SandboxConfigBuilder<N: NetworkPolicy = DenyAll, I = IpcUnconfigured> {
     network: N,
     data: SandboxConfigData,
     ipc: Option<IpcRouter>,
+    ipc_state: std::marker::PhantomData<I>,
 }
 
 impl Default for SandboxConfigBuilder<DenyAll> {
@@ -471,24 +494,28 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 limits: ResourceLimits::default(),
                 priority: ProcessPriority::default(),
                 ipc_socket: None,
+                ipc_bin_dir: None,
                 heel_binary: None,
+                external_ipc: None,
                 // Deny /dev/tty writes by default so all output is captured.
                 allow_tty_write: false,
             },
             ipc: None,
+            ipc_state: std::marker::PhantomData,
         }
     }
 }
 
-impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
+impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Set the network policy, changing the configuration's type.
-    pub fn network<M: NetworkPolicy>(self, policy: M) -> SandboxConfigBuilder<M> {
+    pub fn network<M: NetworkPolicy>(self, policy: M) -> SandboxConfigBuilder<M, I> {
         let mut data = self.data;
         data.network_deny_all = M::DENIES_ALL;
         SandboxConfigBuilder {
             network: policy,
             data,
             ipc: self.ipc,
+            ipc_state: self.ipc_state,
         }
     }
 
@@ -599,13 +626,49 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N> {
         self.data.priority = priority;
         self
     }
+}
 
-    /// Expose host-side commands to sandboxed processes over IPC.
-    pub fn ipc(mut self, router: IpcRouter) -> Self {
-        self.ipc = Some(router);
-        self
+impl<N: NetworkPolicy> SandboxConfigBuilder<N, IpcUnconfigured> {
+    fn configured(self) -> SandboxConfigBuilder<N, IpcConfigured> {
+        SandboxConfigBuilder {
+            network: self.network,
+            data: self.data,
+            ipc: self.ipc,
+            ipc_state: std::marker::PhantomData,
+        }
     }
 
+    /// Expose host-side commands to sandboxed processes over IPC.
+    ///
+    /// # IPC state
+    ///
+    /// Selects the sole IPC route; a configured builder cannot select another.
+    pub fn ipc(mut self, router: IpcRouter) -> SandboxConfigBuilder<N, IpcConfigured> {
+        self.ipc = Some(router);
+        self.configured()
+    }
+
+    /// Relay sandbox IPC to one explicitly trusted peer, keeping child networking denied.
+    ///
+    /// # IPC state
+    ///
+    /// Selects the sole IPC route; a configured builder cannot select another.
+    /// ```compile_fail
+    /// use heel::{SandboxConfigBuilder, ipc::{IpcRouter, TcpIpcEndpoint}};
+    /// use std::time::Duration;
+    /// let peer = TcpIpcEndpoint::new("127.0.0.1:7000".parse().unwrap(), Duration::from_secs(1));
+    /// SandboxConfigBuilder::default().ipc(IpcRouter::new()).external_ipc(peer);
+    /// ```
+    pub fn external_ipc(
+        mut self,
+        endpoint: crate::ipc::TcpIpcEndpoint,
+    ) -> SandboxConfigBuilder<N, IpcConfigured> {
+        self.data.external_ipc = Some(endpoint);
+        self.configured()
+    }
+}
+
+impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Use a specific `heel` binary for the generated IPC command shims.
     ///
     /// Without this the binary is found through `HEEL_BIN`, the running

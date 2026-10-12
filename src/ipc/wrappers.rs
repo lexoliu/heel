@@ -5,9 +5,11 @@
 //! own: they forward the declared argument names to `heel ipc`, which does the
 //! parsing in Rust where it can be tested.
 
+#[cfg(any(unix, test))]
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use askama::Template;
 
 use crate::error::{Error, Result};
@@ -21,6 +23,7 @@ pub const WRAPPER_DIR_NAME: &str = "bin";
 pub const SOCKET_NAME: &str = "s";
 
 /// Wrapper script for one IPC command.
+#[cfg(unix)]
 #[derive(Template)]
 #[template(path = "ipc/wrapper.sh", escape = "none")]
 struct WrapperTemplate<'a> {
@@ -30,6 +33,7 @@ struct WrapperTemplate<'a> {
 }
 
 /// The `heel` launcher placed alongside the wrappers.
+#[cfg(unix)]
 #[derive(Template)]
 #[template(path = "ipc/heel_launcher.sh", escape = "none")]
 struct LauncherTemplate<'a> {
@@ -71,14 +75,30 @@ impl IpcLayout {
         create_private_dir(&self.heel_dir)?;
         create_private_dir(&self.bin_dir)?;
 
-        let escaped = shell_escape::unix::escape(heel_binary.to_string_lossy());
-        write_script(
-            &self.bin_dir.join("heel"),
-            &LauncherTemplate { binary: &escaped }.render()?,
-        )?;
-
-        for (command, meta) in router.methods() {
-            write_script(&self.bin_dir.join(command), &render_wrapper(command, meta)?)?;
+        #[cfg(unix)]
+        {
+            let escaped = shell_escape::unix::escape(heel_binary.to_string_lossy());
+            write_script(
+                &self.bin_dir.join("heel"),
+                &LauncherTemplate { binary: &escaped }.render()?,
+            )?;
+            for (command, meta) in router.methods() {
+                write_script(&self.bin_dir.join(command), &render_wrapper(command, meta)?)?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let binary = self.bin_dir.join("heel.exe");
+            std::fs::copy(heel_binary, &binary).map_err(|source| Error::path(&binary, source))?;
+            for (command, meta) in router.methods() {
+                let executable = self.bin_dir.join(command).with_extension("exe");
+                std::fs::hard_link(&binary, &executable)
+                    .map_err(|source| Error::path(&executable, source))?;
+                let metadata = self.bin_dir.join(command).with_extension("json");
+                let contents = render_wrapper(command, meta)?;
+                std::fs::write(&metadata, contents)
+                    .map_err(|source| Error::path(&metadata, source))?;
+            }
         }
 
         tracing::debug!(bin_dir = %self.bin_dir.display(), "wrote IPC command shims");
@@ -103,6 +123,7 @@ pub(crate) fn socket_root() -> PathBuf {
 }
 
 /// Render the shim for one command.
+#[cfg(unix)]
 fn render_wrapper(command: &str, meta: &CommandMeta) -> Result<String> {
     Ok(WrapperTemplate {
         command,
@@ -110,6 +131,11 @@ fn render_wrapper(command: &str, meta: &CommandMeta) -> Result<String> {
         stdin_arg: meta.stdin_arg.as_deref(),
     }
     .render()?)
+}
+
+#[cfg(windows)]
+fn render_wrapper(_command: &str, meta: &CommandMeta) -> Result<String> {
+    serde_json::to_string(meta).map_err(|source| Error::InitFailed(source.to_string()))
 }
 
 /// Create a directory only its owner can enter.
@@ -127,6 +153,7 @@ fn create_private_dir(path: &Path) -> Result<()> {
 }
 
 /// Write an executable script.
+#[cfg(unix)]
 fn write_script(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).map_err(|source| Error::path(path, source))?;
 
@@ -195,9 +222,16 @@ mod tests {
         )
         .expect("renders");
 
+        #[cfg(unix)]
         assert!(script.contains(
             "heel\" ipc search --positional query --positional scope --stdin-arg input -- \"$@\""
         ));
+        #[cfg(windows)]
+        {
+            let metadata: CommandMeta = serde_json::from_str(&script).expect("metadata");
+            assert_eq!(metadata.positional_args.as_ref(), ["query", "scope"]);
+            assert_eq!(metadata.stdin_arg.as_deref(), Some("input"));
+        }
     }
 
     #[test]
@@ -211,9 +245,18 @@ mod tests {
         )
         .expect("renders");
 
-        assert!(script.contains("heel\" ipc plain -- \"$@\""));
-        assert!(!script.contains("--positional"));
-        assert!(!script.contains("--stdin-arg"));
+        #[cfg(unix)]
+        {
+            assert!(script.contains("heel\" ipc plain -- \"$@\""));
+            assert!(!script.contains("--positional"));
+            assert!(!script.contains("--stdin-arg"));
+        }
+        #[cfg(windows)]
+        {
+            let metadata: CommandMeta = serde_json::from_str(&script).expect("metadata");
+            assert!(metadata.positional_args.is_empty());
+            assert!(metadata.stdin_arg.is_none());
+        }
     }
 
     #[test]
@@ -222,11 +265,17 @@ mod tests {
         let layout = IpcLayout::new(dir.path());
         let router = IpcRouter::new().register(Search).register(Plain);
 
-        layout
-            .write(&router, Path::new("/usr/local/bin/heel"))
-            .expect("writes");
+        #[cfg(unix)]
+        let binary = PathBuf::from("/usr/local/bin/heel");
+        #[cfg(windows)]
+        let binary = std::env::current_exe().expect("native test executable");
+        layout.write(&router, &binary).expect("writes");
 
-        for name in ["heel", "search", "plain"] {
+        #[cfg(unix)]
+        let names = ["heel", "search", "plain"];
+        #[cfg(windows)]
+        let names = ["heel.exe", "search.exe", "plain.exe"];
+        for name in names {
             let path = layout.bin_dir().join(name);
             assert!(path.is_file(), "{name} must be written");
 
@@ -259,15 +308,30 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = IpcLayout::new(dir.path());
 
-        layout
-            .write(&IpcRouter::new(), Path::new("/opt/heel dir/heel"))
-            .expect("writes");
-
-        let launcher = std::fs::read_to_string(layout.bin_dir().join("heel")).expect("reads");
-        assert!(
-            launcher.contains("'/opt/heel dir/heel'"),
-            "unescaped path in: {launcher}"
-        );
+        #[cfg(unix)]
+        {
+            layout
+                .write(&IpcRouter::new(), Path::new("/opt/heel dir/heel"))
+                .expect("writes");
+            let launcher = std::fs::read_to_string(layout.bin_dir().join("heel")).expect("reads");
+            assert!(
+                launcher.contains("'/opt/heel dir/heel'"),
+                "unescaped path in: {launcher}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let source = dir.path().join("heel dir");
+            std::fs::create_dir(&source).expect("directory with spaces");
+            let binary = source.join("heel.exe");
+            std::fs::copy(std::env::current_exe().expect("native binary"), &binary)
+                .expect("copies");
+            layout.write(&IpcRouter::new(), &binary).expect("writes");
+            assert_eq!(
+                std::fs::read(&binary).expect("source"),
+                std::fs::read(layout.bin_dir().join("heel.exe")).expect("native launcher")
+            );
+        }
     }
 
     #[test]

@@ -16,6 +16,10 @@ use crate::error::{CliError, CliResult};
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct FileConfig {
+    /// Trusted TCP IPC peer.
+    pub ipc_endpoint: Option<String>,
+    /// IPC request deadline in seconds.
+    pub ipc_timeout_seconds: Option<u64>,
     /// Network policy.
     pub network: Option<NetworkMode>,
     /// Domains to allow under the `allow-list` policy.
@@ -86,6 +90,8 @@ pub struct PythonSection {
 /// The effective configuration for one invocation.
 #[derive(Debug)]
 pub struct MergedConfig {
+    pub ipc_endpoint: Option<String>,
+    pub ipc_timeout: std::time::Duration,
     pub network_mode: NetworkMode,
     pub allow_domains: Vec<String>,
     pub audit_log: Option<PathBuf>,
@@ -167,6 +173,11 @@ pub fn merge_config(file: FileConfig, cli: &CommonArgs) -> CliResult<MergedConfi
     }
 
     Ok(MergedConfig {
+        ipc_endpoint: cli.ipc_endpoint.clone().or(file.ipc_endpoint),
+        ipc_timeout: cli
+            .ipc_timeout
+            .or(file.ipc_timeout_seconds.map(std::time::Duration::from_secs))
+            .unwrap_or(std::time::Duration::from_secs(30)),
         network_mode,
         allow_domains,
         audit_log,

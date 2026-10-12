@@ -8,14 +8,16 @@
 //! files, without execute.
 //!
 //! That distinction is why these calls are made directly rather than through
-//! `rappct`, whose ACL helper applies a single mask to a directory and
+//! a generic ACL helper, which applies a single mask to a directory and
 //! everything beneath it.
 
 use std::io;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::Path;
 
-use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree, WIN32_ERROR,
+};
 use windows::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
     GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetEntriesInAclW,
@@ -140,6 +142,35 @@ pub(crate) fn grant_pipe(name: &str, sid: &str, access: u32) -> io::Result<()> {
     grant_handle(handle, sid, access)
 }
 
+/// Run a `Get*SecurityInfo` call until it answers or fails for real.
+///
+/// The calls are documented not to handle a security descriptor that
+/// changes mid-call: the object's list can move between the size they
+/// first query and the read they then make, which is reported as
+/// `ERROR_INSUFFICIENT_BUFFER`. None of heel's writes targets another
+/// sandbox's objects, but a writer outside this process cannot be ruled
+/// out, so a descriptor can move under any reader — and the API's answer
+/// is to ask again. The loop stays bounded so a descriptor that cannot
+/// be read still fails after `ATTEMPTS` tries.
+fn reread(object: &str, mut attempt: impl FnMut() -> WIN32_ERROR) -> io::Result<()> {
+    const ATTEMPTS: u32 = 5;
+
+    let mut status = attempt();
+    let mut remaining = ATTEMPTS - 1;
+    while status == ERROR_INSUFFICIENT_BUFFER && remaining > 0 {
+        remaining -= 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        status = attempt();
+    }
+
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot read the access control list of {object}: {status:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Add `access` for `sid` to the kernel object `handle` refers to.
 ///
 /// The handle must already carry `WRITE_DAC`, which the caller arranges by
@@ -148,24 +179,23 @@ fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut current: *mut ACL = std::ptr::null_mut();
 
-    // SAFETY: the out-parameters are valid destinations.
-    let status = unsafe {
-        GetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut current),
-            None,
-            Some(&mut descriptor),
-        )
-    };
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot read the access control list of the kernel object: {status:?}"
-        )));
-    }
+    reread("the kernel object", || {
+        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        current = std::ptr::null_mut();
+        // SAFETY: the out-parameters are valid destinations.
+        unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut current),
+                None,
+                Some(&mut descriptor),
+            )
+        }
+    })?;
     let _descriptor = LocalBuffer(descriptor.0);
 
     let updated = merge(
@@ -240,24 +270,23 @@ pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut current: *mut ACL = std::ptr::null_mut();
 
-    // SAFETY: the path is NUL-terminated and the out-parameters are valid.
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut current),
-            None,
-            &mut descriptor,
-        )
-    };
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot read the access control list of {name}: {status:?}"
-        )));
-    }
+    reread(&name, || {
+        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        current = std::ptr::null_mut();
+        // SAFETY: the path is NUL-terminated and the out-parameters are valid.
+        unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut current),
+                None,
+                &mut descriptor,
+            )
+        }
+    })?;
     let _descriptor = LocalBuffer(descriptor.0);
 
     let mut control = 0u16;
@@ -357,24 +386,23 @@ fn apply(name: &str, sddl: &str, entries: &[Entry], kind: SE_OBJECT_TYPE) -> io:
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut current: *mut ACL = std::ptr::null_mut();
 
-    // SAFETY: the path is NUL-terminated and the out-parameters are valid.
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            kind,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut current),
-            None,
-            &mut descriptor,
-        )
-    };
-    if status.is_err() {
-        return Err(io::Error::other(format!(
-            "cannot read the access control list of {name}: {status:?}"
-        )));
-    }
+    reread(name, || {
+        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        current = std::ptr::null_mut();
+        // SAFETY: the path is NUL-terminated and the out-parameters are valid.
+        unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                kind,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut current),
+                None,
+                &mut descriptor,
+            )
+        }
+    })?;
     let _descriptor = LocalBuffer(descriptor.0);
 
     let updated = merge(sddl, current, entries, name)?;

@@ -48,7 +48,7 @@ pub enum IpcError {
 
 /// A decoded request.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct IpcRequest {
+pub struct IpcRequest {
     /// Method name.
     pub method: String,
     /// MessagePack-encoded arguments.
@@ -57,7 +57,7 @@ pub(crate) struct IpcRequest {
 
 impl IpcRequest {
     /// Decode a request body, excluding the length prefix.
-    pub(crate) fn decode(body: &[u8]) -> Result<Self, IpcError> {
+    pub fn decode(body: &[u8]) -> Result<Self, IpcError> {
         let (&method_len, rest) = body
             .split_first()
             .ok_or_else(|| IpcError::InvalidProtocol("empty request".to_string()))?;
@@ -79,7 +79,7 @@ impl IpcRequest {
     }
 
     /// Encode a request frame, including the length prefix.
-    pub(crate) fn encode(method: &str, params: &[u8]) -> Result<Vec<u8>, IpcError> {
+    pub fn encode(method: &str, params: &[u8]) -> Result<Vec<u8>, IpcError> {
         let method = method.as_bytes();
         let method_len = u8::try_from(method.len())
             .map_err(|_| IpcError::InvalidProtocol("method name too long".to_string()))?;
@@ -102,7 +102,7 @@ impl IpcRequest {
 
 /// A response to a request.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct IpcResponse {
+pub struct IpcResponse {
     /// Whether the command succeeded.
     pub success: bool,
     /// The command's response, or a MessagePack error string.
@@ -111,7 +111,7 @@ pub(crate) struct IpcResponse {
 
 impl IpcResponse {
     /// A successful response carrying an already-encoded payload.
-    pub(crate) fn success(payload: Vec<u8>) -> Self {
+    pub fn success(payload: Vec<u8>) -> Self {
         Self {
             success: true,
             payload,
@@ -119,7 +119,7 @@ impl IpcResponse {
     }
 
     /// A failure response carrying `message`.
-    pub(crate) fn error(message: &str) -> Self {
+    pub fn error(message: &str) -> Self {
         Self {
             success: false,
             // Encoding a string cannot fail; an empty payload still decodes as
@@ -129,7 +129,7 @@ impl IpcResponse {
     }
 
     /// Encode a response frame, including the length prefix.
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let body_len = 1 + self.payload.len();
         let mut frame = Vec::with_capacity(4 + body_len);
         frame.extend_from_slice(&(body_len as u32).to_be_bytes());
@@ -139,7 +139,7 @@ impl IpcResponse {
     }
 
     /// Decode a response body, excluding the length prefix.
-    pub(crate) fn decode(body: &[u8]) -> Result<Self, IpcError> {
+    pub fn decode(body: &[u8]) -> Result<Self, IpcError> {
         let (&flag, payload) = body
             .split_first()
             .ok_or_else(|| IpcError::InvalidProtocol("empty response".to_string()))?;

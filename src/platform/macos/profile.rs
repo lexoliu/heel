@@ -104,11 +104,7 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
     let mut template = SandboxProfile {
         grants: grant_rules(config.grants())?,
         working_dir: sbpl_path(config.working_dir())?,
-        ipc_bin_dir: config
-            .ipc_socket()
-            .map(|_| crate::ipc::IpcLayout::new(config.working_dir()))
-            .map(|layout| sbpl_path(layout.bin_dir()))
-            .transpose()?,
+        ipc_bin_dir: config.ipc_bin_dir().map(sbpl_path).transpose()?,
         ipc_socket_dir: config
             .ipc_socket()
             .and_then(Path::parent)
