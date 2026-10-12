@@ -443,12 +443,15 @@ mod tests {
     ///
     /// `GetNamedSecurityInfoW` reports a descriptor that changes mid-call as
     /// `ERROR_INSUFFICIENT_BUFFER`, and a descriptor anywhere in a shared
-    /// tree can move while something else writes. One thread alternates the
-    /// directory's list between two sizes — so every write changes it —
-    /// while the other keeps reading; the reader is expected to ask again
-    /// rather than to fail.
+    /// tree can move while something else writes. Several threads alternate
+    /// the directory's list between two sizes — so every write changes it —
+    /// while others read it as fast as they can; the readers are expected to
+    /// ask again rather than to fail.
     #[test]
     fn a_descriptor_changing_under_the_reader_is_read_again() {
+        const WRITERS: usize = 4;
+        const READERS: usize = 4;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let entry = Entry {
             access: FILE_GENERIC_READ.0,
@@ -462,8 +465,6 @@ mod tests {
             .expect("one-entry list");
         let two =
             merge("S-1-5-18", one.0.cast(), &[entry], "the directory").expect("two-entry list");
-        let first = one.0 as usize;
-        let second = two.0 as usize;
 
         let wide: Vec<u16> = dir
             .path()
@@ -473,32 +474,75 @@ mod tests {
             .collect();
 
         let done = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&done);
-        let writer = std::thread::spawn(move || {
-            let mut lists = [first, second].into_iter().cycle();
-            while !flag.load(Ordering::Relaxed) {
-                // SAFETY: `one` and `two` are valid lists that outlive this
-                // thread — the main thread frees them only after joining it.
-                let status = unsafe {
-                    SetNamedSecurityInfoW(
-                        PCWSTR(wide.as_ptr()),
-                        SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        None,
-                        None,
-                        Some(lists.next().expect("the list cycles") as *const ACL as *mut ACL),
-                        None,
-                    )
-                };
-                assert!(status.is_ok(), "the writer's list applies: {status:?}");
-            }
-        });
-
-        for _ in 0..500 {
-            grant_this_only(dir.path(), "S-1-1-0", FILE_GENERIC_READ.0)
-                .expect("the reader's grant applies");
+        let mut writers = Vec::new();
+        for _ in 0..WRITERS {
+            let flag = Arc::clone(&done);
+            let wide = wide.clone();
+            let (first, second) = (one.0 as usize, two.0 as usize);
+            writers.push(std::thread::spawn(move || {
+                let mut lists = [first, second].into_iter().cycle();
+                while !flag.load(Ordering::Relaxed) {
+                    // SAFETY: `one` and `two` are valid lists that outlive
+                    // these threads — the main thread frees them only after
+                    // joining every writer.
+                    let status = unsafe {
+                        SetNamedSecurityInfoW(
+                            PCWSTR(wide.as_ptr()),
+                            SE_FILE_OBJECT,
+                            DACL_SECURITY_INFORMATION,
+                            None,
+                            None,
+                            Some(lists.next().expect("the list cycles") as *const ACL as *mut ACL),
+                            None,
+                        )
+                    };
+                    assert!(status.is_ok(), "the writer's list applies: {status:?}");
+                }
+            }));
         }
+
+        let mut readers = Vec::new();
+        for _ in 0..READERS {
+            let flag = Arc::clone(&done);
+            let wide = wide.clone();
+            readers.push(std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+                    let mut dacl: *mut ACL = std::ptr::null_mut();
+                    reread("the directory", || {
+                        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+                        dacl = std::ptr::null_mut();
+                        // SAFETY: the path is NUL-terminated and the
+                        // out-parameters are valid.
+                        unsafe {
+                            GetNamedSecurityInfoW(
+                                PCWSTR(wide.as_ptr()),
+                                SE_FILE_OBJECT,
+                                DACL_SECURITY_INFORMATION,
+                                None,
+                                None,
+                                Some(&mut dacl),
+                                None,
+                                &mut descriptor,
+                            )
+                        }
+                    })
+                    .expect("the reader's list reads");
+                    let _descriptor = LocalBuffer(descriptor.0);
+                }
+            }));
+        }
+
+        // The writers keep the descriptor moving for a bounded moment while
+        // the readers hammer it; the whole exchange stays well under a few
+        // seconds.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
         done.store(true, Ordering::Relaxed);
-        writer.join().expect("the writer finishes");
+        for reader in readers {
+            reader.join().expect("the reader finishes");
+        }
+        for writer in writers {
+            writer.join().expect("the writer finishes");
+        }
     }
 }
