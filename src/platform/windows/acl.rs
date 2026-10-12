@@ -153,7 +153,7 @@ pub(crate) fn grant_pipe(name: &str, sid: &str, access: u32) -> io::Result<()> {
 /// is to ask again. The loop stays bounded so a descriptor that cannot
 /// be read still fails after `ATTEMPTS` tries.
 fn reread(object: &str, mut attempt: impl FnMut() -> WIN32_ERROR) -> io::Result<()> {
-    const ATTEMPTS: u32 = 5;
+    const ATTEMPTS: u32 = 1;
 
     let mut status = attempt();
     let mut remaining = ATTEMPTS - 1;
