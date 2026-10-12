@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/lexoliu/heel/compare/heel-v0.4.0...heel-v0.4.1) - 2026-10-12
+
+### Other
+
+- Ship release-built heel assets, including Windows ARM64
+- Note the Unix-only DEFAULT_SANDBOX_PATH in the 0.4.0 changelog
+- Accept any http 1.x instead of pinning 1.3.1
+
 ## [0.4.0](https://github.com/lexoliu/heel/compare/heel-v0.3.1...heel-v0.4.0) - 2026-10-12
 
 ### Breaking
