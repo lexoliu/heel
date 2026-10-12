@@ -3,6 +3,22 @@
 
 use rappct::capability::SecurityCapabilitiesBuilder;
 use rappct::launch::{LaunchOptions, StdioConfig, launch_in_container_with_io};
+
+/// Releases a `ConvertStringSidToSidW` SID allocation on drop.
+struct LocalFreeGuard(*mut core::ffi::c_void);
+
+impl Drop for LocalFreeGuard {
+    fn drop(&mut self) {
+        // SAFETY: the pointer comes from ConvertStringSidToSidW, which allocates
+        // with LocalAlloc and requires LocalFree as the deallocator.
+        unsafe {
+            let _ = windows::Win32::Foundation::LocalFree(Some(
+                windows::Win32::Foundation::HLOCAL(self.0),
+            ));
+        }
+    }
+}
+
 struct LaunchFixture {
     container: super::container::Container,
     directory: tempfile::TempDir,
@@ -85,7 +101,7 @@ fn raw_zero_capability_launch(
     // SAFETY: all input strings are terminated, owned SID and attribute storage outlive CreateProcessW, and successful process handles are closed once.
     unsafe {
         ConvertStringSidToSidW(PCWSTR(sid_text.as_ptr()), &mut sid)?;
-        let _sid_owner = rappct::util::LocalFreeGuard::new(sid.0);
+        let _sid_owner = LocalFreeGuard(sid.0);
         let capabilities = SECURITY_CAPABILITIES {
             AppContainerSid: sid,
             Capabilities: if null_array {

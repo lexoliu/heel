@@ -123,7 +123,7 @@ seccompiler = "0.4"
 which = "7"
 # AppContainer profiles, capability SIDs, ACL grants, container launch and the
 # loopback exemption the proxy needs.
-rappct = { version = "0.13.3", features = ["net", "tracing"] }
+rappct = { git = "https://gitlab.curtpme.com/public-repos/rappct.git", rev = "f1eaa4ceaebfa23bc04b26ee9bb89bd74ced8645", features = ["net", "tracing"] }
 # Kept on the version rappct exposes in its own API: a handle from one version
 # of the `windows` crate is a different type from the same handle in another.
 windows = { version = "0.62", features = [

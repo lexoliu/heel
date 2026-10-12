@@ -146,6 +146,7 @@ impl WindowsBackend {
                 kill_on_job_close: true,
             }),
             startup_timeout: None,
+            ..Default::default()
         };
 
         Ok(Prepared {

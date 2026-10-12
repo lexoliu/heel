@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use rappct::capability::{SecurityCapabilities, SecurityCapabilitiesBuilder};
-use rappct::net::LoopbackExemptionGuard;
+use rappct::net::{LoopbackAdd, LoopbackExemptionGuard};
 use rappct::profile::AppContainerProfile;
 use rappct::sid::AppContainerSid;
 
@@ -122,11 +122,10 @@ impl Container {
     /// The package SID that ACL grants and capabilities are keyed on.
     pub(crate) fn sid(&self) -> &AppContainerSid {
         // Always `Some` until `Drop`, which is the only place it is taken.
-        &self
-            .profile
+        self.profile
             .as_ref()
             .expect("the profile is present until the container is dropped")
-            .sid
+            .sid()
     }
 
     /// Open the configured paths to this container.
@@ -317,7 +316,10 @@ impl Container {
     /// rather than a downgrade: a sandbox whose traffic cannot reach the proxy
     /// is a sandbox whose network policy is not enforced.
     pub(crate) fn exempt_loopback(&self) -> Result<LoopbackExemptionGuard> {
-        LoopbackExemptionGuard::new(self.sid()).map_err(|source| {
+        LoopbackExemptionGuard::new_confirmed(
+            LoopbackAdd::new(self.sid().clone()).confirm_debug_only(),
+        )
+        .map_err(|source| {
             Error::NotEnforced(format!(
                 "cannot add the loopback exemption the network proxy needs, so the network \
                  policy would not be applied: {source}. Registering one requires administrator \
@@ -344,7 +346,7 @@ impl Drop for Container {
         let Some(profile) = self.profile.take() else {
             return;
         };
-        let name = profile.name.clone();
+        let name = profile.name().to_owned();
         if let Err(error) = profile.delete() {
             tracing::warn!(profile = %name, %error, "failed to delete AppContainer profile");
         }
