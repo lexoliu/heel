@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/lexoliu/heel/compare/heel-v0.3.1...heel-v0.3.2) - 2026-10-12
+
+### Other
+
+- Drop the reread test that proves nothing
+- Make the reread test actually reach the race
+- Correct the reread comment to what the evidence shows
+- Reread an object's access control list when it changes mid-read
+- Address launch-layer review: alignment, frees, and error shape
+- Drop rappct and launch AppContainer children directly
+- Cover inherited environments in native launch regressions
+- Use a granted workspace for native launch parameter tests
+- Give native launch regressions the production stream-device grant
+- Shut down IPC exactly once through ownership
+- Keep platform initialization off async threads
+- Bound native launch regressions without hiding subsequent tests
+- Make conflicting IPC routes unrepresentable in the builder
+- Keep nested IPC names unique and prove TCP denial at connect
+- Keep native and container IPC reachable under deny-all isolation
+
 ## [0.3.1](https://github.com/lexoliu/heel/compare/heel-v0.3.0...heel-v0.3.1) - 2026-10-11
 
 ### Fixed
