@@ -4,7 +4,7 @@
 //! names, so all parsing happens here rather than in shell script.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{self, Read, Write};
 
 use heel::IpcClient;
 use serde_json::Value;
@@ -34,7 +34,7 @@ pub async fn execute(args: IpcArgs) -> CliResult<()> {
         };
         let rendered = render(&payload)?;
         if !rendered.is_empty() {
-            println!("{rendered}");
+            write_rendered(&mut io::stdout().lock(), &rendered)?;
         }
         Ok(())
     })
@@ -123,6 +123,18 @@ fn read_stdin() -> CliResult<String> {
     Ok(content)
 }
 
+/// Write the rendered response followed by a newline.
+///
+/// A reader that exits before taking the whole response (`... | head`) has
+/// nobody left to deliver to, so a broken pipe ends the write like the
+/// default SIGPIPE disposition instead of failing the command.
+fn write_rendered(out: &mut impl Write, rendered: &str) -> CliResult<()> {
+    match writeln!(out, "{rendered}").and_then(|()| out.flush()) {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => Ok(result?),
+    }
+}
+
 /// Render a MessagePack payload for a terminal.
 ///
 /// A string response is printed as-is; anything else is printed as JSON.
@@ -138,6 +150,31 @@ fn render(payload: &[u8]) -> CliResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer whose reader has already gone away.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn write_rendered_appends_a_newline() {
+        let mut out = Vec::new();
+        write_rendered(&mut out, "hello").expect("write to a buffer");
+        assert_eq!(out, b"hello\n");
+    }
+
+    #[test]
+    fn write_rendered_ends_quietly_when_the_reader_is_gone() {
+        write_rendered(&mut ClosedPipe, "hello").expect("a broken pipe is not a failure");
+    }
 
     fn args(command: &str, positional: &[&str], stdin_arg: Option<&str>, rest: &[&str]) -> IpcArgs {
         IpcArgs {
