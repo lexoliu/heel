@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/lexoliu/heel/compare/heel-v0.4.1...heel-v0.4.2) - 2026-10-16
+
+### Other
+
+- End heel ipc quietly when its reader closes the pipe
+
 ## [0.4.1](https://github.com/lexoliu/heel/compare/heel-v0.4.0...heel-v0.4.1) - 2026-10-12
 
 ### Fixed
