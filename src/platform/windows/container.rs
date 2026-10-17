@@ -10,7 +10,9 @@
 //! deny-all policy needs. A filtering policy is enforced by the proxy instead,
 //! and reaching the proxy needs the loopback exemption below.
 
+use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
@@ -47,6 +49,9 @@ const TRAVERSE: u32 = FILE_TRAVERSE.0;
 
 /// Run a file.
 const EXECUTE: u32 = FILE_GENERIC_EXECUTE.0;
+
+/// ALL APPLICATION PACKAGES — the SID every AppContainer token carries.
+const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
 
 /// What one grant opens to the container.
 ///
@@ -89,6 +94,34 @@ fn access_tree(access: Access) -> [Entry; 2] {
 pub(crate) struct Container {
     /// The profile this sandbox's processes run in.
     profile: Profile,
+    /// Every access-control list this container added entries to, in the
+    /// order it added them — the grants `drop` takes back, each named the
+    /// way the write named it so the removal finds the same list. Grants
+    /// are recorded from `&self` methods — `grant_program` runs once per
+    /// launch — so the list lives behind a mutex taken only for a push.
+    granted: Mutex<Vec<Granted>>,
+}
+
+/// One access-control list the container added entries to.
+#[derive(Debug)]
+struct Granted {
+    /// The name the write used — a verbatim path or an object name — so the
+    /// removal names the same list.
+    name: String,
+    /// How the entries are removed again.
+    removal: Removal,
+}
+
+/// How an added entry is removed again, mirroring how it was written.
+#[derive(Debug)]
+enum Removal {
+    /// Through `SetNamedSecurityInfoW`, which propagates the removal through
+    /// the tree the same way it propagated the entry.
+    Tree,
+    /// Through `SetFileSecurityW`, which writes the object's own descriptor
+    /// and nothing beneath it — the write `grant_this_only` used to add the
+    /// entry.
+    ThisOnly,
 }
 
 impl Container {
@@ -101,7 +134,10 @@ impl Container {
                 super::with_causes(&source)
             ))
         })?;
-        Ok(Self { profile })
+        Ok(Self {
+            profile,
+            granted: Mutex::new(Vec::new()),
+        })
     }
 
     /// The package SID that ACL grants and capabilities are keyed on.
@@ -153,7 +189,9 @@ impl Container {
     /// reports an artifact.
     ///
     /// `socket` is the path the endpoint was bound for; the pipe name is
-    /// derived from it the same way the server derives it.
+    /// derived from it the same way the server derives it. The pipe is the
+    /// sandbox's own — bound by its IPC server and closed with it — so its
+    /// entry is not recorded for removal: it dies with the pipe.
     pub(crate) fn grant_ipc_endpoint(&self, socket: &Path) -> Result<()> {
         const PIPE_ACCESS: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
 
@@ -189,7 +227,10 @@ impl Container {
         const READ_WRITE: u32 = GENERIC_READ.0 | GENERIC_WRITE.0;
 
         match acl::grant_object(NULL_DEVICE, self.sid().as_string(), READ_WRITE) {
-            Ok(()) => tracing::debug!("opened the null device to the container"),
+            Ok(()) => {
+                self.record(NULL_DEVICE.to_owned(), Removal::Tree);
+                tracing::debug!("opened the null device to the container");
+            }
             Err(source) => tracing::warn!(
                 %source,
                 "cannot open the null device to the container; children that open NUL will be denied"
@@ -213,15 +254,30 @@ impl Container {
     /// toolchain tree cost minutes per sandbox.
     fn grant_path(&self, path: &Path, access: Access) -> Result<()> {
         let entries = access_tree(access);
+        // The entry that applies to `path` itself is what the access check
+        // asks about: a container already holding it needs nothing written.
+        let desired = if path.is_dir() {
+            entries[0].access
+        } else {
+            entries[1].access
+        };
+        if self.already_open(path, desired)? {
+            tracing::debug!(
+                path = %path.display(),
+                "path already grants the container its access"
+            );
+            return Ok(());
+        }
         if path.is_dir() {
-            self.grant(path, &entries)
+            self.grant(path, &entries, desired)
         } else {
             self.grant(
                 path,
                 &[Entry {
-                    access: entries[1].access,
+                    access: desired,
                     applies_to: Scope::ThisOnly,
                 }],
+                desired,
             )
         }
     }
@@ -229,44 +285,102 @@ impl Container {
     /// Grant traverse on every directory above `path`.
     fn grant_ancestors(&self, path: &Path) -> Result<()> {
         for ancestor in path.ancestors().skip(1) {
-            // A drive root is traversable by everyone already, and its ACL is
-            // not ours to change.
-            if ancestor.parent().is_none() || in_system_directory(ancestor) {
+            // A drive root is traversable by everyone already, and its ACL
+            // is not ours to change.
+            if ancestor.parent().is_none() {
                 continue;
             }
-            acl::grant_this_only(ancestor, self.sid().as_string(), TRAVERSE)
-                .map_err(|source| Error::path(ancestor, source))?;
+            if self.already_open(ancestor, TRAVERSE)? {
+                tracing::debug!(
+                    path = %ancestor.display(),
+                    "ancestor already grants the container traverse"
+                );
+                continue;
+            }
+            let name = acl::grant_this_only(ancestor, self.sid().as_string(), TRAVERSE).map_err(
+                |source| {
+                    Error::path(
+                        ancestor,
+                        io::Error::other(format!(
+                            "the container does not already hold traverse here: {source}"
+                        )),
+                    )
+                },
+            )?;
+            self.record(name, Removal::ThisOnly);
         }
         Ok(())
     }
 
     /// Open a program to this container so that it can be read and run.
     ///
-    /// Programs under the system directories are skipped: Windows already
-    /// grants every AppContainer read and execute on them, and their ACLs are
-    /// not ours to change, so asking would fail with access denied. Anything
-    /// outside them has to be granted, and failing there is a real error.
+    /// Programs Windows already opens to every package — the system
+    /// directories, whose ACLs are not ours to change — need nothing
+    /// written. Anything the container does not already hold has to be
+    /// granted, and failing there is a real error.
     pub(crate) fn grant_program(&self, program: &Path) -> Result<()> {
-        if in_system_directory(program) {
+        const PROGRAM_ACCESS: u32 = READ | EXECUTE;
+        if self.already_open(program, PROGRAM_ACCESS)? {
             tracing::debug!(
                 program = %program.display(),
-                "program is already open to every AppContainer"
+                "program already grants the container read and execute"
             );
             return Ok(());
         }
         self.grant(
             program,
             &[Entry {
-                access: READ | EXECUTE,
+                access: PROGRAM_ACCESS,
                 applies_to: Scope::ThisOnly,
             }],
+            PROGRAM_ACCESS,
         )
     }
 
-    /// Add entries to a path's access control list.
-    fn grant(&self, path: &Path, entries: &[Entry]) -> Result<()> {
-        acl::grant(path, self.sid().as_string(), entries)
-            .map_err(|source| Error::path(path, source))
+    /// Whether the container already holds `desired` on `path`.
+    ///
+    /// An AppContainer token carries its package SID, its capability SIDs
+    /// and ALL APPLICATION PACKAGES — no Everyone or Users memberships, so
+    /// an ACE naming them opens nothing to it — and what it may do on a
+    /// path is the union of what those SIDs' entries in the path's DACL
+    /// allow (Microsoft, "AppContainer isolation",
+    /// learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation,
+    /// and the well-known SID list for S-1-15-2-1).
+    /// `GetEffectiveRightsFromAclW` answers that union one trustee at a
+    /// time against the object's own list, so the two SIDs are the
+    /// filesystem access check the kernel will make; `AccessCheck` itself
+    /// wants a real token, which exists only while a process in the
+    /// container runs.
+    fn already_open(&self, path: &Path, desired: u32) -> Result<bool> {
+        let held = acl::effective_rights(path, &[self.sid().as_string(), ALL_APPLICATION_PACKAGES])
+            .map_err(|source| Error::path(path, source))?;
+        Ok(held & desired == desired)
+    }
+
+    /// Add entries to a path's access control list, and record the grant
+    /// for `drop`. `desired` names the rights being added, so a failure —
+    /// a real error, not a case to absorb — says what the container lacks.
+    fn grant(&self, path: &Path, entries: &[Entry], desired: u32) -> Result<()> {
+        let name = acl::grant(path, self.sid().as_string(), entries).map_err(|source| {
+            Error::path(
+                path,
+                io::Error::other(format!(
+                    "the container does not already hold {} here: {source}",
+                    describe(desired)
+                )),
+            )
+        })?;
+        self.record(name, Removal::Tree);
+        Ok(())
+    }
+
+    /// Remember that `name`'s access control list carries this container's
+    /// entries, so `drop` removes exactly them.
+    fn record(&self, name: String, removal: Removal) {
+        self.granted
+            .lock()
+            .expect("the grants lock is held only around a push")
+            .push(Granted { name, removal });
     }
 
     /// The capability a process gets, given whether it may reach the network.
@@ -309,14 +423,167 @@ impl Container {
     }
 }
 
-/// Whether a path lives under a directory Windows opens to every package.
-///
-/// Compared case-insensitively, because Windows paths are, and the case a
-/// program is found under does not always match the environment variable.
-fn in_system_directory(path: &Path) -> bool {
-    let path = path.to_string_lossy().to_lowercase();
-    ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"]
+impl Drop for Container {
+    /// Take back every entry the container added.
+    ///
+    /// Each list is re-read before it is rewritten and only the entries this
+    /// container's own SID holds are dropped, so a concurrent sandbox's
+    /// entries on the same path survive the removal. A list whose removal
+    /// fails is reported and the rest are still removed. A crash before this
+    /// runs leaves the entries on their lists, each naming a package SID
+    /// that no longer exists.
+    fn drop(&mut self) {
+        let Self { profile, granted } = self;
+        let sid = profile.sid().as_string();
+        for granted in granted
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            let result = match granted.removal {
+                Removal::Tree => acl::revoke(&granted.name, sid),
+                Removal::ThisOnly => acl::revoke_this_only(&granted.name, sid),
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    path = %granted.name,
+                    %error,
+                    "cannot remove the container's access control entries"
+                );
+            }
+        }
+    }
+}
+
+/// The operations `mask` grants, named for messages — "read, write and
+/// traverse" and the like.
+fn describe(mask: u32) -> String {
+    const OPERATIONS: &[(u32, &str)] = &[
+        (FILE_GENERIC_READ.0, "read"),
+        (FILE_GENERIC_WRITE.0, "write"),
+        (FILE_GENERIC_EXECUTE.0, "execute"),
+        (FILE_TRAVERSE.0, "traverse"),
+        (DELETE.0, "delete"),
+        (FILE_DELETE_CHILD.0, "delete children"),
+    ];
+    let named = OPERATIONS
         .iter()
-        .filter_map(|variable| std::env::var(variable).ok())
-        .any(|root| path.starts_with(&root.to_lowercase()))
+        .filter(|(bits, _)| mask & bits == *bits)
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>();
+    if named.is_empty() {
+        format!("access {mask:#x}")
+    } else {
+        named.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The DACL of `path`, rendered as SDDL.
+    fn dacl(path: &Path) -> String {
+        let name = std::fs::canonicalize(path).expect("the path resolves");
+        acl::dacl_sddl(&name.to_string_lossy()).expect("the list reads back")
+    }
+
+    #[test]
+    fn drop_removes_every_entry_the_container_added() {
+        let dir = tempfile::tempdir().expect("a temp directory");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("a nested directory");
+
+        let sid = {
+            let container = Container::create().expect("a container");
+            let sid = container.sid().as_string().to_owned();
+
+            container
+                .grant_ancestors(dir.path())
+                .expect("the ancestors grant");
+            container
+                .grant_path(dir.path(), Access::WRITE)
+                .expect("the directory grants");
+            container
+                .grant_path(&nested, Access::READ | Access::EXEC)
+                .expect("the nested directory grants");
+
+            // The entries are in place before the drop — otherwise the
+            // assertions below pass on an empty premise.
+            for path in [&nested, dir.path()] {
+                let list = dacl(path);
+                assert!(
+                    list.contains(&sid),
+                    "no {sid} entry on {} before drop: {list}",
+                    path.display()
+                );
+            }
+            sid
+        };
+
+        // Neither the granted paths nor any ancestor keeps an entry for the
+        // dropped container's SID.
+        for path in std::iter::once(nested.as_path()).chain(dir.path().ancestors()) {
+            let list = dacl(path);
+            assert!(
+                !list.contains(&sid),
+                "an entry for {sid} remains on {}: {list}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn an_already_open_directory_is_granted_without_an_acl_write() {
+        // `%SystemRoot%\System32` grants ALL APPLICATION PACKAGES read and
+        // execute, so the container already holds everything a read/execute
+        // grant promises: the grant must be a skip, not an ACL write. The
+        // recorded grants are exactly the writes the container made, so an
+        // empty list proves nothing was written — on a host with the rights
+        // to write there, no less than on one without.
+        let system32 =
+            Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set")).join("System32");
+        let container = Container::create().expect("a container");
+        container
+            .grant_path(&system32, Access::READ | Access::EXEC)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "granting read and execute on {} failed; its DACL is {}: {error}",
+                    system32.display(),
+                    dacl(&system32)
+                )
+            });
+        let granted = container.granted.lock().expect("the grants lock");
+        assert!(
+            granted.is_empty(),
+            "an already-open directory must not be written; recorded {} grants; its DACL is {}",
+            granted.len(),
+            dacl(&system32)
+        );
+    }
+
+    #[test]
+    fn a_directory_the_container_cannot_reach_is_granted_for_real() {
+        // A temp directory's DACL names nothing an AppContainer token
+        // carries, so the grant has to add real entries — and the record
+        // shows it did.
+        let dir = tempfile::tempdir().expect("a temp directory");
+        let container = Container::create().expect("a container");
+        container
+            .grant_path(dir.path(), Access::READ)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "granting read on {} failed; its DACL is {}: {error}",
+                    dir.path().display(),
+                    dacl(dir.path())
+                )
+            });
+        assert!(
+            !container
+                .granted
+                .lock()
+                .expect("the grants lock")
+                .is_empty(),
+            "a directory the container cannot reach must be written to its DACL"
+        );
+    }
 }
