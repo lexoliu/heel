@@ -342,6 +342,24 @@ fn acl_listing(path: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// Search `file` for `needle` with `findstr` inside `sandbox`: a read of the
+/// file's contents, with the path passed as its own argument.
+async fn read_inside(
+    sandbox: &Sandbox<impl heel::NetworkPolicy>,
+    file: &Path,
+    needle: &str,
+) -> Output {
+    let system32 =
+        Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set")).join("System32");
+    sandbox
+        .command(system32.join("findstr.exe").to_string_lossy())
+        .arg(format!("/c:{needle}"))
+        .arg(file.to_string_lossy())
+        .output()
+        .await
+        .expect("findstr runs")
+}
+
 /// A sandbox with `path` granted `access`.
 async fn sandbox_granting(path: &Path, access: Access) -> heel::Result<Sandbox> {
     let config = SandboxConfigBuilder::default().grant(path, access).build();
@@ -357,8 +375,11 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
     //
     // (a) `%SystemRoot%\System32` grants ALL APPLICATION PACKAGES read and
     // execute, so the grant must be a skip rather than a write — a write
-    // there needs rights the sandbox user does not hold — and the
-    // directory is readable inside without it.
+    // there needs rights the sandbox user does not hold — and a file in it
+    // is readable inside without it. The read goes through `findstr` on a
+    // known file rather than `cmd`'s `dir`: `dir` queries the volume
+    // through the drive root, which grants nothing to an AppContainer, so
+    // it fails on every directory, granted or not.
     let system32 =
         Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set")).join("System32");
     let sandbox = sandbox_granting(&system32, Access::READ | Access::EXEC)
@@ -370,11 +391,12 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
                 acl_listing(&system32)
             )
         });
-    let output = cmd(&sandbox, &format!("dir \"{}\"", system32.display())).await;
+    let hosts = system32.join(r"drivers\etc\hosts");
+    let output = read_inside(&sandbox, &hosts, "localhost").await;
     assert!(
         output.status.success(),
-        "the already-open directory is readable inside; its DACL is {}: {}",
-        acl_listing(&system32),
+        "a file in the already-open directory is readable inside; its DACL is {}: {}",
+        acl_listing(&hosts),
         stderr(&output)
     );
     drop(sandbox);
@@ -399,11 +421,14 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
     }
 
     // `/inheritance:r` removes the entries inherited from Program Files;
-    // on a directory this test just created that is all of them, so the
+    // on a tree this test just created that is all of them, so the
     // container holds no access whatever there.
+    let probe = child.join("probe.txt");
+    std::fs::write(&probe, "heel-probe\n").expect("the probe file is written");
     let stripped = std::process::Command::new("icacls")
         .arg(&child)
         .arg("/inheritance:r")
+        .arg("/T")
         .output()
         .expect("icacls runs");
     assert!(
@@ -422,13 +447,13 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
                 acl_listing(&child)
             )
         });
-    let output = cmd(&sandbox, &format!("dir \"{}\"", child.display())).await;
+    let output = read_inside(&sandbox, &probe, "heel-probe").await;
     drop(sandbox);
-    let _ = std::fs::remove_dir(&child);
+    let listing = acl_listing(&probe);
+    std::fs::remove_dir_all(&child).expect("the test's Program Files child is removed");
     assert!(
         output.status.success(),
-        "the granted directory is readable inside; its DACL is {}: {}",
-        acl_listing(&child),
+        "a file in the granted directory is readable inside; its DACL is {listing}: {}",
         stderr(&output)
     );
 }
