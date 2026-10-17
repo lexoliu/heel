@@ -18,10 +18,15 @@ use std::path::Path;
 use windows::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree, WIN32_ERROR,
 };
+#[cfg(test)]
+use windows::Win32::Security::Authorization::{
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-    GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetEntriesInAclW,
-    SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
+    SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
 };
 use windows::Win32::Security::{
     ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
@@ -237,15 +242,12 @@ fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
 /// than replacing it, so nothing the machine or the user already relies on is
 /// removed.
 ///
-/// The named security APIs reject object names deeper than `MAX_PATH` unless
-/// they are spelled verbatim, and a granted tree can itself sit deeper than
-/// that. Resolving the path first hands them the `\\?\` form they accept at
-/// any depth, while the errors keep naming the path the caller asked for.
-pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()> {
-    let resolved = std::fs::canonicalize(path).map_err(|source| {
-        io::Error::other(format!("cannot resolve {}: {source}", path.display()))
-    })?;
-    apply(&resolved.to_string_lossy(), sid, entries, SE_FILE_OBJECT)
+/// The resolved name the entries were written to is returned so the caller
+/// can hand the same name to `revoke` when the sandbox is dropped.
+pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<String> {
+    let name = resolve(path)?;
+    apply(&name, sid, entries, SE_FILE_OBJECT)?;
+    Ok(name)
 }
 
 /// Add `access` for `sid` to the object at `path` alone, without touching
@@ -260,43 +262,12 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()>
 /// stored with `SetFileSecurityW`, which writes the object's own descriptor
 /// and propagates nothing. The list keeps its protected and auto-inherited
 /// bits, so how it relates to its parent is unchanged.
-pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result<()> {
-    let resolved = std::fs::canonicalize(path).map_err(|source| {
-        io::Error::other(format!("cannot resolve {}: {source}", path.display()))
-    })?;
-    let name = resolved.to_string_lossy();
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-
-    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    let mut current: *mut ACL = std::ptr::null_mut();
-
-    reread(&name, || {
-        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-        current = std::ptr::null_mut();
-        // SAFETY: the path is NUL-terminated and the out-parameters are valid.
-        unsafe {
-            GetNamedSecurityInfoW(
-                PCWSTR(wide.as_ptr()),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(&mut current),
-                None,
-                &mut descriptor,
-            )
-        }
-    })?;
-    let _descriptor = LocalBuffer(descriptor.0);
-
-    let mut control = 0u16;
-    let mut revision = 0u32;
-    // SAFETY: `descriptor` is the descriptor just read, alive while its guard
-    // lives, and the out-parameters are valid.
-    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.map_err(
-        |source| io::Error::other(format!("cannot read the descriptor of {name}: {source}")),
-    )?;
-
+///
+/// The resolved name the entry was written to is returned, as `grant`
+/// returns it, for the matching `revoke_this_only` call.
+pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result<String> {
+    let name = resolve(path)?;
+    let (descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
     let updated = merge(
         sid,
         current,
@@ -306,33 +277,72 @@ pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result
         }],
         &name,
     )?;
+    write_file_dacl(&name, &descriptor, updated)?;
+    Ok(name)
+}
 
-    let mut absolute = SECURITY_DESCRIPTOR::default();
-    let written = PSECURITY_DESCRIPTOR((&raw mut absolute).cast());
-    let inheritance = SECURITY_DESCRIPTOR_CONTROL(SE_DACL_PROTECTED.0 | SE_DACL_AUTO_INHERITED.0);
-    // SAFETY: `absolute` outlives every call below, and `updated` — which it
-    // points at once the list is set — outlives the write.
-    let status = unsafe {
-        InitializeSecurityDescriptor(written, SECURITY_DESCRIPTOR_REVISION)
-            .and_then(|()| SetSecurityDescriptorDacl(written, true, Some(updated.0.cast()), false))
-            .and_then(|()| {
-                SetSecurityDescriptorControl(
-                    written,
-                    inheritance,
-                    SECURITY_DESCRIPTOR_CONTROL(control & inheritance.0),
-                )
-            })
-            .and_then(|()| {
-                SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, written).ok()
-            })
-    };
-    drop(updated);
+/// Remove every entry `sddl` holds on the object `name` refers to.
+///
+/// The list is re-read before it is rewritten, so entries a concurrent
+/// sandbox added for its own SID since this one's grant survive — only the
+/// trustee's entries are dropped from a freshly read list, and other SIDs'
+/// entries stay. `SetNamedSecurityInfoW` then propagates the removal through
+/// the tree the same way the grant propagated the entry.
+pub(crate) fn revoke(name: &str, sddl: &str) -> io::Result<()> {
+    let (_descriptor, current) = read_dacl(name, SE_FILE_OBJECT)?;
+    let updated = without(sddl, current, name)?;
+    write_dacl(name, updated, SE_FILE_OBJECT)
+}
 
-    status.map_err(|source| {
-        io::Error::other(format!(
-            "cannot apply the access control list to {name}: {source}"
-        ))
-    })
+/// Remove every entry `sddl` holds on the file `name` refers to, touching
+/// nothing beneath it — the counterpart of `grant_this_only`.
+pub(crate) fn revoke_this_only(name: &str, sddl: &str) -> io::Result<()> {
+    let (descriptor, current) = read_dacl(name, SE_FILE_OBJECT)?;
+    let updated = without(sddl, current, name)?;
+    write_file_dacl(name, &descriptor, updated)
+}
+
+/// The `\\?\` verbatim spelling of `path`.
+///
+/// The named security APIs reject object names deeper than `MAX_PATH` unless
+/// they are spelled verbatim, and a granted tree can itself sit deeper than
+/// that. Resolving the path first hands them the `\\?\` form they accept at
+/// any depth, while the errors keep naming the path the caller asked for.
+fn resolve(path: &Path) -> io::Result<String> {
+    let resolved = std::fs::canonicalize(path).map_err(|source| {
+        io::Error::other(format!("cannot resolve {}: {source}", path.display()))
+    })?;
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
+/// Read the DACL of the object `name` refers to, retrying while it moves.
+///
+/// The returned pair is the security descriptor — whose `LocalBuffer` owns
+/// the memory the list points into — and the list itself.
+fn read_dacl(name: &str, kind: SE_OBJECT_TYPE) -> io::Result<(LocalBuffer, *mut ACL)> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let mut current: *mut ACL = std::ptr::null_mut();
+
+    reread(name, || {
+        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        current = std::ptr::null_mut();
+        // SAFETY: the path is NUL-terminated and the out-parameters are valid.
+        unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                kind,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut current),
+                None,
+                &mut descriptor,
+            )
+        }
+    })?;
+    Ok((LocalBuffer(descriptor.0), current))
 }
 
 /// Merge `entries` for `sddl` into `current`, producing a new list.
@@ -375,39 +385,63 @@ fn merge(
     Ok(LocalBuffer(updated.cast()))
 }
 
+/// Build a copy of `current` with every entry `sddl` holds removed.
+///
+/// `REVOKE_ACCESS` drops the trustee's entries whatever their mask or
+/// inheritance, which is what cleanup asks: the container removes exactly
+/// the entries its SID carries, and entries other SIDs — other sandboxes',
+/// the machine's — are not the trustee's and stay.
+///
+/// The returned ACL is `LocalAlloc` memory the caller frees, and `object`
+/// names what is being edited for the error.
+fn without(sddl: &str, current: *mut ACL, object: &str) -> io::Result<LocalBuffer> {
+    let (_sid_buffer, sid) = parse_sid(sddl)?;
+
+    let trustee = TRUSTEE_W {
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: PWSTR(sid.0.cast()),
+        ..Default::default()
+    };
+    let access = [EXPLICIT_ACCESS_W {
+        grfAccessPermissions: 0,
+        grfAccessMode: REVOKE_ACCESS,
+        grfInheritance: ACE_FLAGS(0),
+        Trustee: trustee,
+    }];
+
+    let mut updated: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `access` outlives the call and `current` is the caller's list.
+    let status = unsafe { SetEntriesInAclW(Some(&access), Some(current), &mut updated) };
+    if status.is_err() {
+        return Err(io::Error::other(format!(
+            "cannot build the access control list for {object}: {status:?}"
+        )));
+    }
+    Ok(LocalBuffer(updated.cast()))
+}
+
 /// Add `entries` for `sid` to the object `name` refers to.
 ///
 /// `name` reaches the named security APIs as given — a filesystem path
 /// already spelled verbatim, or an object name such as a device or pipe —
 /// and `kind` tells the APIs how to open it.
 fn apply(name: &str, sddl: &str, entries: &[Entry], kind: SE_OBJECT_TYPE) -> io::Result<()> {
+    let (_descriptor, current) = read_dacl(name, kind)?;
+    let updated = merge(sddl, current, entries, name)?;
+    write_dacl(name, updated, kind)
+}
+
+/// Replace the DACL of the object `name` refers to with `list`.
+///
+/// `SetNamedSecurityInfoW` propagates inheritable entries through the tree
+/// below a directory — what installs a grant's entries on the children the
+/// tree already holds, and what removes them again when the entry they came
+/// from is revoked.
+fn write_dacl(name: &str, list: LocalBuffer, kind: SE_OBJECT_TYPE) -> io::Result<()> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
-    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    let mut current: *mut ACL = std::ptr::null_mut();
-
-    reread(name, || {
-        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-        current = std::ptr::null_mut();
-        // SAFETY: the path is NUL-terminated and the out-parameters are valid.
-        unsafe {
-            GetNamedSecurityInfoW(
-                PCWSTR(wide.as_ptr()),
-                kind,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(&mut current),
-                None,
-                &mut descriptor,
-            )
-        }
-    })?;
-    let _descriptor = LocalBuffer(descriptor.0);
-
-    let updated = merge(sddl, current, entries, name)?;
-
-    // SAFETY: `updated` is the list just built, valid while the guard lives.
+    // SAFETY: `list` is the list just built, valid until it is dropped below.
     let status = unsafe {
         SetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
@@ -415,11 +449,11 @@ fn apply(name: &str, sddl: &str, entries: &[Entry], kind: SE_OBJECT_TYPE) -> io:
             DACL_SECURITY_INFORMATION,
             None,
             None,
-            Some(updated.0.cast()),
+            Some(list.0.cast()),
             None,
         )
     };
-    drop(updated);
+    drop(list);
 
     if status.is_err() {
         return Err(io::Error::other(format!(
@@ -428,4 +462,83 @@ fn apply(name: &str, sddl: &str, entries: &[Entry], kind: SE_OBJECT_TYPE) -> io:
     }
 
     Ok(())
+}
+
+/// Replace the DACL of the file `name` refers to, propagating nothing.
+///
+/// `SetFileSecurityW` writes the object's own descriptor and leaves the tree
+/// beneath it alone, which is what makes a this-object-only edit cheap: no
+/// child inherits from it, so nothing below is touched. The list keeps the
+/// protected and auto-inherited bits `descriptor` — the descriptor the
+/// object's list was read from — carries, so how it relates to its parent is
+/// unchanged.
+fn write_file_dacl(name: &str, descriptor: &LocalBuffer, list: LocalBuffer) -> io::Result<()> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let descriptor = PSECURITY_DESCRIPTOR(descriptor.0.cast());
+
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: `descriptor` is the descriptor just read, alive while its guard
+    // lives, and the out-parameters are valid.
+    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.map_err(
+        |source| io::Error::other(format!("cannot read the descriptor of {name}: {source}")),
+    )?;
+
+    let mut absolute = SECURITY_DESCRIPTOR::default();
+    let written = PSECURITY_DESCRIPTOR((&raw mut absolute).cast());
+    let inheritance = SECURITY_DESCRIPTOR_CONTROL(SE_DACL_PROTECTED.0 | SE_DACL_AUTO_INHERITED.0);
+    // SAFETY: `absolute` outlives every call below, and `list` — which it
+    // points at once the list is set — outlives the write.
+    let status = unsafe {
+        InitializeSecurityDescriptor(written, SECURITY_DESCRIPTOR_REVISION)
+            .and_then(|()| SetSecurityDescriptorDacl(written, true, Some(list.0.cast()), false))
+            .and_then(|()| {
+                SetSecurityDescriptorControl(
+                    written,
+                    inheritance,
+                    SECURITY_DESCRIPTOR_CONTROL(control & inheritance.0),
+                )
+            })
+            .and_then(|()| {
+                SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, written).ok()
+            })
+    };
+    drop(list);
+
+    status.map_err(|source| {
+        io::Error::other(format!(
+            "cannot apply the access control list to {name}: {source}"
+        ))
+    })
+}
+
+/// The DACL of the file `name` refers to, rendered as SDDL.
+#[cfg(test)]
+pub(crate) fn dacl_sddl(name: &str) -> io::Result<String> {
+    let (descriptor, _current) = read_dacl(name, SE_FILE_OBJECT)?;
+
+    let mut text = PWSTR::null();
+    // SAFETY: `descriptor` names the descriptor just read, alive while its
+    // guard lives, and `text` is a valid out-parameter.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            PSECURITY_DESCRIPTOR(descriptor.0.cast()),
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut text,
+            None,
+        )
+    }
+    .map_err(|source| {
+        io::Error::other(format!("cannot render the descriptor of {name}: {source}"))
+    })?;
+
+    // SAFETY: `text` came from the conversion call — a NUL-terminated
+    // `LocalAlloc` string read once here and freed once below.
+    let rendered = unsafe { text.to_string() }
+        .map_err(|source| io::Error::other(format!("the descriptor of {name}: {source}")))?;
+    // SAFETY: the buffer came from the conversion call, which documents
+    // `LocalFree` as its deallocator, and it is freed exactly once.
+    unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    Ok(rendered)
 }

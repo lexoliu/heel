@@ -24,6 +24,12 @@ pub(crate) mod rlimit;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+// Windows path spelling compared the way Windows compares it. The work is
+// pure — no Win32 call — so it compiles wherever its tests run, which is
+// every platform; the Windows backend is the only non-test caller.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod windows_path;
+
 /// Everything a backend needs to launch one sandboxed process.
 ///
 /// Backends take a large, fixed set of inputs; passing them as a struct keeps

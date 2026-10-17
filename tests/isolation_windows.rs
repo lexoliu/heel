@@ -326,6 +326,38 @@ async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_pro
 }
 
 #[tokio::test]
+async fn a_read_grant_under_program_files_needs_no_administrator() {
+    // Windows opens the system directories to every AppContainer through
+    // ALL APPLICATION PACKAGES, so a grant carrying only read and execute
+    // must not touch their ACLs at all: writing needs rights the sandbox
+    // user does not hold, and it changes nothing the container can do. A
+    // nested child is granted rather than the root so the ancestors walk
+    // meets the system directory on its way up.
+    let program_files =
+        PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles is set"));
+    let child = std::fs::read_dir(&program_files)
+        .expect("Program Files lists")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("Program Files holds a directory");
+
+    let config = SandboxConfigBuilder::default()
+        .grant(&child, Access::READ | Access::EXEC)
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("a read/execute grant under Program Files starts without administrator rights");
+
+    let output = cmd(&sandbox, &format!("dir \"{}\"", child.display())).await;
+    assert!(
+        output.status.success(),
+        "the granted directory is reachable inside the container: {}",
+        stderr(&output)
+    );
+}
+
+#[tokio::test]
 async fn a_junction_inside_a_granted_directory_does_not_open_its_target() {
     // A grant's entries propagate through the tree it names, and a junction
     // planted in that tree must not carry them to wherever it points: the

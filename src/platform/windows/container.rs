@@ -11,6 +11,7 @@
 //! and reaching the proxy needs the loopback exemption below.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
@@ -26,6 +27,7 @@ use super::sid::Sid;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::grant::Access;
+use crate::platform::windows_path;
 
 /// Read a file, or list a directory.
 const READ: u32 = FILE_GENERIC_READ.0;
@@ -89,6 +91,34 @@ fn access_tree(access: Access) -> [Entry; 2] {
 pub(crate) struct Container {
     /// The profile this sandbox's processes run in.
     profile: Profile,
+    /// Every access-control list this container added entries to, in the
+    /// order it added them — the grants `drop` takes back, each named the
+    /// way the write named it so the removal finds the same list. Grants
+    /// are recorded from `&self` methods — `grant_program` runs once per
+    /// launch — so the list lives behind a mutex taken only for a push.
+    granted: Mutex<Vec<Granted>>,
+}
+
+/// One access-control list the container added entries to.
+#[derive(Debug)]
+struct Granted {
+    /// The name the write used — a verbatim path or an object name — so the
+    /// removal names the same list.
+    name: String,
+    /// How the entries are removed again.
+    removal: Removal,
+}
+
+/// How an added entry is removed again, mirroring how it was written.
+#[derive(Debug)]
+enum Removal {
+    /// Through `SetNamedSecurityInfoW`, which propagates the removal through
+    /// the tree the same way it propagated the entry.
+    Tree,
+    /// Through `SetFileSecurityW`, which writes the object's own descriptor
+    /// and nothing beneath it — the write `grant_this_only` used to add the
+    /// entry.
+    ThisOnly,
 }
 
 impl Container {
@@ -101,7 +131,10 @@ impl Container {
                 super::with_causes(&source)
             ))
         })?;
-        Ok(Self { profile })
+        Ok(Self {
+            profile,
+            granted: Mutex::new(Vec::new()),
+        })
     }
 
     /// The package SID that ACL grants and capabilities are keyed on.
@@ -153,7 +186,9 @@ impl Container {
     /// reports an artifact.
     ///
     /// `socket` is the path the endpoint was bound for; the pipe name is
-    /// derived from it the same way the server derives it.
+    /// derived from it the same way the server derives it. The pipe is the
+    /// sandbox's own — bound by its IPC server and closed with it — so its
+    /// entry is not recorded for removal: it dies with the pipe.
     pub(crate) fn grant_ipc_endpoint(&self, socket: &Path) -> Result<()> {
         const PIPE_ACCESS: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
 
@@ -189,7 +224,10 @@ impl Container {
         const READ_WRITE: u32 = GENERIC_READ.0 | GENERIC_WRITE.0;
 
         match acl::grant_object(NULL_DEVICE, self.sid().as_string(), READ_WRITE) {
-            Ok(()) => tracing::debug!("opened the null device to the container"),
+            Ok(()) => {
+                self.record(NULL_DEVICE.to_owned(), Removal::Tree);
+                tracing::debug!("opened the null device to the container");
+            }
             Err(source) => tracing::warn!(
                 %source,
                 "cannot open the null device to the container; children that open NUL will be denied"
@@ -211,7 +249,20 @@ impl Container {
     /// written once by the system. Walking it and granting each child again
     /// re-propagated every subtree once per directory above it — a
     /// toolchain tree cost minutes per sandbox.
+    ///
+    /// Windows already opens the system directories to every AppContainer
+    /// through ALL APPLICATION PACKAGES, so a grant that adds nothing but
+    /// read and execute changes nothing — while the write itself needs
+    /// rights a sandbox user does not hold. A write grant is still
+    /// attempted: a failure there is a real error.
     fn grant_path(&self, path: &Path, access: Access) -> Result<()> {
+        if !access.can_write() && in_system_directory(path) {
+            tracing::debug!(
+                path = %path.display(),
+                "path is already open to every AppContainer"
+            );
+            return Ok(());
+        }
         let entries = access_tree(access);
         if path.is_dir() {
             self.grant(path, &entries)
@@ -229,13 +280,15 @@ impl Container {
     /// Grant traverse on every directory above `path`.
     fn grant_ancestors(&self, path: &Path) -> Result<()> {
         for ancestor in path.ancestors().skip(1) {
-            // A drive root is traversable by everyone already, and its ACL is
-            // not ours to change.
+            // A drive root is traversable by everyone already, and the
+            // system directories are open to every package, traverse
+            // included; the ACLs of neither are ours to change.
             if ancestor.parent().is_none() || in_system_directory(ancestor) {
                 continue;
             }
-            acl::grant_this_only(ancestor, self.sid().as_string(), TRAVERSE)
+            let name = acl::grant_this_only(ancestor, self.sid().as_string(), TRAVERSE)
                 .map_err(|source| Error::path(ancestor, source))?;
+            self.record(name, Removal::ThisOnly);
         }
         Ok(())
     }
@@ -263,10 +316,22 @@ impl Container {
         )
     }
 
-    /// Add entries to a path's access control list.
+    /// Add entries to a path's access control list, and record the grant
+    /// for `drop`.
     fn grant(&self, path: &Path, entries: &[Entry]) -> Result<()> {
-        acl::grant(path, self.sid().as_string(), entries)
-            .map_err(|source| Error::path(path, source))
+        let name = acl::grant(path, self.sid().as_string(), entries)
+            .map_err(|source| Error::path(path, source))?;
+        self.record(name, Removal::Tree);
+        Ok(())
+    }
+
+    /// Remember that `name`'s access control list carries this container's
+    /// entries, so `drop` removes exactly them.
+    fn record(&self, name: String, removal: Removal) {
+        self.granted
+            .lock()
+            .expect("the grants lock is held only around a push")
+            .push(Granted { name, removal });
     }
 
     /// The capability a process gets, given whether it may reach the network.
@@ -309,14 +374,101 @@ impl Container {
     }
 }
 
+impl Drop for Container {
+    /// Take back every entry the container added.
+    ///
+    /// Each list is re-read before it is rewritten and only the entries this
+    /// container's own SID holds are dropped, so a concurrent sandbox's
+    /// entries on the same path survive the removal. A list whose removal
+    /// fails is reported and the rest are still removed. A crash before this
+    /// runs leaves the entries on their lists, each naming a package SID
+    /// that no longer exists.
+    fn drop(&mut self) {
+        let Self { profile, granted } = self;
+        let sid = profile.sid().as_string();
+        for granted in granted
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            let result = match granted.removal {
+                Removal::Tree => acl::revoke(&granted.name, sid),
+                Removal::ThisOnly => acl::revoke_this_only(&granted.name, sid),
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    path = %granted.name,
+                    %error,
+                    "cannot remove the container's access control entries"
+                );
+            }
+        }
+    }
+}
+
 /// Whether a path lives under a directory Windows opens to every package.
 ///
-/// Compared case-insensitively, because Windows paths are, and the case a
-/// program is found under does not always match the environment variable.
+/// Compared component-wise and case-insensitively — the way Windows itself
+/// compares paths — so a canonicalized `\\?\C:\…` path matches `C:\…` and a
+/// sibling like `C:\Program Files Extra` does not match `C:\Program Files`.
 fn in_system_directory(path: &Path) -> bool {
-    let path = path.to_string_lossy().to_lowercase();
     ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"]
         .iter()
         .filter_map(|variable| std::env::var(variable).ok())
-        .any(|root| path.starts_with(&root.to_lowercase()))
+        .any(|root| windows_path::contains(Path::new(&root), path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The DACL of `path`, rendered as SDDL.
+    fn dacl(path: &Path) -> String {
+        let name = std::fs::canonicalize(path).expect("the path resolves");
+        acl::dacl_sddl(&name.to_string_lossy()).expect("the list reads back")
+    }
+
+    #[test]
+    fn drop_removes_every_entry_the_container_added() {
+        let dir = tempfile::tempdir().expect("a temp directory");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("a nested directory");
+
+        let sid = {
+            let container = Container::create().expect("a container");
+            let sid = container.sid().as_string().to_owned();
+
+            container
+                .grant_ancestors(dir.path())
+                .expect("the ancestors grant");
+            container
+                .grant_path(dir.path(), Access::WRITE)
+                .expect("the directory grants");
+            container
+                .grant_path(&nested, Access::READ | Access::EXEC)
+                .expect("the nested directory grants");
+
+            // The entries are in place before the drop — otherwise the
+            // assertions below pass on an empty premise.
+            for path in [&nested, dir.path()] {
+                let list = dacl(path);
+                assert!(
+                    list.contains(&sid),
+                    "no {sid} entry on {} before drop",
+                    path.display()
+                );
+            }
+            sid
+        };
+
+        // Neither the granted paths nor any ancestor keeps an entry for the
+        // dropped container's SID.
+        for path in std::iter::once(nested.as_path()).chain(dir.path().ancestors()) {
+            let list = dacl(path);
+            assert!(
+                !list.contains(&sid),
+                "an entry for {sid} remains on {}",
+                path.display()
+            );
+        }
+    }
 }
