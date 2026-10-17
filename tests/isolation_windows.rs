@@ -325,17 +325,17 @@ async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_pro
     assert_needle(&run_staged_from_inside(&sandbox, dir.path()).await);
 }
 
-/// The DACL of `path` rendered as SDDL, for failure messages.
-fn sddl(path: &Path) -> String {
-    let output = std::process::Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg(format!("(Get-Acl -LiteralPath '{}').Sddl", path.display()))
+/// The access control list of `path` as `icacls` prints it, for failure
+/// messages. `icacls` is a system binary, so the report works on a runner
+/// whose PowerShell security module does not load.
+fn acl_listing(path: &Path) -> String {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
         .output()
-        .expect("powershell runs");
+        .expect("icacls runs");
     assert!(
         output.status.success(),
-        "Get-Acl on {}: {}",
+        "icacls on {}: {}",
         path.display(),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -367,14 +367,14 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
             panic!(
                 "granting read/execute on the already-open {} failed; its DACL is {}: {error}",
                 system32.display(),
-                sddl(&system32)
+                acl_listing(&system32)
             )
         });
     let output = cmd(&sandbox, &format!("dir \"{}\"", system32.display())).await;
     assert!(
         output.status.success(),
         "the already-open directory is readable inside; its DACL is {}: {}",
-        sddl(&system32),
+        acl_listing(&system32),
         stderr(&output)
     );
     drop(sandbox);
@@ -419,7 +419,7 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
             panic!(
                 "granting read/execute on {} failed; its DACL is {}: {error}",
                 child.display(),
-                sddl(&child)
+                acl_listing(&child)
             )
         });
     let output = cmd(&sandbox, &format!("dir \"{}\"", child.display())).await;
@@ -428,7 +428,7 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
     assert!(
         output.status.success(),
         "the granted directory is readable inside; its DACL is {}: {}",
-        sddl(&child),
+        acl_listing(&child),
         stderr(&output)
     );
 }
