@@ -420,15 +420,16 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
         return;
     }
 
-    // `/inheritance:r` removes the entries inherited from Program Files;
-    // on a tree this test just created that is all of them, so the
-    // container holds no access whatever there.
-    let probe = child.join("probe.txt");
-    std::fs::write(&probe, "heel-probe\n").expect("the probe file is written");
+    // `/inheritance:r` removes the entries inherited from Program Files,
+    // and the one entry put back opens the tree to Administrators — whom
+    // this process runs as — and to nothing an AppContainer token
+    // carries. The probe file is written afterwards so it inherits that
+    // entry, and with it whatever the grant adds to the directory.
     let stripped = std::process::Command::new("icacls")
         .arg(&child)
         .arg("/inheritance:r")
-        .arg("/T")
+        .arg("/grant:r")
+        .arg("*S-1-5-32-544:(OI)(CI)F")
         .output()
         .expect("icacls runs");
     assert!(
@@ -437,6 +438,8 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
         child.display(),
         String::from_utf8_lossy(&stripped.stderr)
     );
+    let probe = child.join("probe.txt");
+    std::fs::write(&probe, "heel-probe\n").expect("the probe file is written");
 
     let sandbox = sandbox_granting(&child, Access::READ | Access::EXEC)
         .await
