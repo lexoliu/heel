@@ -325,34 +325,110 @@ async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_pro
     assert_needle(&run_staged_from_inside(&sandbox, dir.path()).await);
 }
 
-#[tokio::test]
-async fn a_read_grant_under_program_files_needs_no_administrator() {
-    // Windows opens the system directories to every AppContainer through
-    // ALL APPLICATION PACKAGES, so a grant carrying only read and execute
-    // must not touch their ACLs at all: writing needs rights the sandbox
-    // user does not hold, and it changes nothing the container can do. A
-    // nested child is granted rather than the root so the ancestors walk
-    // meets the system directory on its way up.
-    let program_files =
-        PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles is set"));
-    let child = std::fs::read_dir(&program_files)
-        .expect("Program Files lists")
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.is_dir())
-        .expect("Program Files holds a directory");
-
-    let config = SandboxConfigBuilder::default()
-        .grant(&child, Access::READ | Access::EXEC)
-        .build();
-    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
-        .await
-        .expect("a read/execute grant under Program Files starts without administrator rights");
-
-    let output = cmd(&sandbox, &format!("dir \"{}\"", child.display())).await;
+/// The DACL of `path` rendered as SDDL, for failure messages.
+fn sddl(path: &Path) -> String {
+    let output = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(format!("(Get-Acl -LiteralPath '{}').Sddl", path.display()))
+        .output()
+        .expect("powershell runs");
     assert!(
         output.status.success(),
-        "the granted directory is reachable inside the container: {}",
+        "Get-Acl on {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A sandbox with `path` granted `access`.
+async fn sandbox_granting(path: &Path, access: Access) -> heel::Result<Sandbox> {
+    let config = SandboxConfigBuilder::default().grant(path, access).build();
+    Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await
+}
+
+#[tokio::test]
+async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
+    // Whether a grant writes the ACL at all is decided by what the
+    // container already holds on the path — asked of Windows, not guessed
+    // from the path, because a directory under a system root can carry a
+    // DACL that opens nothing to a package.
+    //
+    // (a) `%SystemRoot%\System32` grants ALL APPLICATION PACKAGES read and
+    // execute, so the grant must be a skip rather than a write — a write
+    // there needs rights the sandbox user does not hold — and the
+    // directory is readable inside without it.
+    let system32 =
+        Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set")).join("System32");
+    let sandbox = sandbox_granting(&system32, Access::READ | Access::EXEC)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "granting read/execute on the already-open {} failed; its DACL is {}: {error}",
+                system32.display(),
+                sddl(&system32)
+            )
+        });
+    let output = cmd(&sandbox, &format!("dir \"{}\"", system32.display())).await;
+    assert!(
+        output.status.success(),
+        "the already-open directory is readable inside; its DACL is {}: {}",
+        sddl(&system32),
+        stderr(&output)
+    );
+    drop(sandbox);
+
+    // (b) A fresh child of %ProgramFiles% with its inherited entries
+    // stripped opens nothing to an AppContainer, so the grant has to add
+    // real entries — and a runner without the rights to create it meets a
+    // real error naming the path.
+    let program_files =
+        PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles is set"));
+    let child = program_files.join(format!("heel-grant-{}", std::process::id()));
+    if let Err(source) = std::fs::create_dir(&child) {
+        let error = sandbox_granting(&child, Access::READ | Access::EXEC)
+            .await
+            .err()
+            .expect("a grant that cannot be written fails");
+        assert!(
+            error.to_string().contains(child.to_string_lossy().as_ref()),
+            "the error must name the path it could not grant ({source}): {error}"
+        );
+        return;
+    }
+
+    // `/inheritance:r` removes the entries inherited from Program Files;
+    // on a directory this test just created that is all of them, so the
+    // container holds no access whatever there.
+    let stripped = std::process::Command::new("icacls")
+        .arg(&child)
+        .arg("/inheritance:r")
+        .output()
+        .expect("icacls runs");
+    assert!(
+        stripped.status.success(),
+        "icacls /inheritance:r on {}: {}",
+        child.display(),
+        String::from_utf8_lossy(&stripped.stderr)
+    );
+
+    let sandbox = sandbox_granting(&child, Access::READ | Access::EXEC)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "granting read/execute on {} failed; its DACL is {}: {error}",
+                child.display(),
+                sddl(&child)
+            )
+        });
+    let output = cmd(&sandbox, &format!("dir \"{}\"", child.display())).await;
+    drop(sandbox);
+    let _ = std::fs::remove_dir(&child);
+    assert!(
+        output.status.success(),
+        "the granted directory is readable inside; its DACL is {}: {}",
+        sddl(&child),
         stderr(&output)
     );
 }

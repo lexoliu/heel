@@ -23,10 +23,10 @@ use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-    GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
-    SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-    TRUSTEE_W,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetEffectiveRightsFromAclW,
+    GetNamedSecurityInfoW, GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    SE_OBJECT_TYPE, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
     ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
@@ -300,6 +300,43 @@ pub(crate) fn revoke_this_only(name: &str, sddl: &str) -> io::Result<()> {
     let (descriptor, current) = read_dacl(name, SE_FILE_OBJECT)?;
     let updated = without(sddl, current, name)?;
     write_file_dacl(name, &descriptor, updated)
+}
+
+/// The rights `trustees` effectively hold on `path`, unioned.
+///
+/// Each trustee is a SID in `S-…` form. `GetEffectiveRightsFromAclW` answers
+/// "what does this object's DACL grant this SID" for one trustee, and the
+/// object's own list is the whole question: entries an ancestor granted by
+/// inheritance are already written into it. The union over the SIDs an
+/// AppContainer token carries is therefore the filesystem access check the
+/// kernel will make for it — `AccessCheck` itself wants a real token, and
+/// one exists only while a process in the container runs.
+pub(crate) fn effective_rights(path: &Path, trustees: &[&str]) -> io::Result<u32> {
+    let name = resolve(path)?;
+    let (_descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
+
+    let mut rights = 0u32;
+    for sddl in trustees {
+        let (_sid_buffer, sid) = parse_sid(sddl)?;
+        let trustee = TRUSTEE_W {
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(sid.0.cast()),
+            ..Default::default()
+        };
+        let mut held = 0u32;
+        // SAFETY: `current` is the list just read, alive while its guard
+        // lives, `trustee` names a valid SID, and `held` is a valid
+        // out-parameter.
+        let status = unsafe { GetEffectiveRightsFromAclW(current, &trustee, &mut held) };
+        if status.is_err() {
+            return Err(io::Error::other(format!(
+                "cannot evaluate the access rights of {name}: {status:?}"
+            )));
+        }
+        rights |= held;
+    }
+    Ok(rights)
 }
 
 /// The `\\?\` verbatim spelling of `path`.
