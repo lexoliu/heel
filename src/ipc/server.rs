@@ -299,8 +299,8 @@ mod tests {
         type Args = EchoArgs;
         type Response = String;
 
-        async fn handle(&self, args: EchoArgs) -> String {
-            args.message
+        async fn handle(&self, args: EchoArgs) -> Result<String, IpcError> {
+            Ok(args.message)
         }
     }
 

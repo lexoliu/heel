@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use heel::ipc::{IpcCommand, IpcRouter, NoArgs};
+use heel::ipc::{IpcCommand, IpcError, IpcRouter, NoArgs};
 use heel::{Sandbox, SandboxConfigBuilder};
 use serde::Deserialize;
 
@@ -45,15 +45,15 @@ impl IpcCommand for Echo {
     type Args = EchoArgs;
     type Response = String;
 
-    async fn handle(&self, args: EchoArgs) -> String {
+    async fn handle(&self, args: EchoArgs) -> Result<String, IpcError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        format!(
+        Ok(format!(
             "first={} second={} flag={} piped={}",
             args.first,
             args.second,
             args.flag,
             args.piped.trim()
-        )
+        ))
     }
 }
 
@@ -68,8 +68,8 @@ impl IpcCommand for Structured {
     type Args = NoArgs;
     type Response = Vec<u32>;
 
-    async fn handle(&self, _args: NoArgs) -> Vec<u32> {
-        vec![1, 2, 3]
+    async fn handle(&self, _args: NoArgs) -> Result<Vec<u32>, IpcError> {
+        Ok(vec![1, 2, 3])
     }
 }
 

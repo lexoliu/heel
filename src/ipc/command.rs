@@ -7,6 +7,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::ipc::IpcError;
+
 /// Arguments for a command that takes none.
 ///
 /// The wire format is always a map of named arguments, so a command without
@@ -28,7 +30,7 @@ pub struct NoArgs {}
 ///
 /// ```rust,ignore
 /// use serde::Deserialize;
-/// use heel::ipc::IpcCommand;
+/// use heel::ipc::{IpcCommand, IpcError};
 ///
 /// struct Search {
 ///     client: SearchClient,
@@ -52,8 +54,8 @@ pub struct NoArgs {}
 ///     type Args = SearchArgs;
 ///     type Response = Vec<String>;
 ///
-///     async fn handle(&self, args: SearchArgs) -> Self::Response {
-///         self.client.search(&args.query).await
+///     async fn handle(&self, args: SearchArgs) -> Result<Self::Response, IpcError> {
+///         self.client.search(&args.query).await.map_err(IpcError::remote)
 ///     }
 /// }
 /// ```
@@ -77,6 +79,21 @@ pub trait IpcCommand: Send + Sync + 'static {
         Cow::Borrowed(&[])
     }
 
+    /// Whether the invocation's arguments reach the handler verbatim.
+    ///
+    /// Declared names bind words to `Args` fields on the client side, which
+    /// only works when the command line's shape is fixed here. A command whose
+    /// arguments are defined by a schema on the host — subcommands, per-variant
+    /// fields, anything the client cannot know — returns `true`: the generated
+    /// shim forwards every word untouched, `heel ipc` delivers them in
+    /// `params["args"]`, and the host-side parser interprets them. `Args` is
+    /// then a map or a struct with an `args` field, not a declaration the
+    /// client can pre-bind. Declaring positional arguments alongside raw
+    /// arguments is a registration error.
+    fn raw_args(&self) -> bool {
+        false
+    }
+
     /// Name of the argument that receives piped standard input.
     ///
     /// With `Some("input")`, `cat file | summarize "brief"` arrives as
@@ -93,5 +110,12 @@ pub trait IpcCommand: Send + Sync + 'static {
     type Response: Serialize + Send;
 
     /// Handle one request.
-    fn handle(&self, args: Self::Args) -> impl Future<Output = Self::Response> + Send;
+    ///
+    /// An error becomes the failure half of the wire response, so `heel ipc`
+    /// prints it on standard error and exits non-zero instead of reporting a
+    /// successful call that happened to serialize a failure.
+    fn handle(
+        &self,
+        args: Self::Args,
+    ) -> impl Future<Output = Result<Self::Response, IpcError>> + Send;
 }

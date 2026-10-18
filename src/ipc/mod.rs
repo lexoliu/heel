@@ -36,8 +36,8 @@
 //!     type Args = WebSearchArgs;
 //!     type Response = Vec<String>;
 //!
-//!     async fn handle(&self, args: WebSearchArgs) -> Vec<String> {
-//!         self.client.search(&args.query).await
+//!     async fn handle(&self, args: WebSearchArgs) -> Result<Vec<String>, IpcError> {
+//!         self.client.search(&args.query).await.map_err(IpcError::remote)
 //!     }
 //! }
 //!

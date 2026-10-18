@@ -46,6 +46,13 @@ pub enum IpcError {
     Remote(String),
 }
 
+impl IpcError {
+    /// A failure reported by the host handler.
+    pub fn remote(error: impl std::fmt::Display) -> Self {
+        Self::Remote(error.to_string())
+    }
+}
+
 /// A decoded request.
 #[derive(Debug, PartialEq, Eq)]
 pub struct IpcRequest {

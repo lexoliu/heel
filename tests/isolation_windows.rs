@@ -16,7 +16,7 @@ use std::process::Output;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use heel::ipc::{IpcCommand, IpcRouter, NoArgs};
+use heel::ipc::{IpcCommand, IpcError, IpcRouter, NoArgs};
 use heel::{Access, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 #[path = "fixtures/mod.rs"]
@@ -258,8 +258,9 @@ impl IpcCommand for Probe {
     type Args = NoArgs;
     type Response = ();
 
-    async fn handle(&self, _args: NoArgs) {
+    async fn handle(&self, _args: NoArgs) -> Result<(), IpcError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -323,6 +324,142 @@ async fn a_granted_directory_at_the_drive_root_lets_the_container_run_staged_pro
     let sandbox = exec_granted_sandbox(dir.path()).await;
 
     assert_needle(&run_staged_from_inside(&sandbox, dir.path()).await);
+}
+
+/// The access control list of `path` as `icacls` prints it, for failure
+/// messages. `icacls` is a system binary, so the report works on a runner
+/// whose PowerShell security module does not load.
+fn acl_listing(path: &Path) -> String {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .output()
+        .expect("icacls runs");
+    assert!(
+        output.status.success(),
+        "icacls on {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Search `file` for `needle` with `findstr` inside `sandbox`: a read of the
+/// file's contents, with the path passed as its own argument.
+async fn read_inside(
+    sandbox: &Sandbox<impl heel::NetworkPolicy>,
+    file: &Path,
+    needle: &str,
+) -> Output {
+    let system32 =
+        Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set")).join("System32");
+    sandbox
+        .command(system32.join("findstr.exe").to_string_lossy())
+        .arg(format!("/c:{needle}"))
+        .arg(file.to_string_lossy())
+        .output()
+        .await
+        .expect("findstr runs")
+}
+
+/// A sandbox with `path` granted `access`.
+async fn sandbox_granting(path: &Path, access: Access) -> heel::Result<Sandbox> {
+    let config = SandboxConfigBuilder::default().grant(path, access).build();
+    Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await
+}
+
+#[tokio::test]
+async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
+    // Whether a grant writes the ACL at all is decided by what the
+    // container already holds on the path — asked of Windows, not guessed
+    // from the path, because a directory under a system root can carry a
+    // DACL that opens nothing to a package.
+    //
+    // (a) `%SystemRoot%\System32` grants ALL APPLICATION PACKAGES read and
+    // execute, so the grant must be a skip rather than a write — a write
+    // there needs rights the sandbox user does not hold — and a file in it
+    // is readable inside without it. The read goes through `findstr` on a
+    // known file rather than `cmd`'s `dir`: `dir` queries the volume
+    // through the drive root, which grants nothing to an AppContainer, so
+    // it fails on every directory, granted or not.
+    let system32 =
+        Path::new(&std::env::var_os("SystemRoot").expect("SystemRoot is set")).join("System32");
+    let sandbox = sandbox_granting(&system32, Access::READ | Access::EXEC)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "granting read/execute on the already-open {} failed; its DACL is {}: {error}",
+                system32.display(),
+                acl_listing(&system32)
+            )
+        });
+    let hosts = system32.join(r"drivers\etc\hosts");
+    let output = read_inside(&sandbox, &hosts, "localhost").await;
+    assert!(
+        output.status.success(),
+        "a file in the already-open directory is readable inside; its DACL is {}: {}",
+        acl_listing(&hosts),
+        stderr(&output)
+    );
+    drop(sandbox);
+
+    // (b) A fresh child of %ProgramFiles% with its inherited entries
+    // stripped opens nothing to an AppContainer, so the grant has to add
+    // real entries — and a runner without the rights to create it meets a
+    // real error naming the path.
+    let program_files =
+        PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles is set"));
+    let child = program_files.join(format!("heel-grant-{}", std::process::id()));
+    if let Err(source) = std::fs::create_dir(&child) {
+        let error = sandbox_granting(&child, Access::READ | Access::EXEC)
+            .await
+            .err()
+            .expect("a grant that cannot be written fails");
+        assert!(
+            error.to_string().contains(child.to_string_lossy().as_ref()),
+            "the error must name the path it could not grant ({source}): {error}"
+        );
+        return;
+    }
+
+    // `/inheritance:r` removes the entries inherited from Program Files,
+    // and the one entry put back opens the tree to Administrators — whom
+    // this process runs as — and to nothing an AppContainer token
+    // carries. The probe file is written afterwards so it inherits that
+    // entry, and with it whatever the grant adds to the directory.
+    let stripped = std::process::Command::new("icacls")
+        .arg(&child)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg("*S-1-5-32-544:(OI)(CI)F")
+        .output()
+        .expect("icacls runs");
+    assert!(
+        stripped.status.success(),
+        "icacls /inheritance:r on {}: {}",
+        child.display(),
+        String::from_utf8_lossy(&stripped.stderr)
+    );
+    let probe = child.join("probe.txt");
+    std::fs::write(&probe, "heel-probe\n").expect("the probe file is written");
+
+    let sandbox = sandbox_granting(&child, Access::READ | Access::EXEC)
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "granting read/execute on {} failed; its DACL is {}: {error}",
+                child.display(),
+                acl_listing(&child)
+            )
+        });
+    let output = read_inside(&sandbox, &probe, "heel-probe").await;
+    drop(sandbox);
+    let listing = acl_listing(&probe);
+    std::fs::remove_dir_all(&child).expect("the test's Program Files child is removed");
+    assert!(
+        output.status.success(),
+        "a file in the granted directory is readable inside; its DACL is {listing}: {}",
+        stderr(&output)
+    );
 }
 
 #[tokio::test]

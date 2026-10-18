@@ -16,8 +16,12 @@ pub fn parse() -> CliResult<Cli> {
     let metadata: heel::CommandMeta = serde_json::from_slice(&std::fs::read(&path)?)
         .map_err(|source| CliError::NativeMetadata { path, source })?;
     let mut arguments = vec!["heel".to_owned(), "ipc".to_owned(), command.to_owned()];
-    for positional in metadata.positional_args.iter() {
-        arguments.extend(["--positional".to_owned(), positional.to_string()]);
+    if metadata.raw_args {
+        arguments.push("--raw-args".to_owned());
+    } else {
+        for positional in metadata.positional_args.iter() {
+            arguments.extend(["--positional".to_owned(), positional.to_string()]);
+        }
     }
     if let Some(stdin_arg) = metadata.stdin_arg {
         arguments.extend(["--stdin-arg".to_owned(), stdin_arg.into_owned()]);

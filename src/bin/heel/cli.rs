@@ -146,6 +146,10 @@ pub struct IpcArgs {
     #[arg(long = "positional")]
     pub positional: Vec<String>,
 
+    /// Forward every argument verbatim in `args` for the host-side parser.
+    #[arg(long = "raw-args")]
+    pub raw_args: bool,
+
     /// Argument name that receives piped standard input.
     #[arg(long = "stdin-arg")]
     pub stdin_arg: Option<String>,
