@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/lexoliu/heel/compare/heel-v0.4.2...heel-v0.5.0) - 2026-10-18
+
+### Fixed
+
+- *(windows)* decide a grant by the container's effective rights, not the path
+- *(windows)* skip system directories and remove grant entries on drop
+
+### Other
+
+- [**breaking**] update the IpcCommand example for fallible handlers ([#80](https://github.com/lexoliu/heel/pull/80))
+- let commands take argv verbatim and make handlers fallible ([#78](https://github.com/lexoliu/heel/pull/78))
+- *(windows)* strip the Program Files child's inheritance before writing its probe
+- *(windows)* prove readability by reading a file, not with dir
+- *(windows)* list ACLs with icacls in failure messages
+
 ## [0.4.2](https://github.com/lexoliu/heel/compare/heel-v0.4.1...heel-v0.4.2) - 2026-10-16
 
 ### Other
