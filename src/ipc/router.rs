@@ -24,6 +24,9 @@ pub struct CommandMeta {
     pub positional_args: Cow<'static, [Cow<'static, str>]>,
     /// Argument that receives piped standard input, if any.
     pub stdin_arg: Option<Cow<'static, str>>,
+    /// Whether every argument reaches the handler verbatim in `params["args"]`.
+    #[serde(default)]
+    pub raw_args: bool,
 }
 
 /// Whether a name is usable as a command or argument name.
@@ -92,13 +95,18 @@ impl IpcRouter {
             !self.handlers.contains_key(&name),
             "IPC command '{name}' is already registered"
         );
+        let raw_args = command.raw_args();
+        assert!(
+            !raw_args || positional_args.is_empty(),
+            "IPC command '{name}' cannot declare positional arguments with raw_args"
+        );
 
         let command = Arc::new(command);
         let handler: ErasedHandler = Arc::new(move |params: Vec<u8>| {
             let command = Arc::clone(&command);
             Box::pin(async move {
                 let args = rmp_serde::from_slice::<C::Args>(&params)?;
-                let response = command.handle(args).await;
+                let response = command.handle(args).await?;
                 Ok(rmp_serde::to_vec_named(&response)?)
             })
         });
@@ -108,6 +116,7 @@ impl IpcRouter {
             CommandMeta {
                 positional_args,
                 stdin_arg,
+                raw_args,
             },
         );
         self.handlers.insert(name, handler);
@@ -169,10 +178,10 @@ mod tests {
         type Args = DoublerArgs;
         type Response = DoublerResponse;
 
-        async fn handle(&self, args: DoublerArgs) -> DoublerResponse {
-            DoublerResponse {
+        async fn handle(&self, args: DoublerArgs) -> Result<DoublerResponse, IpcError> {
+            Ok(DoublerResponse {
                 doubled: args.value * 2,
-            }
+            })
         }
     }
 
@@ -194,8 +203,8 @@ mod tests {
         type Args = CounterArgs;
         type Response = String;
 
-        async fn handle(&self, args: CounterArgs) -> String {
-            format!("{}, {}!", self.greeting, args.name)
+        async fn handle(&self, args: CounterArgs) -> Result<String, IpcError> {
+            Ok(format!("{}, {}!", self.greeting, args.name))
         }
     }
 
@@ -210,6 +219,76 @@ mod tests {
 
             assert_eq!(response, DoublerResponse { doubled: 42 });
         });
+    }
+
+    /// A command whose words go to the host-side parser untouched.
+    struct Tool;
+
+    #[derive(Deserialize)]
+    struct ToolArgs {
+        args: Vec<String>,
+    }
+
+    impl IpcCommand for Tool {
+        fn name(&self) -> Cow<'static, str> {
+            "tool".into()
+        }
+
+        fn raw_args(&self) -> bool {
+            true
+        }
+
+        type Args = ToolArgs;
+        type Response = Vec<String>;
+
+        async fn handle(&self, args: ToolArgs) -> Result<Vec<String>, IpcError> {
+            Ok(args.args)
+        }
+    }
+
+    #[test]
+    fn raw_args_commands_receive_argv_verbatim() {
+        smol::block_on(async {
+            let router = IpcRouter::new().register(Tool);
+            let params = rmp_serde::to_vec_named(
+                &serde_json::json!({ "args": ["open", "--detail", "full"] }),
+            )
+            .unwrap();
+
+            let response = router.handle("tool", params).await.unwrap();
+            let response: Vec<String> = rmp_serde::from_slice(&response).unwrap();
+
+            assert_eq!(response, ["open", "--detail", "full"]);
+            assert!(router.methods().next().unwrap().1.raw_args);
+        });
+    }
+
+    /// A command that opts into raw argv may not also declare positionals.
+    struct BothBindings;
+
+    impl IpcCommand for BothBindings {
+        fn name(&self) -> Cow<'static, str> {
+            "both".into()
+        }
+        fn positional_args(&self) -> Cow<'static, [Cow<'static, str>]> {
+            Cow::Borrowed(&[Cow::Borrowed("query")])
+        }
+        fn raw_args(&self) -> bool {
+            true
+        }
+
+        type Args = NoArgs;
+        type Response = ();
+
+        async fn handle(&self, _args: NoArgs) -> Result<(), IpcError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot declare positional arguments with raw_args")]
+    fn raw_args_rejects_declared_positionals() {
+        let _ = IpcRouter::new().register(BothBindings);
     }
 
     #[test]
@@ -270,7 +349,9 @@ mod tests {
         type Args = NoArgs;
         type Response = ();
 
-        async fn handle(&self, _args: NoArgs) {}
+        async fn handle(&self, _args: NoArgs) -> Result<(), IpcError> {
+            Ok(())
+        }
     }
 
     #[test]

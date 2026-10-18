@@ -50,6 +50,30 @@ fn build_params(
     stdin: impl FnOnce() -> CliResult<String>,
 ) -> CliResult<BTreeMap<String, Value>> {
     let mut params = BTreeMap::new();
+
+    // Raw-args commands own their own parser on the host side; the words are
+    // delivered untouched for it to interpret.
+    if args.raw_args {
+        params.insert(
+            "args".to_string(),
+            Value::Array(
+                args.args
+                    .iter()
+                    .map(|word| Value::String(word.clone()))
+                    .collect(),
+            ),
+        );
+        if let Some(name) = &args.stdin_arg
+            && !asks_for_help(&args.args)
+        {
+            let content = stdin()?;
+            if !content.is_empty() {
+                params.insert(name.clone(), Value::String(content));
+            }
+        }
+        return Ok(params);
+    }
+
     let mut positional = args.positional.iter();
     let mut rest = args.args.iter().peekable();
 
@@ -181,6 +205,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(30),
             command: command.to_string(),
             positional: positional.iter().map(|s| s.to_string()).collect(),
+            raw_args: false,
             stdin_arg: stdin_arg.map(str::to_string),
             verbose: false,
             args: rest.iter().map(|s| s.to_string()).collect(),
@@ -287,6 +312,43 @@ mod tests {
         .expect("builds");
 
         assert_eq!(params["input"], Value::String("explicit".into()));
+    }
+
+    #[test]
+    fn raw_args_deliver_every_word_verbatim() {
+        let mut invocation = args(
+            "browser",
+            &[],
+            None,
+            &["read", "https://x", "--detail", "full"],
+        );
+        invocation.raw_args = true;
+
+        let params = build_params(&invocation, no_stdin).expect("builds");
+
+        assert_eq!(
+            params["args"],
+            Value::Array(vec![
+                Value::String("read".into()),
+                Value::String("https://x".into()),
+                Value::String("--detail".into()),
+                Value::String("full".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn raw_args_still_bind_piped_stdin_to_the_declared_name() {
+        let mut invocation = args("sum", &[], Some("input"), &["brief"]);
+        invocation.raw_args = true;
+
+        let params = build_params(&invocation, || Ok("piped text".to_string())).expect("builds");
+
+        assert_eq!(
+            params["args"],
+            Value::Array(vec![Value::String("brief".into())])
+        );
+        assert_eq!(params["input"], Value::String("piped text".into()));
     }
 
     #[test]

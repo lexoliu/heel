@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use heel::ipc::{IpcCommand, IpcRouter, TcpIpcEndpoint};
+use heel::ipc::{IpcCommand, IpcError, IpcRouter, TcpIpcEndpoint};
 use heel::{Sandbox, SandboxConfigBuilder};
 use serde::Deserialize;
 
@@ -26,8 +26,11 @@ impl IpcCommand for Echo {
     type Args = EchoArgs;
     type Response = String;
 
-    fn handle(&self, args: EchoArgs) -> impl std::future::Future<Output = String> {
-        std::future::ready(args.message)
+    fn handle(
+        &self,
+        args: EchoArgs,
+    ) -> impl std::future::Future<Output = Result<String, IpcError>> {
+        std::future::ready(Ok(args.message))
     }
 }
 
