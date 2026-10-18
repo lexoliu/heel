@@ -30,6 +30,7 @@ struct WrapperTemplate<'a> {
     command: &'a str,
     positional_args: &'a [Cow<'static, str>],
     stdin_arg: Option<&'a str>,
+    raw_args: bool,
 }
 
 /// The `heel` launcher placed alongside the wrappers.
@@ -129,6 +130,7 @@ fn render_wrapper(command: &str, meta: &CommandMeta) -> Result<String> {
         command,
         positional_args: &meta.positional_args,
         stdin_arg: meta.stdin_arg.as_deref(),
+        raw_args: meta.raw_args,
     }
     .render()?)
 }
@@ -195,7 +197,9 @@ mod tests {
         type Args = SearchArgs;
         type Response = ();
 
-        async fn handle(&self, _args: SearchArgs) {}
+        async fn handle(&self, _args: SearchArgs) -> std::result::Result<(), crate::ipc::IpcError> {
+            Ok(())
+        }
     }
 
     struct Plain;
@@ -208,7 +212,9 @@ mod tests {
         type Args = NoArgs;
         type Response = ();
 
-        async fn handle(&self, _args: NoArgs) {}
+        async fn handle(&self, _args: NoArgs) -> std::result::Result<(), crate::ipc::IpcError> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -218,6 +224,7 @@ mod tests {
             &CommandMeta {
                 positional_args: Cow::Borrowed(&[Cow::Borrowed("query"), Cow::Borrowed("scope")]),
                 stdin_arg: Some(Cow::Borrowed("input")),
+                raw_args: false,
             },
         )
         .expect("renders");
@@ -241,6 +248,7 @@ mod tests {
             &CommandMeta {
                 positional_args: Cow::Borrowed(&[]),
                 stdin_arg: None,
+                raw_args: false,
             },
         )
         .expect("renders");
@@ -256,6 +264,31 @@ mod tests {
             let metadata: CommandMeta = serde_json::from_str(&script).expect("metadata");
             assert!(metadata.positional_args.is_empty());
             assert!(metadata.stdin_arg.is_none());
+        }
+    }
+
+    #[test]
+    fn raw_args_wrappers_forward_argv_verbatim() {
+        let script = render_wrapper(
+            "tool",
+            &CommandMeta {
+                positional_args: Cow::Borrowed(&[]),
+                stdin_arg: Some(Cow::Borrowed("input")),
+                raw_args: true,
+            },
+        )
+        .expect("renders");
+
+        #[cfg(unix)]
+        {
+            assert!(script.contains("heel\" ipc tool --raw-args --stdin-arg input -- \"$@\""));
+            assert!(!script.contains("--positional"));
+        }
+        #[cfg(windows)]
+        {
+            let metadata: CommandMeta = serde_json::from_str(&script).expect("metadata");
+            assert!(metadata.raw_args);
+            assert_eq!(metadata.stdin_arg.as_deref(), Some("input"));
         }
     }
 

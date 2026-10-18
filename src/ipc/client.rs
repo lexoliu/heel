@@ -117,8 +117,8 @@ mod tests {
         type Args = SumArgs;
         type Response = i64;
 
-        async fn handle(&self, args: SumArgs) -> i64 {
-            args.a + args.b
+        async fn handle(&self, args: SumArgs) -> Result<i64, IpcError> {
+            Ok(args.a + args.b)
         }
     }
 
@@ -132,7 +132,9 @@ mod tests {
         type Args = i64;
         type Response = ();
 
-        async fn handle(&self, _args: i64) {}
+        async fn handle(&self, _args: i64) -> Result<(), IpcError> {
+            Err(IpcError::remote("the handler gave up"))
+        }
     }
 
     /// Start a server on a temporary socket for one test.
@@ -199,18 +201,33 @@ mod tests {
         let server = serve(&dir, IpcRouter::new().register(Failing)).await;
         let socket = server.socket_path().to_path_buf();
 
+        let decode_error = {
+            let socket = socket.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut client = IpcClient::connect(&socket).expect("connects");
+                // `Failing` expects an integer, so a map is a decoding error.
+                client
+                    .call::<_, ()>("failing", &serde_json::json!({ "unexpected": true }))
+                    .expect_err("must fail")
+            })
+            .await
+            .expect("client task completes")
+        };
+        assert!(
+            matches!(decode_error, IpcError::Remote(ref message) if message.contains("deserialization")),
+            "unexpected error: {decode_error:?}"
+        );
+
+        // A well-formed call reaches the handler, whose failure must surface
+        // the same way rather than arriving as a serialized result.
         let error = tokio::task::spawn_blocking(move || {
             let mut client = IpcClient::connect(&socket).expect("connects");
-            // `Failing` expects an integer, so a map is a decoding error.
-            client
-                .call::<_, ()>("failing", &serde_json::json!({ "unexpected": true }))
-                .expect_err("must fail")
+            client.call::<_, ()>("failing", &1).expect_err("must fail")
         })
         .await
         .expect("client task completes");
-
         assert!(
-            matches!(error, IpcError::Remote(ref message) if message.contains("deserialization")),
+            matches!(error, IpcError::Remote(ref message) if message.contains("the handler gave up")),
             "unexpected error: {error:?}"
         );
     }
