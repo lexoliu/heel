@@ -301,9 +301,9 @@ async fn no_proxy_is_advertised_without_network_access() {
 #[tokio::test]
 async fn temporary_files_land_somewhere_the_sandbox_can_write() {
     // Asserted as behaviour rather than as a path: Unix points `TMPDIR` at the
-    // working directory, while Windows redirects `TEMP` to a directory private
-    // to the container. Both give temporary files a writable home inside the
-    // sandbox, which is the guarantee.
+    // working directory, while Windows sets `TEMP`, `TMP` and `TMPDIR` to a
+    // directory private to the container. Both give temporary files a writable
+    // home inside the sandbox, which is the guarantee.
     let sandbox = default_sandbox().await;
     let output = shell(&sandbox, Platform::WRITE_AND_READ_BACK).await;
 

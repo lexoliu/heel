@@ -40,8 +40,10 @@
 //!
 //! # Filesystem
 //!
-//! Sandboxed processes may always read and write their working directory, which
-//! is also exported as `TMPDIR`. Everything else is opt-in through
+//! Sandboxed processes may always read and write their working directory. On
+//! Unix it is also exported as `TMPDIR`; on Windows the backend sets `TEMP`,
+//! `TMP` and `TMPDIR` to the container's own temporary folder. Everything else
+//! is opt-in through
 //! [`SandboxConfigBuilder::grant`], which pairs a path with the [`Access`] the
 //! sandbox has to it, and no location a process can write to may be executed.
 //! An [`Access::EXEC`] grant is the deliberate exception: it may name a single
