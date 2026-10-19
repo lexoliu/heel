@@ -264,9 +264,19 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
         .map(|(key, value)| (key.into(), value.into()))
         .collect();
 
+    // Variables the caller named for pass-through join whatever the request
+    // already carries. What the request supplies wins where the two overlap.
+    for name in request.config.env_passthrough() {
+        if let Some(value) = std::env::var_os(name)
+            && !supplied(&env, name)
+        {
+            env.push((name.into(), value));
+        }
+    }
+
     for name in MACHINE_FACTS.iter().chain(USER_DIRECTORIES) {
         if let Some(value) = std::env::var_os(name)
-            && !env.iter().any(|(existing, _)| existing == name)
+            && !supplied(&env, name)
         {
             env.push(((*name).into(), value));
         }
@@ -274,11 +284,7 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
 
     for name in INHERITED_VARIABLES {
         if let Some(value) = std::env::var_os(name)
-            && !env.iter().any(|(existing, _)| {
-                existing
-                    .as_encoded_bytes()
-                    .eq_ignore_ascii_case(name.as_bytes())
-            })
+            && !supplied(&env, name)
         {
             env.push(((*name).into(), value));
         }
@@ -286,6 +292,19 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
 
     env.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_lowercase());
     env
+}
+
+/// Whether `env` already supplies `name`.
+///
+/// Windows compares variable names case-insensitively, so the check does too:
+/// a `PATH` the request spelled `Path` must not sit beside the variable being
+/// filled in behind it.
+fn supplied(env: &[(OsString, OsString)], name: &str) -> bool {
+    env.iter().any(|(existing, _)| {
+        existing
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(name.as_bytes())
+    })
 }
 
 /// Summarize a launch's environment for a failure message.
