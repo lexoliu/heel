@@ -11,10 +11,14 @@
 #![allow(clippy::unwrap_used)]
 
 use std::borrow::Cow;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use heel::ipc::{IpcCommand, IpcError, IpcRouter, NoArgs};
 use heel::{Access, Sandbox, SandboxConfig, SandboxConfigBuilder};
@@ -534,6 +538,134 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
         "a file in the granted directory is readable inside; its DACL is {listing}: {}",
         stderr(&output)
     );
+}
+
+#[tokio::test]
+async fn acl_concurrency_child() {
+    // This child role is a no-op in the regular suite; the parent supplies the
+    // shared tree and release file so separate processes grant it together.
+    let Some(shared_dir) = std::env::var_os("HEEL_ACL_CONCURRENCY_DIR") else {
+        return;
+    };
+    let go_file =
+        std::env::var_os("HEEL_ACL_CONCURRENCY_GO").expect("the parent supplies the release file");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !Path::new(&go_file).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the parent did not release the ACL grant workers"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let shared_dir = PathBuf::from(shared_dir);
+    let sandbox = sandbox_granting(&shared_dir, Access::READ)
+        .await
+        .expect("the shared directory grant succeeds");
+    let known_file = shared_dir.join("known.txt");
+    let output = read_inside(&sandbox, &known_file, "heel-acl-concurrency").await;
+    assert!(
+        output.status.success() && stdout(&output).contains("heel-acl-concurrency"),
+        "the shared file is readable: status={:?} stderr={}",
+        output.status.code(),
+        stderr(&output)
+    );
+}
+
+#[tokio::test]
+async fn concurrent_acl_grants_preserve_each_container_entry() {
+    // Reproduce #69's lost update with independent processes changing the
+    // same directory; 1,200 files widen the propagation window.
+    const CHILDREN: usize = 6;
+    const ROUNDS: usize = 3;
+    const SHARED_FILES: usize = 1_200;
+    const ROUND_TIMEOUT: Duration = Duration::from_secs(20);
+
+    let test_binary = std::env::current_exe().expect("the test binary path is available");
+    for round in 0..ROUNDS {
+        let shared = tempfile::tempdir().expect("the shared directory exists");
+        fs::write(shared.path().join("known.txt"), "heel-acl-concurrency\n")
+            .expect("the known file is staged");
+        for index in 0..SHARED_FILES {
+            fs::write(shared.path().join(format!("entry-{index}")), b"shared")
+                .expect("the propagation tree is staged");
+        }
+
+        let go_file = shared.path().join("go");
+        let mut children = Vec::with_capacity(CHILDREN);
+        for _ in 0..CHILDREN {
+            children.push(
+                Command::new(&test_binary)
+                    .args(["--exact", "acl_concurrency_child", "--nocapture"])
+                    .env("HEEL_ACL_CONCURRENCY_DIR", shared.path())
+                    .env("HEEL_ACL_CONCURRENCY_GO", &go_file)
+                    .env("RUST_LOG", "off")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("a grant worker starts"),
+            );
+        }
+        fs::File::create(&go_file)
+            .expect("the release file is created after every worker starts")
+            .write_all(b"go")
+            .expect("the release file is written");
+
+        let deadline = Instant::now() + ROUND_TIMEOUT;
+        let mut finished = vec![false; children.len()];
+        let mut timed_out = vec![false; children.len()];
+        loop {
+            let mut running = false;
+            for (index, child) in children.iter_mut().enumerate() {
+                if finished[index] {
+                    continue;
+                }
+                if child
+                    .try_wait()
+                    .expect("a grant worker can be polled")
+                    .is_some()
+                {
+                    finished[index] = true;
+                } else {
+                    running = true;
+                }
+            }
+            if !running {
+                break;
+            }
+            if Instant::now() >= deadline {
+                for (index, child) in children.iter_mut().enumerate() {
+                    if !finished[index] {
+                        timed_out[index] = true;
+                        child.kill().expect("a timed-out worker is stopped");
+                    }
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let mut failures = Vec::new();
+        for (index, child) in children.into_iter().enumerate() {
+            let output = child
+                .wait_with_output()
+                .expect("a grant worker's output is collected");
+            if timed_out[index] || !output.status.success() {
+                failures.push(format!(
+                    "worker {index} timed_out={} status={:?} stderr={} stdout={}",
+                    timed_out[index],
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "ACL grant round {round} failed:\n{}",
+            failures.join("\n")
+        );
+    }
 }
 
 #[tokio::test]
