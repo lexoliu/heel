@@ -31,10 +31,12 @@ use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_FLAGS, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, EqualSid, GENERIC_MAPPING, GetAce, GetSecurityDescriptorControl,
     INHERIT_ONLY_ACE, InitializeSecurityDescriptor, MapGenericMask, OBJECT_INHERIT_ACE,
-    PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW,
-    SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL,
+    SetFileSecurityW, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
 };
+#[cfg(test)]
+use windows::Win32::Storage::FileSystem::FILE_TRAVERSE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ALL_ACCESS, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_EXECUTE,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -676,7 +678,9 @@ fn write_dacl(name: &str, list: LocalBuffer, kind: SE_OBJECT_TYPE) -> io::Result
 /// child inherits from it, so nothing below is touched. The list keeps the
 /// protected and auto-inherited bits `descriptor` — the descriptor the
 /// object's list was read from — carries, so how it relates to its parent is
-/// unchanged.
+/// unchanged. `NtSetSecurityObject` keeps `SE_DACL_AUTO_INHERITED` only when
+/// `SE_DACL_AUTO_INHERIT_REQ` is requested; without that request, the object
+/// stops being auto-inherited.
 fn write_file_dacl(name: &str, descriptor: &LocalBuffer, list: LocalBuffer) -> io::Result<()> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let descriptor = PSECURITY_DESCRIPTOR(descriptor.0.cast());
@@ -691,19 +695,20 @@ fn write_file_dacl(name: &str, descriptor: &LocalBuffer, list: LocalBuffer) -> i
 
     let mut absolute = SECURITY_DESCRIPTOR::default();
     let written = PSECURITY_DESCRIPTOR((&raw mut absolute).cast());
-    let inheritance = SECURITY_DESCRIPTOR_CONTROL(SE_DACL_PROTECTED.0 | SE_DACL_AUTO_INHERITED.0);
+    let mut inheritance_mask = SE_DACL_PROTECTED.0 | SE_DACL_AUTO_INHERITED.0;
+    let mut inheritance_value = control & inheritance_mask;
+    if control & SE_DACL_AUTO_INHERITED.0 != 0 {
+        inheritance_mask |= SE_DACL_AUTO_INHERIT_REQ.0;
+        inheritance_value |= SE_DACL_AUTO_INHERIT_REQ.0 | SE_DACL_AUTO_INHERITED.0;
+    }
+    let inheritance = SECURITY_DESCRIPTOR_CONTROL(inheritance_mask);
+    let inheritance_value = SECURITY_DESCRIPTOR_CONTROL(inheritance_value);
     // SAFETY: `absolute` outlives every call below, and `list` — which it
     // points at once the list is set — outlives the write.
     let status = unsafe {
         InitializeSecurityDescriptor(written, SECURITY_DESCRIPTOR_REVISION)
             .and_then(|()| SetSecurityDescriptorDacl(written, true, Some(list.0.cast()), false))
-            .and_then(|()| {
-                SetSecurityDescriptorControl(
-                    written,
-                    inheritance,
-                    SECURITY_DESCRIPTOR_CONTROL(control & inheritance.0),
-                )
-            })
+            .and_then(|()| SetSecurityDescriptorControl(written, inheritance, inheritance_value))
             .and_then(|()| {
                 SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, written).ok()
             })
@@ -784,4 +789,86 @@ pub(crate) fn set_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     }
     .ok()
     .map_err(|source| io::Error::other(format!("cannot set the DACL for {name}: {source}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dacl(path: &Path) -> String {
+        let name = resolve(path).expect("the path resolves");
+        dacl_sddl(&name).expect("the DACL reads back")
+    }
+
+    fn id_aces(sddl: &str) -> Vec<String> {
+        sddl.split('(')
+            .skip(1)
+            .filter_map(|entry| {
+                let entry = entry.split_once(')')?.0;
+                let flags = entry.split(';').nth(1)?;
+                flags.contains("ID").then(|| format!("({entry})"))
+            })
+            .collect()
+    }
+
+    // A this-object ACL write preserves the parent's auto-inherited DACL.
+    #[test]
+    fn this_object_writes_preserve_auto_inheritance() {
+        let outer = tempfile::tempdir().expect("an outer temp directory");
+        let marker = "S-1-15-3-1024-2";
+        grant(
+            outer.path(),
+            marker,
+            &[
+                Entry {
+                    access: FILE_TRAVERSE.0,
+                    applies_to: Scope::Directories,
+                },
+                Entry {
+                    access: FILE_TRAVERSE.0,
+                    applies_to: Scope::Files,
+                },
+            ],
+        )
+        .expect("the outer directory gets inheritable entries");
+        let target = outer.path().join("target");
+        std::fs::create_dir(&target).expect("the target is created beneath the outer directory");
+
+        let initial = dacl(&target);
+        assert!(
+            initial.starts_with("D:AI"),
+            "the constructed parent did not produce an auto-inherited child: {initial}"
+        );
+        let inherited = id_aces(&initial);
+        assert!(
+            !inherited.is_empty(),
+            "the DACL has inherited ACEs: {initial}"
+        );
+
+        let sid = "S-1-15-3-1024-1";
+        let name =
+            grant_this_only(&target, sid, FILE_TRAVERSE.0).expect("the traverse grant is written");
+        let granted = dacl(&target);
+        assert!(
+            granted.starts_with("D:AI"),
+            "the grant preserves auto-inheritance: {granted}"
+        );
+        assert_eq!(
+            id_aces(&granted),
+            inherited,
+            "the grant preserves inherited ACEs: {granted}"
+        );
+
+        revoke_this_only(&name, sid).expect("the traverse grant is revoked");
+        let revoked = dacl(&target);
+        assert!(
+            revoked.starts_with("D:AI"),
+            "the revoke preserves auto-inheritance: {revoked}"
+        );
+        assert_eq!(
+            id_aces(&revoked),
+            inherited,
+            "the revoke preserves inherited ACEs: {revoked}"
+        );
+    }
 }
