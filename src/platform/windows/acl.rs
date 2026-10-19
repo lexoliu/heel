@@ -23,23 +23,26 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW,
-    GetSecurityInfo, REVOKE_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
-    SE_OBJECT_TYPE, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo, REVOKE_ACCESS,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetEntriesInAclW,
+    SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
-    INHERIT_ONLY_ACE, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl,
+    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_FLAGS, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE,
+    DACL_SECURITY_INFORMATION, EqualSid, GENERIC_MAPPING, GetAce, GetSecurityDescriptorControl,
+    INHERIT_ONLY_ACE, InitializeSecurityDescriptor, MapGenericMask, OBJECT_INHERIT_ACE,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW,
+    SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, WRITE_DAC,
+    CreateFileW, FILE_ALL_ACCESS, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    WRITE_DAC,
 };
-use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+use windows::Win32::System::SystemServices::{
+    ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
+};
 use windows::Win32::System::Threading::{
     CreateMutexExW, INFINITE, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE,
     WaitForSingleObject,
@@ -416,41 +419,91 @@ pub(crate) fn revoke_this_only(name: &str, sddl: &str) -> io::Result<()> {
     write_file_dacl(name, &descriptor, updated)
 }
 
-/// The rights `trustees` effectively hold on `path`, unioned.
+/// The rights named `trustees` receive from the object's own DACL on `path`.
 ///
-/// Each trustee is a SID in `S-…` form. `GetEffectiveRightsFromAclW` answers
-/// "what does this object's DACL grant this SID" for one trustee, and the
-/// object's own list is the whole question: entries an ancestor granted by
-/// inheritance are already written into it. The union over the SIDs an
-/// AppContainer token carries is therefore the filesystem access check the
-/// kernel will make for it — `AccessCheck` itself wants a real token, and
-/// one exists only while a process in the container runs.
+/// Each trustee is a SID in `S-…` form. `GetEffectiveRightsFromAclW` expands
+/// group membership, so it counted Everyone and Users ACEs that the kernel's
+/// AppContainer access check ignores. The token carries its package SID,
+/// capability SIDs, and ALL APPLICATION PACKAGES instead. Inherited ACEs that
+/// apply to this object are already in its DACL; inherit-only ACEs are skipped
+/// because they do not apply to the object itself.
 pub(crate) fn effective_rights(path: &Path, trustees: &[&str]) -> io::Result<u32> {
     let name = resolve(path)?;
     let (_descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
 
-    let mut rights = 0u32;
-    for sddl in trustees {
-        let (_sid_buffer, sid) = parse_sid(sddl)?;
-        let trustee = TRUSTEE_W {
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: PWSTR(sid.0.cast()),
-            ..Default::default()
-        };
-        let mut held = 0u32;
-        // SAFETY: `current` is the list just read, alive while its guard
-        // lives, `trustee` names a valid SID, and `held` is a valid
-        // out-parameter.
-        let status = unsafe { GetEffectiveRightsFromAclW(current, &trustee, &mut held) };
-        if status.is_err() {
-            return Err(io::Error::other(format!(
-                "cannot evaluate the access rights of {name}: {status:?}"
-            )));
-        }
-        rights |= held;
+    // SetSecurityDescriptorDacl documents that a NULL DACL allows all access;
+    // an absent list therefore cannot be treated like an empty, deny-all DACL.
+    if current.is_null() {
+        return Ok(u32::MAX);
     }
-    Ok(rights)
+
+    let trustee_sids = trustees
+        .iter()
+        .map(|trustee| parse_sid(trustee))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ.0,
+        GenericWrite: FILE_GENERIC_WRITE.0,
+        GenericExecute: FILE_GENERIC_EXECUTE.0,
+        GenericAll: FILE_ALL_ACCESS.0,
+    };
+    // SAFETY: `current` is non-null and points into the descriptor returned
+    // by `read_dacl`, which remains alive for this function.
+    let ace_count = unsafe { (*current).AceCount };
+    let mut granted = 0u32;
+    let mut denied = 0u32;
+
+    for index in 0..u32::from(ace_count) {
+        let mut raw_ace = std::ptr::null_mut();
+        // SAFETY: `current` points into the descriptor kept alive by
+        // `_descriptor`, and `raw_ace` is a valid out-parameter.
+        unsafe { GetAce(current, index, &mut raw_ace) }.map_err(|source| {
+            io::Error::other(format!("cannot read ACE {index} from {name}: {source}"))
+        })?;
+
+        // SAFETY: `GetAce` returned a pointer to an ACE in the live DACL.
+        let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
+        if ACE_FLAGS(u32::from(header.AceFlags)).contains(INHERIT_ONLY_ACE) {
+            continue;
+        }
+
+        let (mut mask, ace_sid, allowed) = if header.AceType == ACCESS_ALLOWED_ACE_TYPE as u8 {
+            // SAFETY: this ACE type has the ACCESS_ALLOWED_ACE layout.
+            let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+            (
+                ace.Mask,
+                PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast()),
+                true,
+            )
+        } else if header.AceType == ACCESS_DENIED_ACE_TYPE as u8 {
+            // SAFETY: this ACE type has the ACCESS_DENIED_ACE layout.
+            let ace = unsafe { &*raw_ace.cast::<ACCESS_DENIED_ACE>() };
+            (
+                ace.Mask,
+                PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast()),
+                false,
+            )
+        } else {
+            continue;
+        };
+        if !trustee_sids.iter().any(|(_, trustee_sid)| {
+            // SAFETY: both SIDs are valid and remain alive for this comparison.
+            unsafe { EqualSid(ace_sid, *trustee_sid) }.is_ok()
+        }) {
+            continue;
+        }
+
+        // SAFETY: `mapping` is the file mapping and `mask` is a valid in/out
+        // access mask for MapGenericMask.
+        unsafe { MapGenericMask(&mut mask, &mapping) };
+        if allowed {
+            granted |= mask & !denied;
+        } else {
+            denied |= mask & !granted;
+        }
+    }
+
+    Ok(granted)
 }
 
 /// The `\\?\` verbatim spelling of `path`.
@@ -693,4 +746,42 @@ pub(crate) fn dacl_sddl(name: &str) -> io::Result<String> {
     // `LocalFree` as its deallocator, and it is freed exactly once.
     unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
     Ok(rendered)
+}
+
+/// Set `path`'s protected DACL from `sddl`.
+///
+/// The tests need the object's own trustee list to decide whether access is
+/// already present; protecting the list prevents inherited entries from
+/// making that result depend on the temporary directory's parent.
+#[cfg(test)]
+pub(crate) fn set_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
+    let name = resolve(path)?;
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    // SAFETY: `wide_sddl` is NUL-terminated and `descriptor` is a valid
+    // out-parameter for the LocalAlloc-backed descriptor.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(wide_sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|source| io::Error::other(format!("cannot parse the DACL for {name}: {source}")))?;
+    let _descriptor = LocalBuffer(descriptor.0.cast());
+
+    // SAFETY: `wide_name` is NUL-terminated and the descriptor remains alive
+    // until the file security call returns.
+    unsafe {
+        SetFileSecurityW(
+            PCWSTR(wide_name.as_ptr()),
+            DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    }
+    .ok()
+    .map_err(|source| io::Error::other(format!("cannot set the DACL for {name}: {source}")))
 }
