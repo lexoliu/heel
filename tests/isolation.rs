@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::process::Output;
 
-use heel::{Sandbox, SandboxConfig, SandboxConfigBuilder};
+use heel::{Access, Grant, Identity, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 /// Run `script` with `/bin/sh` inside `sandbox`.
 async fn sh(sandbox: &Sandbox<impl heel::NetworkPolicy>, script: &str) -> Output {
@@ -61,6 +61,31 @@ async fn an_explicitly_readable_path_is_readable() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "token-value");
+}
+
+#[tokio::test]
+async fn a_persistent_identity_grant_is_readable_without_an_ordinary_grant() {
+    let (directory, secret) = secret_file();
+    let identity = Identity::named("persistent-read-test")
+        .expect("the identity name is valid")
+        .persistent_grant(Grant::new(
+            secret.parent().expect("the file has a parent"),
+            Access::READ,
+        ));
+    let config = SandboxConfigBuilder::default()
+        .identity(identity.clone())
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    let output = sh(&sandbox, &format!("cat {}", secret.display())).await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "token-value");
+    drop(sandbox);
+    identity.remove().expect("the test identity is removed");
+    drop(directory);
 }
 
 #[tokio::test]

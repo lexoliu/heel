@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::grant::{Access, Grant};
+use crate::identity::Identity;
 use crate::ipc::IpcRouter;
 use crate::network::{DenyAll, NetworkPolicy};
 use crate::priority::ProcessPriority;
@@ -280,6 +281,7 @@ impl PythonConfigBuilder {
 pub struct SandboxConfigData {
     security: SecurityConfig,
     grants: Vec<Grant>,
+    identity: Option<Identity>,
     network_deny_all: bool,
     python: Option<PythonConfig>,
     working_dir: PathBuf,
@@ -315,6 +317,13 @@ impl SandboxConfigData {
     /// executable, which no configuration can change.
     pub fn grants(&self) -> &[Grant] {
         &self.grants
+    }
+
+    /// The identity shared by sandboxes that use its persistent profile.
+    ///
+    /// Without one, each sandbox uses an ephemeral profile of its own.
+    pub fn identity(&self) -> Option<&Identity> {
+        self.identity.as_ref()
     }
 
     /// Whether the network policy rejects everything, letting the backend deny
@@ -412,6 +421,18 @@ impl SandboxConfigData {
             None => self.grants.push(Grant::new(path, access)),
         }
     }
+
+    #[cfg(not(windows))]
+    pub(crate) fn adopt_persistent_grants(&mut self) {
+        let grants = self
+            .identity
+            .as_ref()
+            .map(|identity| identity.persistent_grants().to_vec())
+            .unwrap_or_default();
+        for grant in grants {
+            self.push_grant(grant.path().to_path_buf(), grant.access());
+        }
+    }
 }
 
 /// A sandbox configuration: a network policy plus everything else.
@@ -482,6 +503,7 @@ impl Default for SandboxConfigBuilder<DenyAll> {
             data: SandboxConfigData {
                 security: SecurityConfig::default(),
                 grants: Vec::new(),
+                identity: None,
                 network_deny_all: DenyAll::DENIES_ALL,
                 python: None,
                 // Resolved on build(); replaced by the canonical path when the
@@ -522,6 +544,17 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Set the fine-grained protection toggles.
     pub fn security(mut self, security: SecurityConfig) -> Self {
         self.data.security = security;
+        self
+    }
+
+    /// Run sandboxes under this identity; without one, each sandbox gets an
+    /// ephemeral profile.
+    ///
+    /// Persistent grants use the identity's package SID on Windows. On macOS
+    /// and Linux, they are added to each sandbox's ordinary policy and are not
+    /// retained between sandboxes.
+    pub fn identity(mut self, identity: Identity) -> Self {
+        self.data.identity = Some(identity);
         self
     }
 

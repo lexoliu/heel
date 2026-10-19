@@ -6,14 +6,13 @@
 //! `Command` does not expose.
 //!
 //! Three of those attributes matter to a sandbox. The security capabilities
-//! name the package SID — and, when the process may reach the proxy, the
-//! `internetClient` capability — and Windows 11 on ARM64 rejects a non-null
-//! pointer to an empty capability array, so the struct is built from an
-//! `Option` whose `None` writes null by construction. The job list assigns
-//! the child to the job at creation, so no child or grandchild ever runs
-//! outside the sandbox's limits or at normal priority. And the handle list
-//! inherits exactly the std handles the launch asked for — nothing else the
-//! parent happens to hold open leaks into the container.
+//! name the package SID and the capabilities for the sandbox and its network
+//! policy. Windows 11 on ARM64 rejects a non-null pointer to an empty
+//! capability array, so an empty slice writes null by construction. The job
+//! list assigns the child to the job at creation, so no child or grandchild
+//! ever runs outside the sandbox's limits or at normal priority. The handle
+//! list inherits exactly the std handles the launch asked for — nothing else
+//! the parent happens to hold open leaks into the container.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -75,8 +74,8 @@ pub(super) enum Stdio {
 pub(super) struct Launch<'a> {
     /// The container's package SID.
     pub(super) package: &'a Sid,
-    /// `internetClient`, when the process may reach the proxy.
-    pub(super) capability: Option<&'a Sid>,
+    /// The capabilities granted to this process.
+    pub(super) capabilities: &'a [Sid],
     /// Program to run.
     pub(super) exe: PathBuf,
     /// The command line the process sees.
@@ -111,34 +110,36 @@ pub(crate) struct Launched {
     pub(crate) stderr: Option<File>,
 }
 
-/// The `SECURITY_CAPABILITIES` value for one launch, and the capability entry
-/// it points at.
+/// The `SECURITY_CAPABILITIES` value for one launch and its owned entries.
 ///
 /// The entry lives on the heap so the pointer survives wherever the value
-/// goes between `UpdateProcThreadAttribute` and `CreateProcessW`. `None`
-/// writes a null `Capabilities` and a zero count by construction — Windows 11
-/// ARM64 rejects a non-null pointer to an empty array with
+/// goes between `UpdateProcThreadAttribute` and `CreateProcessW`. An empty
+/// slice writes a null `Capabilities` and a zero count by construction —
+/// Windows 11 ARM64 rejects a non-null pointer to an empty array with
 /// `ERROR_INVALID_PARAMETER`.
 #[derive(Debug)]
 pub(super) struct SecurityCapabilities {
-    /// The capability entry the struct points into, when there is one. The
-    /// box keeps its address stable through moves; production code only holds
-    /// it for ownership, while the tests assert its contents.
-    pub(super) _entry: Box<Option<SID_AND_ATTRIBUTES>>,
+    /// The entries the struct points into.
+    pub(super) _entries: Box<[SID_AND_ATTRIBUTES]>,
     /// The struct as the attribute list passes it.
     pub(super) value: SECURITY_CAPABILITIES,
 }
 
 impl SecurityCapabilities {
-    /// Build the capabilities for `package`, carrying `capability` when given.
-    pub(super) fn new(package: &Sid, capability: Option<&Sid>) -> Self {
-        let mut entry = Box::new(capability.map(|sid| SID_AND_ATTRIBUTES {
-            Sid: sid.as_psid(),
-            Attributes: SE_GROUP_ENABLED as u32,
-        }));
-        let (array, count) = match entry.as_mut() {
-            Some(entry) => (std::ptr::from_mut(entry), 1),
-            None => (std::ptr::null_mut(), 0),
+    /// Build the capabilities for `package`.
+    pub(super) fn new(package: &Sid, capabilities: &[Sid]) -> Self {
+        let mut entries = capabilities
+            .iter()
+            .map(|sid| SID_AND_ATTRIBUTES {
+                Sid: sid.as_psid(),
+                Attributes: SE_GROUP_ENABLED as u32,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let (array, count) = if entries.is_empty() {
+            (std::ptr::null_mut(), 0)
+        } else {
+            (entries.as_mut_ptr(), entries.len() as u32)
         };
         let value = SECURITY_CAPABILITIES {
             AppContainerSid: package.as_psid(),
@@ -147,7 +148,7 @@ impl SecurityCapabilities {
             Reserved: 0,
         };
         Self {
-            _entry: entry,
+            _entries: entries,
             value,
         }
     }
@@ -252,7 +253,7 @@ pub(super) fn launch(launch: &Launch<'_>) -> Result<Launched> {
         }
     }
 
-    let capabilities = SecurityCapabilities::new(launch.package, launch.capability);
+    let capabilities = SecurityCapabilities::new(launch.package, launch.capabilities);
     let job_handle = HANDLE(job.as_raw_handle());
 
     let mut attributes = AttributeList::new(2 + u32::from(!inherited.is_empty()))?;

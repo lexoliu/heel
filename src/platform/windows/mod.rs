@@ -15,6 +15,7 @@ mod acl;
 mod capability;
 mod child;
 mod container;
+pub(crate) mod identity;
 mod launch;
 #[cfg(test)]
 mod launch_tests;
@@ -81,6 +82,15 @@ impl Win32Failure {
     fn io(call: &'static str) -> impl FnOnce(io::Error) -> Self {
         move |source| Self::Io { call, source }
     }
+
+    /// Build a failure for the Rust-side call `call`, naming `path` in its
+    /// source error.
+    fn io_at<'a>(call: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> Self + 'a {
+        move |source| Self::Io {
+            call,
+            source: io::Error::other(format!("{}: {source}", path.display())),
+        }
+    }
 }
 
 /// Variables a launched process inherits when the request does not replace
@@ -133,8 +143,8 @@ pub struct WindowsBackend {
 }
 
 impl WindowsBackend {
-    /// Create the AppContainer this sandbox's processes will run in, and open
-    /// the configured paths to it.
+    /// Open or create the AppContainer this sandbox's processes will run in,
+    /// and open the configured paths to it.
     ///
     /// The paths are granted here rather than at the first launch because
     /// Windows grants by inheritance: setting the entries propagates them to
@@ -143,10 +153,13 @@ impl WindowsBackend {
     ///
     /// # Errors
     ///
-    /// Returns an error if the AppContainer profile cannot be created, or if a
-    /// configured path cannot be opened to it.
+    /// Returns an error if the AppContainer profile cannot be opened or
+    /// created, or if a configured path cannot be opened to it.
     pub fn new(config: &SandboxConfigData) -> Result<Self> {
-        let container = Container::create()?;
+        let container = match config.identity() {
+            Some(identity) => Container::named(identity)?.0,
+            None => Container::create()?,
+        };
         container.grant_configured_paths(config)?;
         Ok(Self { container })
     }
@@ -162,8 +175,8 @@ impl WindowsBackend {
 
     /// Prepare everything one launch needs.
     ///
-    /// Returns the program, the capability and the loopback exemption, the
-    /// last of which must outlive the process it is granted for.
+    /// Returns the program, capabilities and loopback exemption, the last of
+    /// which must outlive the process it is granted for.
     fn prepare(&self, request: &SpawnRequest<'_>) -> Result<Prepared> {
         // The container has to read the program to run it. Anything under the
         // system directories is already open to every package; a program
@@ -191,20 +204,19 @@ impl WindowsBackend {
                     )),
                 )
             })?;
-        let capability = self.container.capabilities(request.proxy_port.is_some())?;
-        self.container
-            .grant_program(&program, capability.as_ref())?;
+        let capabilities = self.container.capabilities(request.proxy_port.is_some())?;
+        self.container.grant_program(&program, &capabilities)?;
 
         // A proxy port means a filtering policy, which only works if the
         // container may reach the proxy on loopback.
         let loopback = match request.proxy_port {
-            Some(_) => Some(self.container.exempt_loopback()?),
+            Some(_) => self.container.exempt_loopback()?,
             None => None,
         };
 
         Ok(Prepared {
             program,
-            capability,
+            capabilities,
             loopback,
         })
     }
@@ -219,7 +231,7 @@ impl WindowsBackend {
         // crate asks for the same thing on all three anyway.
         let options = launch::Launch {
             package: self.container.sid(),
-            capability: prepared.capability.as_ref(),
+            capabilities: &prepared.capabilities,
             exe: prepared.program,
             cmdline: command_line(&request),
             cwd: request.working_dir().to_path_buf(),
@@ -385,8 +397,8 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
 struct Prepared {
     /// The resolved path to the program to run.
     program: std::path::PathBuf,
-    /// `internetClient`, when the process may reach the proxy.
-    capability: Option<Sid>,
+    /// Capabilities the process receives.
+    capabilities: Vec<Sid>,
     /// The loopback exemption, held for the life of the process.
     loopback: Option<LoopbackExemption>,
 }

@@ -53,6 +53,11 @@ impl Sid {
         Ok(Self { words, sddl })
     }
 
+    /// Copy the identifier `psid` names without taking ownership of it.
+    pub(crate) fn copy_from_psid(psid: PSID) -> Result<Self, Win32Failure> {
+        Self::from_words(copy_words(psid)?)
+    }
+
     /// The identifier in the pointer form the security APIs take.
     ///
     /// The pointer borrows `self`, so it stays valid exactly as long as the
