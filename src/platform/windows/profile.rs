@@ -1,33 +1,36 @@
-//! One AppContainer profile, created for a sandbox and removed with it.
+//! AppContainer profiles for ephemeral sandboxes and stable identities.
 //!
-//! A profile is what turns a process token into an AppContainer token; the
-//! package SID it derives from the profile name is what ACL grants, the
-//! firewall's loopback exemption and a launch's security capabilities are all
-//! keyed on. The SID is copied out of the creation call's allocation, so the
-//! profile is a `Send`/`Sync` value like everything else the sandbox owns.
+//! A profile is what turns a process token into an AppContainer token. Its
+//! package SID keys persistent grants and the firewall's loopback exemption;
+//! named sandboxes use a separate capability SID for ordinary grants.
+//! Ephemeral profiles are removed with their sandbox; named profiles remain
+//! registered until their identity is removed. The SID is copied out of the
+//! creation call's allocation, so the profile is a `Send`/`Sync` value.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
+use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
 use windows::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeleteAppContainerProfile, GetAppContainerFolderPath,
+    CreateAppContainerProfile, DeleteAppContainerProfile,
+    DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{HRESULT, PCWSTR, PWSTR};
 
 use super::sid::Sid;
 use super::{Win32Failure, wide};
 
 /// The AppContainer profile a sandbox's processes run in.
 ///
-/// One profile per sandbox, named after a random suffix so that concurrent
-/// sandboxes never share a SID and therefore never share ACL grants.
+/// Ephemeral sandboxes receive a random profile; an explicit identity reuses
+/// its named profile and its persistent package SID.
 #[derive(Debug)]
 pub(crate) struct Profile {
     /// Owns the system registration and deletes it when this profile is dropped.
-    _registration: Registration,
-    /// The package SID that ACL grants and capabilities are keyed on.
+    _registration: Option<Registration>,
+    /// The package SID used by the token and persistent grants.
     sid: Sid,
     /// The `GetAppContainerFolderPath` folder for this package SID. Windows
     /// appends `Packages\<profile>\AC` to the launch block's `LOCALAPPDATA`;
@@ -65,16 +68,73 @@ impl Profile {
         let registration = Registration {
             name: name.to_owned(),
         };
-        let sid = Sid::from_owned_psid(sid)?;
-        let sid_wide = wide(sid.as_string());
-        // SAFETY: `sid_wide` is NUL-terminated and the profile SID remains
-        // valid for the call that resolves its package folder.
-        let folder = unsafe { GetAppContainerFolderPath(PCWSTR(sid_wide.as_ptr())) }
-            .map_err(Win32Failure::call("GetAppContainerFolderPath"))?;
-        let folder = TaskWide(folder);
-        // SAFETY: `folder` is the NUL-terminated path returned by
-        // `GetAppContainerFolderPath` and remains alive through conversion.
-        let folder = PathBuf::from(OsString::from_wide(unsafe { folder.0.as_wide() }));
+        Self::from_owned_psid(name, sid, Some(registration))
+    }
+
+    /// Open the persistent profile named `name`, creating it when absent.
+    pub(crate) fn open_named(name: &str) -> Result<Self, Win32Failure> {
+        let name_wide = wide(name);
+        let display = wide("heel sandbox");
+        let description = wide("heel sandbox");
+        // SAFETY: every string is NUL-terminated and outlives the call.
+        let sid = unsafe {
+            CreateAppContainerProfile(
+                PCWSTR(name_wide.as_ptr()),
+                PCWSTR(display.as_ptr()),
+                PCWSTR(description.as_ptr()),
+                None,
+            )
+        };
+        let sid = match sid {
+            Ok(sid) => sid,
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => {
+                return Self::from_sid(name, Self::derive_sid(name)?, None);
+            }
+            Err(source) => {
+                return Err(Win32Failure::Win32 {
+                    call: "CreateAppContainerProfile",
+                    source,
+                });
+            }
+        };
+        Self::from_owned_psid(name, sid, None)
+    }
+
+    /// Delete the persistent profile named `name`.
+    pub(crate) fn delete_named(name: &str) -> Result<(), Win32Failure> {
+        let name_wide = wide(name);
+        // SAFETY: `name_wide` is NUL-terminated and outlives the call.
+        unsafe { DeleteAppContainerProfile(PCWSTR(name_wide.as_ptr())) }
+            .map_err(Win32Failure::call("DeleteAppContainerProfile"))
+    }
+
+    /// Derive the package SID for a profile name whether or not it exists.
+    pub(crate) fn derive_sid(name: &str) -> Result<Sid, Win32Failure> {
+        let name = wide(name);
+        // SAFETY: `name` is NUL-terminated and outlives the call; the returned
+        // PSID uses the `FreeSid` allocation contract.
+        let sid = unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) }
+            .map_err(Win32Failure::call(
+                "DeriveAppContainerSidFromAppContainerName",
+            ))?;
+        Sid::from_owned_psid(sid)
+    }
+
+    fn from_owned_psid(
+        name: &str,
+        psid: windows::Win32::Security::PSID,
+        registration: Option<Registration>,
+    ) -> Result<Self, Win32Failure> {
+        let sid = Sid::from_owned_psid(psid)?;
+        Self::from_sid(name, sid, registration)
+    }
+
+    fn from_sid(
+        name: &str,
+        sid: Sid,
+        registration: Option<Registration>,
+    ) -> Result<Self, Win32Failure> {
+        let folder = Self::folder_for_sid(&sid)?;
         let local_app_data = local_app_data(&folder, name)?;
         let temp = folder.join("Temp");
         std::fs::create_dir(&temp)
@@ -100,7 +160,21 @@ impl Profile {
         })
     }
 
-    /// The package SID that ACL grants and capabilities are keyed on.
+    /// Resolve the folder Windows associates with `sid`.
+    pub(crate) fn folder_for_sid(sid: &Sid) -> Result<PathBuf, Win32Failure> {
+        let sid_wide = wide(sid.as_string());
+        // SAFETY: `sid_wide` is NUL-terminated and the SID remains alive
+        // through the call.
+        let folder = unsafe { GetAppContainerFolderPath(PCWSTR(sid_wide.as_ptr())) }
+            .map_err(Win32Failure::call("GetAppContainerFolderPath"))?;
+        let folder = TaskWide(folder);
+        // SAFETY: `folder` is the NUL-terminated path returned by the API.
+        Ok(PathBuf::from(OsString::from_wide(unsafe {
+            folder.0.as_wide()
+        })))
+    }
+
+    /// The package SID used by the token and persistent grants.
     pub(crate) fn sid(&self) -> &Sid {
         &self.sid
     }
@@ -124,6 +198,12 @@ struct Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        self.delete();
+    }
+}
+
+impl Registration {
+    fn delete(&self) {
         let name = wide(&self.name);
         // SAFETY: `name` is NUL-terminated and outlives the call.
         if let Err(error) = unsafe { DeleteAppContainerProfile(PCWSTR(name.as_ptr())) } {

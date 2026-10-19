@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use heel::ipc::{IpcCommand, IpcError, IpcRouter, NoArgs};
-use heel::{Access, Sandbox, SandboxConfig, SandboxConfigBuilder};
+use heel::{Access, Grant, Identity, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 #[path = "fixtures/mod.rs"]
 mod fixtures;
@@ -68,6 +68,40 @@ async fn default_sandbox() -> Sandbox {
         .expect("sandbox starts")
 }
 
+struct IdentityCleanup {
+    identity: Identity,
+    active: bool,
+}
+
+impl IdentityCleanup {
+    fn new(identity: Identity) -> Self {
+        Self {
+            identity,
+            active: true,
+        }
+    }
+
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    fn remove(&mut self) {
+        let result = self.identity.remove();
+        self.active = false;
+        result.expect("the test identity is removed");
+    }
+}
+
+impl Drop for IdentityCleanup {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.identity.remove()
+        {
+            tracing::warn!(%error, "failed to remove test identity");
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_temp_directory_is_private_to_the_container() {
     // The backend sets TEMP beneath each AppContainer's profile folder, which
@@ -87,6 +121,81 @@ async fn the_temp_directory_is_private_to_the_container() {
     )
     .await;
     assert_eq!(stdout(&written), "written", "{}", stderr(&written));
+}
+
+#[tokio::test]
+async fn named_sandbox_reads_ordinary_and_persistent_grants() {
+    let directory = tempfile::tempdir().expect("the test directory exists");
+    let ordinary = directory.path().join("ordinary");
+    let persistent = directory.path().join("persistent");
+    fs::create_dir(&ordinary).expect("the ordinary directory exists");
+    fs::create_dir(&persistent).expect("the persistent directory exists");
+    let ordinary_file = ordinary.join("ordinary.txt");
+    let persistent_file = persistent.join("persistent.txt");
+    fs::write(&ordinary_file, "ordinary").expect("the ordinary file is written");
+    fs::write(&persistent_file, "persistent").expect("the persistent file is written");
+    let mut identity = IdentityCleanup::new(
+        Identity::named(format!("t-{:016x}", rand::random::<u64>()))
+            .expect("the identity name is valid")
+            .persistent_grant(Grant::new(&persistent, Access::READ)),
+    );
+    let config = SandboxConfigBuilder::default()
+        .identity(identity.identity().clone())
+        .grant(&ordinary, Access::READ)
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("the named sandbox starts");
+
+    let ordinary_output = read_inside(&sandbox, &ordinary_file, "ordinary").await;
+    assert!(
+        ordinary_output.status.success(),
+        "ordinary grant failed: {}",
+        stderr(&ordinary_output)
+    );
+    let persistent_output = read_inside(&sandbox, &persistent_file, "persistent").await;
+    assert!(
+        persistent_output.status.success(),
+        "persistent grant failed: {}",
+        stderr(&persistent_output)
+    );
+
+    drop(sandbox);
+    identity.remove();
+}
+
+#[tokio::test]
+async fn dropping_one_named_sandbox_preserves_the_other_ordinary_grant() {
+    let directory = tempfile::tempdir().expect("the test directory exists");
+    let file = directory.path().join("shared.txt");
+    fs::write(&file, "shared").expect("the shared file is written");
+    let mut identity = IdentityCleanup::new(
+        Identity::named(format!("t-{:016x}", rand::random::<u64>()))
+            .expect("the identity name is valid"),
+    );
+    let config = || {
+        SandboxConfigBuilder::default()
+            .identity(identity.identity().clone())
+            .grant(directory.path(), Access::READ)
+            .build()
+    };
+    let first = Sandbox::with_config_and_executor(config(), executor_core::tokio::TokioGlobal)
+        .await
+        .expect("the first named sandbox starts");
+    let second = Sandbox::with_config_and_executor(config(), executor_core::tokio::TokioGlobal)
+        .await
+        .expect("the second named sandbox starts");
+
+    drop(first);
+    let output = read_inside(&second, &file, "shared").await;
+    assert!(
+        output.status.success(),
+        "dropping the first sandbox removed the second grant: {}",
+        stderr(&output)
+    );
+
+    drop(second);
+    identity.remove();
 }
 
 #[tokio::test]

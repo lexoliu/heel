@@ -608,6 +608,29 @@ mod tests {
     }
 
     #[test]
+    fn persistent_identity_grants_are_adopted_into_landlock_rules() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut data, _working_dir) = prepared(
+            SandboxConfig::builder()
+                .identity(
+                    crate::identity::Identity::named("landlock-test")
+                        .expect("the identity name is valid")
+                        .persistent_grant(Grant::new(directory.path(), Access::READ)),
+                )
+                .build(),
+        );
+        data.adopt_persistent_grants();
+
+        assert_eq!(data.grants(), [Grant::new(directory.path(), Access::READ)]);
+        assert!(
+            configured_rules(&data, ABI::V4)
+                .iter()
+                .any(|rule| rule.path == directory.path()),
+            "the persistent grant is present in the Landlock rules"
+        );
+    }
+
+    #[test]
     fn venv_is_read_only_without_pip_installs() {
         let venv = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(venv.path().join("bin")).expect("creates");

@@ -60,7 +60,7 @@ fn cmd(fixture: &LaunchFixture, args: &[&str], stdio: Stdio) -> AppContainerChil
     let root = std::env::var_os("SystemRoot").expect("Windows SystemRoot");
     let options = Launch {
         package: fixture.container.sid(),
-        capability: None,
+        capabilities: &[],
         exe: PathBuf::from(&root).join("System32").join("cmd.exe"),
         cmdline: super::command_line(&request),
         cwd: fixture.directory.path().to_owned(),
@@ -110,7 +110,7 @@ fn zero_capability_launch_with_piped_stdio_reports_output() {
 #[test]
 fn no_capability_builds_a_null_array() {
     let package = super::capability::internet_client().expect("well-known SID");
-    let capabilities = SecurityCapabilities::new(&package, None);
+    let capabilities = SecurityCapabilities::new(&package, &[]);
     assert!(capabilities.value.Capabilities.is_null());
     assert_eq!(capabilities.value.CapabilityCount, 0);
 }
@@ -119,7 +119,7 @@ fn no_capability_builds_a_null_array() {
 fn internet_client_builds_one_enabled_entry() {
     let package = super::capability::internet_client().expect("well-known SID");
     let capability = super::capability::internet_client().expect("well-known SID");
-    let capabilities = SecurityCapabilities::new(&package, Some(&capability));
+    let capabilities = SecurityCapabilities::new(&package, std::slice::from_ref(&capability));
     assert!(!capabilities.value.Capabilities.is_null());
     assert_eq!(capabilities.value.CapabilityCount, 1);
     // SAFETY: `Capabilities` names the one entry `capabilities` owns, which
@@ -128,4 +128,23 @@ fn internet_client_builds_one_enabled_entry() {
     assert_eq!(entry.Attributes, SE_GROUP_ENABLED as u32);
     // SAFETY: both are valid SIDs for the duration of the call.
     assert!(unsafe { EqualSid(entry.Sid, capability.as_psid()) }.is_ok());
+}
+
+#[test]
+fn launch_keeps_two_capability_entries_in_order() {
+    let package = super::capability::internet_client().expect("well-known SID");
+    let first = super::capability::internet_client().expect("well-known SID");
+    let second =
+        super::capability::derived("heel-sandbox-launch-test").expect("named capability SID");
+    let expected = [first, second];
+    let capabilities = SecurityCapabilities::new(&package, &expected);
+
+    assert_eq!(capabilities.value.CapabilityCount, 2);
+    // SAFETY: `Capabilities` names the two entries `capabilities` owns.
+    let entries = unsafe { std::slice::from_raw_parts(capabilities.value.Capabilities, 2) };
+    for (entry, sid) in entries.iter().zip(&expected) {
+        assert_eq!(entry.Attributes, SE_GROUP_ENABLED as u32);
+        // SAFETY: both are valid SIDs for the duration of the call.
+        assert!(unsafe { EqualSid(entry.Sid, sid.as_psid()) }.is_ok());
+    }
 }

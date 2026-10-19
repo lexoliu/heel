@@ -30,10 +30,11 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_FLAGS, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, EqualSid, GENERIC_MAPPING, GetAce, GetSecurityDescriptorControl,
-    INHERIT_ONLY_ACE, InitializeSecurityDescriptor, MapGenericMask, OBJECT_INHERIT_ACE,
-    PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL,
-    SetFileSecurityW, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    INHERIT_ONLY_ACE, INHERITED_ACE, InitializeSecurityDescriptor, MapGenericMask,
+    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERIT_REQ,
+    SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl,
 };
 #[cfg(test)]
 use windows::Win32::Storage::FileSystem::FILE_TRAVERSE;
@@ -62,7 +63,7 @@ const ACL_UPDATE_MUTEX_NAME: &str = "Global\\heel-acl-update";
 const ACL_UPDATE_MUTEX_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100001;;;AU)";
 
 /// Owns an acquired mutex and releases it before closing the handle.
-struct Guard {
+pub(crate) struct Guard {
     handle: OwnedHandle,
 }
 
@@ -154,6 +155,11 @@ fn acquire() -> io::Result<Guard> {
     }
 
     Ok(Guard { handle })
+}
+
+/// Acquire the machine-wide lock used by ACL mutations.
+pub(crate) fn lock() -> io::Result<Guard> {
+    acquire()
 }
 
 /// What one entry grants, and to what it applies.
@@ -398,6 +404,16 @@ pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result
     Ok(name)
 }
 
+/// Add inheritable entries to `path` without propagating them to its children.
+#[cfg(test)]
+pub(crate) fn add_without_propagation(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()> {
+    let _guard = acquire()?;
+    let name = resolve(path)?;
+    let (descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
+    let updated = merge(sid, current, entries, &name)?;
+    write_file_dacl(&name, &descriptor, updated)
+}
+
 /// Remove every entry `sddl` holds on the object `name` refers to.
 ///
 /// The machine-wide mutex lets heel's concurrent grants finish before the
@@ -508,13 +524,59 @@ pub(crate) fn effective_rights(path: &Path, trustees: &[&str]) -> io::Result<u32
     Ok(granted)
 }
 
+/// Whether an explicit allow or deny ACE in `name`'s DACL names `sid`.
+pub(crate) fn names_trustee(name: &str, sid: &str) -> io::Result<bool> {
+    let (_descriptor, current) = read_dacl(name, SE_FILE_OBJECT)?;
+    if current.is_null() {
+        return Ok(false);
+    }
+    let (_sid_allocation, sid) = parse_sid(sid)?;
+
+    // SAFETY: `current` points into the descriptor returned by `read_dacl`,
+    // which remains alive for this function.
+    let ace_count = unsafe { (*current).AceCount };
+    for index in 0..u32::from(ace_count) {
+        let mut raw_ace = std::ptr::null_mut();
+        // SAFETY: `current` points into the descriptor kept alive by
+        // `_descriptor`, and `raw_ace` is a valid out-parameter.
+        unsafe { GetAce(current, index, &mut raw_ace) }.map_err(|source| {
+            io::Error::other(format!("cannot read ACE {index} from {name}: {source}"))
+        })?;
+
+        // SAFETY: `GetAce` returned a pointer to an ACE in the live DACL.
+        let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
+        if ACE_FLAGS(u32::from(header.AceFlags)).contains(INHERITED_ACE) {
+            continue;
+        }
+
+        let ace_sid = if header.AceType == ACCESS_ALLOWED_ACE_TYPE as u8 {
+            // SAFETY: this ACE type has the ACCESS_ALLOWED_ACE layout.
+            let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+            PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast())
+        } else if header.AceType == ACCESS_DENIED_ACE_TYPE as u8 {
+            // SAFETY: this ACE type has the ACCESS_DENIED_ACE layout.
+            let ace = unsafe { &*raw_ace.cast::<ACCESS_DENIED_ACE>() };
+            PSID(std::ptr::addr_of!(ace.SidStart).cast_mut().cast())
+        } else {
+            continue;
+        };
+
+        // SAFETY: both SIDs are valid and remain alive for this comparison.
+        if unsafe { EqualSid(ace_sid, sid) }.is_ok() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// The `\\?\` verbatim spelling of `path`.
 ///
 /// The named security APIs reject object names deeper than `MAX_PATH` unless
 /// they are spelled verbatim, and a granted tree can itself sit deeper than
 /// that. Resolving the path first hands them the `\\?\` form they accept at
 /// any depth, while the errors keep naming the path the caller asked for.
-fn resolve(path: &Path) -> io::Result<String> {
+pub(crate) fn resolve(path: &Path) -> io::Result<String> {
     let resolved = std::fs::canonicalize(path).map_err(|source| {
         io::Error::other(format!("cannot resolve {}: {source}", path.display()))
     })?;
@@ -753,6 +815,18 @@ pub(crate) fn dacl_sddl(name: &str) -> io::Result<String> {
     Ok(rendered)
 }
 
+#[cfg(test)]
+pub(crate) fn inherited_aces(sddl: &str) -> Vec<String> {
+    sddl.split('(')
+        .skip(1)
+        .filter_map(|entry| {
+            let entry = entry.split_once(')')?.0;
+            let flags = entry.split(';').nth(1)?;
+            flags.contains("ID").then(|| format!("({entry})"))
+        })
+        .collect()
+}
+
 /// Set `path`'s protected DACL from `sddl`.
 ///
 /// The tests need the object's own trustee list to decide whether access is
@@ -800,17 +874,6 @@ mod tests {
         dacl_sddl(&name).expect("the DACL reads back")
     }
 
-    fn id_aces(sddl: &str) -> Vec<String> {
-        sddl.split('(')
-            .skip(1)
-            .filter_map(|entry| {
-                let entry = entry.split_once(')')?.0;
-                let flags = entry.split(';').nth(1)?;
-                flags.contains("ID").then(|| format!("({entry})"))
-            })
-            .collect()
-    }
-
     // A this-object ACL write preserves the parent's auto-inherited DACL.
     #[test]
     fn this_object_writes_preserve_auto_inheritance() {
@@ -839,7 +902,7 @@ mod tests {
             initial.starts_with("D:AI"),
             "the constructed parent did not produce an auto-inherited child: {initial}"
         );
-        let inherited = id_aces(&initial);
+        let inherited = inherited_aces(&initial);
         assert!(
             !inherited.is_empty(),
             "the DACL has inherited ACEs: {initial}"
@@ -854,7 +917,7 @@ mod tests {
             "the grant preserves auto-inheritance: {granted}"
         );
         assert_eq!(
-            id_aces(&granted),
+            inherited_aces(&granted),
             inherited,
             "the grant preserves inherited ACEs: {granted}"
         );
@@ -866,7 +929,7 @@ mod tests {
             "the revoke preserves auto-inheritance: {revoked}"
         );
         assert_eq!(
-            id_aces(&revoked),
+            inherited_aces(&revoked),
             inherited,
             "the revoke preserves inherited ACEs: {revoked}"
         );

@@ -483,6 +483,32 @@ mod tests {
     }
 
     #[test]
+    fn persistent_identity_grants_are_adopted_into_the_profile() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .identity(
+                    crate::identity::Identity::named("macos-test")
+                        .expect("the identity name is valid")
+                        .persistent_grant(crate::grant::Grant::new(directory.path(), Access::READ)),
+                )
+                .build(),
+        );
+        data.adopt_persistent_grants();
+
+        let profile = generate_profile(&data, None).expect("the profile is generated");
+        let canonical = directory
+            .path()
+            .canonicalize()
+            .expect("the grant path canonicalizes");
+        let path = escape_path(&canonical).expect("the grant path escapes");
+        assert!(
+            profile.contains(&format!("(allow file-read* (subpath \"{path}\"))")),
+            "the persistent grant is present in the profile:\n{profile}"
+        );
+    }
+
+    #[test]
     fn strict_mode_denies_user_data() {
         let (data, _dir) =
             prepared_config(SandboxConfig::builder().filesystem_strict(true).build());

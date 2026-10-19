@@ -223,6 +223,9 @@ impl<N: NetworkPolicy> Sandbox<N> {
     ) -> Result<Self> {
         let (policy, mut config_data, router) = config.into_parts();
 
+        #[cfg(not(windows))]
+        config_data.adopt_persistent_grants();
+
         // Create and canonicalize the working directory before anything else
         // derives paths from it.
         let requested_dir = config_data.working_dir().to_path_buf();
