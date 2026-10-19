@@ -4,8 +4,8 @@
 //! execution is a right of its own, a container without `internetClient` has no
 //! network -- are asserted once in `guarantees.rs`, with this platform supplying
 //! only the way to ask. What is left here is what only an AppContainer does:
-//! Windows hands each container a temp directory inside its own package folder
-//! and redirects `TEMP` there, overriding whatever the sandbox sets.
+//! The backend gives each container its own AppContainer profile folder and
+//! sets `LOCALAPPDATA`, `TEMP`, `TMP` and `TMPDIR` to paths beneath it.
 
 #![cfg(target_os = "windows")]
 #![allow(clippy::unwrap_used)]
@@ -70,10 +70,8 @@ async fn default_sandbox() -> Sandbox {
 
 #[tokio::test]
 async fn the_temp_directory_is_private_to_the_container() {
-    // Windows gives each AppContainer its own temp directory inside its package
-    // folder and redirects `TEMP` there, overriding whatever the sandbox sets.
-    // That is stronger than pointing at the working directory, not weaker: no
-    // other container and no other user can read it.
+    // The backend sets TEMP beneath each AppContainer's profile folder, which
+    // is private to that container rather than shared with another sandbox.
     let sandbox = default_sandbox().await;
 
     let output = cmd(&sandbox, "echo %TEMP%").await;
@@ -88,6 +86,88 @@ async fn the_temp_directory_is_private_to_the_container() {
         "echo written> %TEMP%\\probe.txt && type %TEMP%\\probe.txt",
     )
     .await;
+    assert_eq!(stdout(&written), "written", "{}", stderr(&written));
+}
+
+#[tokio::test]
+async fn unrelated_local_app_data_does_not_redirect_container_temp() {
+    // A caller-supplied LOCALAPPDATA must not redirect the profile folders
+    // Windows derives for the child.
+    let unrelated = tempfile::tempdir().expect("the unrelated directory exists");
+    let unrelated_path = unrelated.path().to_string_lossy().to_string();
+    let sandbox = default_sandbox().await;
+    let environment = sandbox
+        .command("cmd.exe")
+        .arg("/C")
+        .arg("set LOCALAPPDATA & set TEMP & set TMP & set TMPDIR")
+        .env("LOCALAPPDATA", &unrelated_path)
+        .env("TEMP", &unrelated_path)
+        .env("TMP", &unrelated_path)
+        .env("TMPDIR", &unrelated_path)
+        .output()
+        .await
+        .expect("the environment probe runs");
+    let local_app_data = env_value(&environment, "LOCALAPPDATA");
+    let temp = env_value(&environment, "TEMP");
+    let tmp = env_value(&environment, "TMP");
+    let tmpdir = env_value(&environment, "TMPDIR");
+    let unrelated_lower = unrelated_path.to_ascii_lowercase();
+
+    assert!(
+        !local_app_data
+            .to_ascii_lowercase()
+            .starts_with(&unrelated_lower)
+            && !temp.to_ascii_lowercase().starts_with(&unrelated_lower)
+            && !tmp.to_ascii_lowercase().starts_with(&unrelated_lower)
+            && !tmpdir.to_ascii_lowercase().starts_with(&unrelated_lower),
+        "the child must not use the unrelated LOCALAPPDATA {unrelated_path:?}; observed LOCALAPPDATA={local_app_data:?}, TEMP={temp:?}, TMP={tmp:?}, TMPDIR={tmpdir:?}"
+    );
+    let profile_folder = Path::new(&local_app_data);
+    let profile_name = profile_folder
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy());
+    let packages_folder = profile_folder
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name);
+    assert!(
+        profile_folder
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("AC"))
+            && profile_name
+                .as_ref()
+                .is_some_and(|name| name.starts_with("heel-"))
+            && packages_folder
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("Packages")),
+        "LOCALAPPDATA must end in \\Packages\\heel-…\\AC, got {local_app_data:?}"
+    );
+    let expected_temp = format!("{}\\Temp", local_app_data.trim_end_matches(['\\', '/']));
+    assert!(
+        temp.eq_ignore_ascii_case(&expected_temp),
+        "TEMP must be LOCALAPPDATA\\Temp: LOCALAPPDATA={local_app_data:?}, TEMP={temp:?}"
+    );
+    assert!(
+        tmp.eq_ignore_ascii_case(&expected_temp),
+        "TMP must be LOCALAPPDATA\\Temp: LOCALAPPDATA={local_app_data:?}, TMP={tmp:?}"
+    );
+    assert!(
+        temp.eq_ignore_ascii_case(&tmp),
+        "TEMP and TMP must agree: TEMP={temp:?}, TMP={tmp:?}"
+    );
+    assert!(
+        tmpdir.eq_ignore_ascii_case(&temp),
+        "TMPDIR must equal TEMP: TEMP={temp:?}, TMPDIR={tmpdir:?}"
+    );
+
+    let written = sandbox
+        .command("cmd.exe")
+        .arg("/C")
+        .arg("echo written> %TEMP%\\probe.txt && type %TEMP%\\probe.txt")
+        .env("LOCALAPPDATA", &unrelated_path)
+        .output()
+        .await
+        .expect("the TEMP round trip runs");
     assert_eq!(stdout(&written), "written", "{}", stderr(&written));
 }
 

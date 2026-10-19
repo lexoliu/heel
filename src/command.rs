@@ -266,14 +266,9 @@ impl<'a> Command<'a> {
 
 /// The variables that name the directory for temporary files.
 ///
-/// Unix programs read `TMPDIR`; the Windows runtimes read `TEMP` and `TMP`, and
-/// a sandboxed process that consulted the host's would be writing where it has
-/// no permission. `TMPDIR` is set on Windows too, for ported tools that look
-/// for it.
-#[cfg(windows)]
-const TEMP_DIR_VARS: &[&str] = &["TEMP", "TMP", "TMPDIR"];
-
-/// The variables that name the directory for temporary files.
+/// Unix programs read `TMPDIR`, which this layer points at the working
+/// directory. On Windows, the backend sets `TEMP`, `TMP` and `TMPDIR` to the
+/// container's own temporary folder.
 #[cfg(not(windows))]
 const TEMP_DIR_VARS: &[&str] = &["TMPDIR"];
 
@@ -296,10 +291,12 @@ pub(crate) fn sandbox_environment(
         }
     }
 
-    // The working directory is the one place a sandboxed process can always
-    // write, so it is also where temporary files belong. Strict mode denies the
-    // shared temp directories outright.
+    // On Unix, the working directory is the one place a sandboxed process can
+    // always write, so it is also where temporary files belong. Strict mode
+    // denies the shared temp directories outright.
+    #[cfg(not(windows))]
     let working_dir = config.working_dir().display().to_string();
+    #[cfg(not(windows))]
     for key in TEMP_DIR_VARS {
         envs.insert((*key).to_string(), working_dir.clone());
     }

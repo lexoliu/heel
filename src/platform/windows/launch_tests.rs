@@ -64,7 +64,11 @@ fn cmd(fixture: &LaunchFixture, args: &[&str], stdio: Stdio) -> AppContainerChil
         exe: PathBuf::from(&root).join("System32").join("cmd.exe"),
         cmdline: super::command_line(&request),
         cwd: fixture.directory.path().to_owned(),
-        env: super::environment(&request),
+        env: super::environment(
+            &request,
+            fixture.container.local_app_data(),
+            fixture.container.profile_folder(),
+        ),
         stdio,
         memory_bytes: None,
         priority: ProcessPriority::default(),

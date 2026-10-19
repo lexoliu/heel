@@ -145,6 +145,16 @@ impl Container {
         self.profile.sid()
     }
 
+    /// The directory Windows associates with this package SID.
+    pub(crate) fn profile_folder(&self) -> &Path {
+        self.profile.folder()
+    }
+
+    /// The base Windows appends the profile suffix to for child `LOCALAPPDATA`.
+    pub(crate) fn local_app_data(&self) -> &Path {
+        self.profile.local_app_data()
+    }
+
     /// Open the configured paths to this container.
     ///
     /// Nothing outside these grants is reachable, so a path that cannot be

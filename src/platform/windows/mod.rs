@@ -83,28 +83,20 @@ impl Win32Failure {
     }
 }
 
-/// Variables a launched process inherits from the parent when the request is
-/// silent.
+/// Variables a launched process inherits when the request does not replace
+/// the parent's environment.
 ///
 /// A custom environment replaces the parent's entirely, and a process without
 /// `SystemRoot` or `ComSpec` fails before its first instruction, so these are
 /// filled in when nothing supplied them. Windows compares names
 /// case-insensitively, so the check does too — a `PATH` the caller spelled
 /// `Path` must not be duplicated.
-const INHERITED_VARIABLES: &[&str] = &[
-    "SystemRoot",
-    "windir",
-    "ComSpec",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-    "PATH",
-];
+const INHERITED_VARIABLES: &[&str] = &["SystemRoot", "windir", "ComSpec", "PATHEXT", "PATH"];
 
 /// Machine facts a Windows process expects to find in its environment.
 ///
-/// The inherited variables already fill in `SystemRoot`, `windir`, `ComSpec`,
-/// `PATHEXT` and the temp variables. These are the rest of what the loader
+/// The inherited variables already fill in `SystemRoot`, `windir`, `ComSpec`
+/// and `PATHEXT`. These are the rest of what the loader
 /// and the C runtime consult, and they describe the machine rather than the
 /// user, so passing them through leaks nothing: the user's own variables stay
 /// out.
@@ -125,18 +117,14 @@ const MACHINE_FACTS: &[&str] = &[
     "CommonProgramW6432",
 ];
 
-/// Variables naming the user's own directories.
-///
-/// An AppContainer's per-container profile lives under
-/// `%LOCALAPPDATA%\Packages`, and Windows resolves it from the environment of
-/// the process being created, so a container started without these cannot be
-/// given a profile to run in.
+/// User directories retained from the parent environment.
 ///
 /// They name the user, which a sandbox would rather not disclose, but nothing
-/// is disclosed that was not already: the working directory sits inside the
-/// user's temp directory and is handed to the process as `TEMP`, so its path
-/// carries the user's name regardless.
-const USER_DIRECTORIES: &[&str] = &["USERPROFILE", "LOCALAPPDATA", "APPDATA", "ALLUSERSPROFILE"];
+/// is disclosed that was not already: the container's temporary directory sits
+/// under the user's profile, so its path carries the user's name regardless.
+/// The remaining entries are passed for what Windows and the C runtime consult.
+/// `LOCALAPPDATA` is set separately from the profile folder.
+const USER_DIRECTORIES: &[&str] = &["USERPROFILE", "APPDATA", "ALLUSERSPROFILE"];
 
 /// Windows sandbox backend.
 #[derive(Debug)]
@@ -233,7 +221,11 @@ impl WindowsBackend {
             exe: prepared.program,
             cmdline: command_line(&request),
             cwd: request.working_dir().to_path_buf(),
-            env: environment(&request),
+            env: environment(
+                &request,
+                self.container.local_app_data(),
+                self.container.profile_folder(),
+            ),
             stdio: stdio(request.stdout),
             memory_bytes: limits
                 .max_memory_bytes()
@@ -272,7 +264,11 @@ impl WindowsBackend {
 /// variable and reads like something else entirely. Inherited variables are
 /// appended to whatever the request supplied, so sorting has to happen after
 /// them rather than at the point the variables are collected.
-fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
+fn environment(
+    request: &SpawnRequest<'_>,
+    local_app_data: &Path,
+    profile_folder: &Path,
+) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = request
         .envs
         .iter()
@@ -304,6 +300,23 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
             env.push(((*name).into(), value));
         }
     }
+
+    // Windows rewrites a child's LOCALAPPDATA to
+    // `<LOCALAPPDATA>\Packages\<profile>\AC` and derives TEMP/TMP beneath it.
+    // GetAppContainerFolderPath reports the existing profile folder; passing
+    // its validated base makes the rewritten value name that folder. The
+    // explicit TEMP/TMP values match what Windows derives, and TMPDIR follows
+    // TEMP for programs that consult it.
+    env.retain(|(name, _)| {
+        !["LOCALAPPDATA", "TEMP", "TMP", "TMPDIR"]
+            .iter()
+            .any(|reserved| env_name_eq(name, reserved))
+    });
+    let temp = profile_folder.join("Temp");
+    env.push(("LOCALAPPDATA".into(), local_app_data.as_os_str().to_owned()));
+    env.push(("TEMP".into(), temp.as_os_str().to_owned()));
+    env.push(("TMP".into(), temp.as_os_str().to_owned()));
+    env.push(("TMPDIR".into(), temp.as_os_str().to_owned()));
 
     env.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_lowercase());
     env
