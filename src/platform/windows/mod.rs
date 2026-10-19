@@ -203,7 +203,9 @@ impl WindowsBackend {
                     )),
                 )
             })?;
-        self.container.grant_program(&program)?;
+        let capability = self.container.capabilities(request.proxy_port.is_some())?;
+        self.container
+            .grant_program(&program, capability.as_ref())?;
 
         // A proxy port means a filtering policy, which only works if the
         // container may reach the proxy on loopback.
@@ -214,7 +216,7 @@ impl WindowsBackend {
 
         Ok(Prepared {
             program,
-            capability: self.container.capabilities(request.proxy_port.is_some())?,
+            capability,
             loopback,
         })
     }

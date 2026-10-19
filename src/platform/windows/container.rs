@@ -261,7 +261,7 @@ impl Container {
         } else {
             entries[1].access
         };
-        if self.already_open(path, desired)? {
+        if self.already_open(path, desired, None)? {
             tracing::debug!(
                 path = %path.display(),
                 "path already grants the container its access"
@@ -290,7 +290,7 @@ impl Container {
             if ancestor.parent().is_none() {
                 continue;
             }
-            if self.already_open(ancestor, TRAVERSE)? {
+            if self.already_open(ancestor, TRAVERSE, None)? {
                 tracing::debug!(
                     path = %ancestor.display(),
                     "ancestor already grants the container traverse"
@@ -318,9 +318,9 @@ impl Container {
     /// directories, whose ACLs are not ours to change — need nothing
     /// written. Anything the container does not already hold has to be
     /// granted, and failing there is a real error.
-    pub(crate) fn grant_program(&self, program: &Path) -> Result<()> {
+    pub(crate) fn grant_program(&self, program: &Path, capability: Option<&Sid>) -> Result<()> {
         const PROGRAM_ACCESS: u32 = READ | EXECUTE;
-        if self.already_open(program, PROGRAM_ACCESS)? {
+        if self.already_open(program, PROGRAM_ACCESS, capability)? {
             tracing::debug!(
                 program = %program.display(),
                 "program already grants the container read and execute"
@@ -337,23 +337,28 @@ impl Container {
         )
     }
 
-    /// Whether the container already holds `desired` on `path`.
+    /// Whether the package and the launch's capability already receive
+    /// `desired` from ACEs on `path`.
     ///
-    /// An AppContainer token carries its package SID, its capability SIDs
-    /// and ALL APPLICATION PACKAGES — no Everyone or Users memberships, so
-    /// an ACE naming them opens nothing to it — and what it may do on a
-    /// path is the union of what those SIDs' entries in the path's DACL
-    /// allow (Microsoft, "AppContainer isolation",
-    /// learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation,
-    /// and the well-known SID list for S-1-15-2-1).
-    /// `GetEffectiveRightsFromAclW` answers that union one trustee at a
-    /// time against the object's own list, so the two SIDs are the
-    /// filesystem access check the kernel will make; `AccessCheck` itself
-    /// wants a real token, which exists only while a process in the
-    /// container runs.
-    fn already_open(&self, path: &Path, desired: u32) -> Result<bool> {
-        let held = acl::effective_rights(path, &[self.sid().as_string(), ALL_APPLICATION_PACKAGES])
-            .map_err(|source| Error::path(path, source))?;
+    /// An AppContainer token carries its package SID, its capability SIDs and
+    /// ALL APPLICATION PACKAGES, but no Everyone or Users memberships. The
+    /// kernel's AppContainer access check requires an ACE for one of those
+    /// token SIDs, so Everyone/Users entries do not open the path to it
+    /// (Microsoft, "AppContainer isolation",
+    /// learn.microsoft.com/windows/win32/secauthz/appcontainer-isolation;
+    /// ALL APPLICATION PACKAGES is SID S-1-15-2-1).
+    ///
+    /// Configured paths and their ancestors are checked before any launch
+    /// chooses whether it carries `internetClient`, so those checks cannot
+    /// count a capability that is not common to every launch. A program is
+    /// checked per launch and can include the capability that launch receives.
+    fn already_open(&self, path: &Path, desired: u32, capability: Option<&Sid>) -> Result<bool> {
+        let mut trustees = vec![self.sid().as_string(), ALL_APPLICATION_PACKAGES];
+        if let Some(capability) = capability {
+            trustees.push(capability.as_string());
+        }
+        let held =
+            acl::effective_rights(path, &trustees).map_err(|source| Error::path(path, source))?;
         Ok(held & desired == desired)
     }
 
@@ -584,6 +589,81 @@ mod tests {
                 .expect("the grants lock")
                 .is_empty(),
             "a directory the container cannot reach must be written to its DACL"
+        );
+    }
+
+    #[test]
+    fn a_directory_open_only_to_everyone_is_granted_to_the_container() {
+        // Everyone's ACE must not suppress a grant because AppContainer
+        // tokens do not carry Everyone as a trustee.
+        let dir = tempfile::tempdir().expect("a temp directory");
+        acl::set_dacl_sddl(dir.path(), "D:P(A;OICI;FA;;;WD)(A;OICI;FA;;;BA)")
+            .expect("the protected DACL is set");
+        let container = Container::create().expect("a container");
+
+        container
+            .grant_path(dir.path(), Access::READ)
+            .expect("the directory is granted");
+
+        assert!(
+            !container
+                .granted
+                .lock()
+                .expect("the grants lock")
+                .is_empty(),
+            "Everyone is not a trustee carried by an AppContainer token; its DACL is {}",
+            dacl(dir.path())
+        );
+    }
+
+    #[test]
+    fn a_directory_open_to_all_application_packages_is_not_regranted() {
+        // ALL APPLICATION PACKAGES already reaches this container, so its
+        // ACE must suppress a redundant ACL write.
+        let dir = tempfile::tempdir().expect("a temp directory");
+        acl::set_dacl_sddl(dir.path(), "D:P(A;OICI;FA;;;AC)(A;OICI;FA;;;BA)")
+            .expect("the protected DACL is set");
+        let container = Container::create().expect("a container");
+
+        container
+            .grant_path(dir.path(), Access::READ | Access::EXEC)
+            .expect("the directory is already open");
+
+        assert!(
+            container
+                .granted
+                .lock()
+                .expect("the grants lock")
+                .is_empty(),
+            "ALL APPLICATION PACKAGES already grants read and execute; its DACL is {}",
+            dacl(dir.path())
+        );
+    }
+
+    #[test]
+    fn a_leading_deny_keeps_the_container_from_holding_read_access() {
+        // The first matching deny wins over a later allow, so the DACL walk
+        // must still request a grant for read.
+        let dir = tempfile::tempdir().expect("a temp directory");
+        acl::set_dacl_sddl(
+            dir.path(),
+            "D:P(D;;FR;;;AC)(A;OICI;FA;;;AC)(A;OICI;FA;;;BA)",
+        )
+        .expect("the protected DACL is set");
+        let container = Container::create().expect("a container");
+
+        container
+            .grant_path(dir.path(), Access::READ)
+            .expect("the denied read access is granted");
+
+        assert!(
+            !container
+                .granted
+                .lock()
+                .expect("the grants lock")
+                .is_empty(),
+            "the leading deny must win over the later allow; its DACL is {}",
+            dacl(dir.path())
         );
     }
 }
