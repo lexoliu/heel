@@ -814,11 +814,30 @@ mod tests {
     // A this-object ACL write preserves the parent's auto-inherited DACL.
     #[test]
     fn this_object_writes_preserve_auto_inheritance() {
-        let directory = tempfile::tempdir().expect("a temp directory");
-        let initial = dacl(directory.path());
+        let outer = tempfile::tempdir().expect("an outer temp directory");
+        let marker = "S-1-15-3-1024-2";
+        grant(
+            outer.path(),
+            marker,
+            &[
+                Entry {
+                    access: FILE_TRAVERSE.0,
+                    applies_to: Scope::Directories,
+                },
+                Entry {
+                    access: FILE_TRAVERSE.0,
+                    applies_to: Scope::Files,
+                },
+            ],
+        )
+        .expect("the outer directory gets inheritable entries");
+        let target = outer.path().join("target");
+        std::fs::create_dir(&target).expect("the target is created beneath the outer directory");
+
+        let initial = dacl(&target);
         assert!(
             initial.starts_with("D:AI"),
-            "the parent chain must be auto-inherited: {initial}"
+            "the constructed parent did not produce an auto-inherited child: {initial}"
         );
         let inherited = id_aces(&initial);
         assert!(
@@ -827,9 +846,9 @@ mod tests {
         );
 
         let sid = "S-1-15-3-1024-1";
-        let name = grant_this_only(directory.path(), sid, FILE_TRAVERSE.0)
-            .expect("the traverse grant is written");
-        let granted = dacl(directory.path());
+        let name =
+            grant_this_only(&target, sid, FILE_TRAVERSE.0).expect("the traverse grant is written");
+        let granted = dacl(&target);
         assert!(
             granted.starts_with("D:AI"),
             "the grant preserves auto-inheritance: {granted}"
@@ -841,7 +860,7 @@ mod tests {
         );
 
         revoke_this_only(&name, sid).expect("the traverse grant is revoked");
-        let revoked = dacl(directory.path());
+        let revoked = dacl(&target);
         assert!(
             revoked.starts_with("D:AI"),
             "the revoke preserves auto-inheritance: {revoked}"
