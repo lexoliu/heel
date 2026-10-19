@@ -186,8 +186,23 @@ impl WindowsBackend {
             .rev()
             .find(|(name, _)| env_name_eq(name, "PATH"))
             .map(|(_, value)| value);
-        let program = which::which_in(request.program, path, request.working_dir())
-            .map_err(|source| Error::path(request.program, std::io::Error::other(source)))?;
+        // A program that does not resolve names the search it failed: the
+        // sandbox's PATH is computed from the request and the passthrough
+        // list, so the caller cannot otherwise tell which one it was.
+        let program =
+            which::which_in(request.program, path, request.working_dir()).map_err(|source| {
+                let pathext = std::env::var_os("PATHEXT");
+                Error::path(
+                    request.program,
+                    std::io::Error::other(format!(
+                        "{source} (PATH searched: {}; PATHEXT: {})",
+                        path.map_or("unset", String::as_str),
+                        pathext
+                            .as_deref()
+                            .map_or("unset".into(), |ext| ext.to_string_lossy()),
+                    )),
+                )
+            })?;
         self.container.grant_program(&program)?;
 
         // A proxy port means a filtering policy, which only works if the
