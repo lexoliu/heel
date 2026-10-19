@@ -673,17 +673,6 @@ mod tests {
         .expect("the persistent grant record is valid")
     }
 
-    fn inherited_aces(sddl: &str) -> Vec<String> {
-        sddl.split('(')
-            .skip(1)
-            .filter_map(|entry| {
-                let entry = entry.split_once(')')?.0;
-                let flags = entry.split(';').nth(1)?;
-                flags.contains("ID").then(|| format!("({entry})"))
-            })
-            .collect()
-    }
-
     fn auto_inherited_grant_tree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let outer = tempfile::tempdir().expect("an outer temp directory");
         acl::grant(outer.path(), "S-1-15-3-1024-2", &access_tree(Access::READ))
@@ -710,7 +699,7 @@ mod tests {
             "the constructed child is auto-inherited: {probe_dacl}"
         );
         assert!(
-            !inherited_aces(&probe_dacl).is_empty(),
+            !acl::inherited_aces(&probe_dacl).is_empty(),
             "the constructed child has inherited ACEs: {probe_dacl}"
         );
 
@@ -724,7 +713,7 @@ mod tests {
             "the root-only write leaves the child auto-inherited: {probe_dacl}"
         );
         assert_eq!(
-            inherited_aces(&probe_dacl),
+            acl::inherited_aces(&probe_dacl),
             expected,
             "the root-only write preserves the child's inherited ACEs: {probe_dacl}"
         );
@@ -928,20 +917,15 @@ mod tests {
 
         let marker = "S-1-15-3-1024-1";
         let marker_entries = access_tree(Access::READ);
-        let inherited = inherited_aces(&dacl(&probe));
+        let inherited = acl::inherited_aces(&dacl(&probe));
         acl::add_without_propagation(&root, marker, &marker_entries)
             .expect("the marker is added to the root only");
         let root_dacl = dacl(&root);
-        let probe_dacl = dacl(&probe);
         assert!(
             root_dacl.contains(marker),
             "the root receives the inheritable marker ACE: {root_dacl}"
         );
         assert_probe_keeps_inherited_aces(&probe, &inherited, marker);
-        assert!(
-            !probe_dacl.starts_with("D:P"),
-            "the child remains unprotected after the root-only write: {probe_dacl}"
-        );
         assert!(
             root_dacl.contains(&package),
             "the root retains the package ACE: {root_dacl}"
@@ -1012,20 +996,15 @@ mod tests {
             .as_string()
             .to_owned();
         let entries = access_tree(Access::READ);
-        let inherited = inherited_aces(&dacl(&probe));
+        let inherited = acl::inherited_aces(&dacl(&probe));
         acl::add_without_propagation(&root, &package, &entries)
             .expect("the persistent grant is written to the root only");
         let root_dacl = dacl(&root);
-        let probe_dacl = dacl(&probe);
         assert!(
             root_dacl.contains(&package),
             "the root holds the package ACE: {root_dacl}"
         );
         assert_probe_keeps_inherited_aces(&probe, &inherited, &package);
-        assert!(
-            !probe_dacl.starts_with("D:P"),
-            "the child remains unprotected after the root-only write: {probe_dacl}"
-        );
 
         let (container, outcomes) =
             Container::named(identity.identity()).expect("the named container reapplies grants");

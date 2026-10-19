@@ -815,6 +815,18 @@ pub(crate) fn dacl_sddl(name: &str) -> io::Result<String> {
     Ok(rendered)
 }
 
+#[cfg(test)]
+pub(crate) fn inherited_aces(sddl: &str) -> Vec<String> {
+    sddl.split('(')
+        .skip(1)
+        .filter_map(|entry| {
+            let entry = entry.split_once(')')?.0;
+            let flags = entry.split(';').nth(1)?;
+            flags.contains("ID").then(|| format!("({entry})"))
+        })
+        .collect()
+}
+
 /// Set `path`'s protected DACL from `sddl`.
 ///
 /// The tests need the object's own trustee list to decide whether access is
@@ -862,17 +874,6 @@ mod tests {
         dacl_sddl(&name).expect("the DACL reads back")
     }
 
-    fn id_aces(sddl: &str) -> Vec<String> {
-        sddl.split('(')
-            .skip(1)
-            .filter_map(|entry| {
-                let entry = entry.split_once(')')?.0;
-                let flags = entry.split(';').nth(1)?;
-                flags.contains("ID").then(|| format!("({entry})"))
-            })
-            .collect()
-    }
-
     // A this-object ACL write preserves the parent's auto-inherited DACL.
     #[test]
     fn this_object_writes_preserve_auto_inheritance() {
@@ -901,7 +902,7 @@ mod tests {
             initial.starts_with("D:AI"),
             "the constructed parent did not produce an auto-inherited child: {initial}"
         );
-        let inherited = id_aces(&initial);
+        let inherited = inherited_aces(&initial);
         assert!(
             !inherited.is_empty(),
             "the DACL has inherited ACEs: {initial}"
@@ -916,7 +917,7 @@ mod tests {
             "the grant preserves auto-inheritance: {granted}"
         );
         assert_eq!(
-            id_aces(&granted),
+            inherited_aces(&granted),
             inherited,
             "the grant preserves inherited ACEs: {granted}"
         );
@@ -928,7 +929,7 @@ mod tests {
             "the revoke preserves auto-inheritance: {revoked}"
         );
         assert_eq!(
-            id_aces(&revoked),
+            inherited_aces(&revoked),
             inherited,
             "the revoke preserves inherited ACEs: {revoked}"
         );
