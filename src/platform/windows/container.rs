@@ -673,6 +673,67 @@ mod tests {
         .expect("the persistent grant record is valid")
     }
 
+    fn inherited_aces(sddl: &str) -> Vec<String> {
+        sddl.split('(')
+            .skip(1)
+            .filter_map(|entry| {
+                let entry = entry.split_once(')')?.0;
+                let flags = entry.split(';').nth(1)?;
+                flags.contains("ID").then(|| format!("({entry})"))
+            })
+            .collect()
+    }
+
+    fn auto_inherited_grant_tree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let outer = tempfile::tempdir().expect("an outer temp directory");
+        acl::grant(outer.path(), "S-1-15-3-1024-2", &access_tree(Access::READ))
+            .expect("the outer directory gets inheritable entries");
+        let outer_dacl = dacl(outer.path());
+        assert!(
+            outer_dacl.starts_with("D:AI"),
+            "the constructed parent is auto-inherited: {outer_dacl}"
+        );
+
+        let root = outer.path().join("granted");
+        std::fs::create_dir(&root).expect("the granted directory is created");
+        let probe = root.join("probe.txt");
+        std::fs::write(&probe, "probe").expect("the probe file is created");
+
+        let root_dacl = dacl(&root);
+        assert!(
+            root_dacl.starts_with("D:AI"),
+            "the constructed root is auto-inherited: {root_dacl}"
+        );
+        let probe_dacl = dacl(&probe);
+        assert!(
+            probe_dacl.starts_with("D:AI"),
+            "the constructed child is auto-inherited: {probe_dacl}"
+        );
+        assert!(
+            !inherited_aces(&probe_dacl).is_empty(),
+            "the constructed child has inherited ACEs: {probe_dacl}"
+        );
+
+        (outer, root, probe)
+    }
+
+    fn assert_probe_keeps_inherited_aces(probe: &Path, expected: &[String], sid: &str) {
+        let probe_dacl = dacl(probe);
+        assert!(
+            probe_dacl.starts_with("D:AI"),
+            "the root-only write leaves the child auto-inherited: {probe_dacl}"
+        );
+        assert_eq!(
+            inherited_aces(&probe_dacl),
+            expected,
+            "the root-only write preserves the child's inherited ACEs: {probe_dacl}"
+        );
+        assert!(
+            !probe_dacl.contains(sid),
+            "the root-only write leaves the child without the written SID: {probe_dacl}"
+        );
+    }
+
     #[test]
     fn drop_removes_every_entry_the_container_added() {
         let dir = tempfile::tempdir().expect("a temp directory");
@@ -851,11 +912,7 @@ mod tests {
     // A completed record skips a root rewrite that would propagate a new ACE.
     #[test]
     fn complete_record_does_not_propagate_a_root_only_marker() {
-        let directory = tempfile::tempdir().expect("a temp directory");
-        let root = directory.path().join("granted");
-        std::fs::create_dir(&root).expect("the granted directory");
-        let probe = root.join("probe.txt");
-        std::fs::write(&probe, "probe").expect("the probe file");
+        let (_outer, root, probe) = auto_inherited_grant_tree();
         let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
 
         let (container, outcomes) =
@@ -871,6 +928,7 @@ mod tests {
 
         let marker = "S-1-15-3-1024-1";
         let marker_entries = access_tree(Access::READ);
+        let inherited = inherited_aces(&dacl(&probe));
         acl::add_without_propagation(&root, marker, &marker_entries)
             .expect("the marker is added to the root only");
         let root_dacl = dacl(&root);
@@ -879,9 +937,10 @@ mod tests {
             root_dacl.contains(marker),
             "the root receives the inheritable marker ACE: {root_dacl}"
         );
+        assert_probe_keeps_inherited_aces(&probe, &inherited, marker);
         assert!(
-            !probe_dacl.contains(marker),
-            "the root-only write leaves the child without the marker ACE: {probe_dacl}"
+            !probe_dacl.starts_with("D:P"),
+            "the child remains unprotected after the root-only write: {probe_dacl}"
         );
         assert!(
             root_dacl.contains(&package),
@@ -945,11 +1004,7 @@ mod tests {
     // A missing record re-applies the root ACE to children through propagation.
     #[test]
     fn missing_record_reapplies_tree_propagation_and_records_the_grant() {
-        let directory = tempfile::tempdir().expect("a temp directory");
-        let root = directory.path().join("granted");
-        std::fs::create_dir(&root).expect("the granted directory");
-        let probe = root.join("probe.txt");
-        std::fs::write(&probe, "probe").expect("the probe file");
+        let (_outer, root, probe) = auto_inherited_grant_tree();
         let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
 
         let package = Profile::derive_sid(&identity.identity().profile_name())
@@ -957,6 +1012,7 @@ mod tests {
             .as_string()
             .to_owned();
         let entries = access_tree(Access::READ);
+        let inherited = inherited_aces(&dacl(&probe));
         acl::add_without_propagation(&root, &package, &entries)
             .expect("the persistent grant is written to the root only");
         let root_dacl = dacl(&root);
@@ -965,9 +1021,10 @@ mod tests {
             root_dacl.contains(&package),
             "the root holds the package ACE: {root_dacl}"
         );
+        assert_probe_keeps_inherited_aces(&probe, &inherited, &package);
         assert!(
-            !probe_dacl.contains(&package),
-            "the root-only write leaves the child without the package ACE: {probe_dacl}"
+            !probe_dacl.starts_with("D:P"),
+            "the child remains unprotected after the root-only write: {probe_dacl}"
         );
 
         let (container, outcomes) =
