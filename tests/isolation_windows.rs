@@ -71,6 +71,67 @@ async fn the_temp_directory_is_private_to_the_container() {
     assert_eq!(stdout(&written), "written", "{}", stderr(&written));
 }
 
+#[tokio::test]
+async fn passthrough_variables_reach_the_container_under_their_host_spelling() {
+    // Windows stores the search path as `Path`, and a caller collecting names
+    // from `std::env::vars_os` passes that spelling: a case-sensitive match
+    // never saw it, so the container fell back to the System32 default and a
+    // program found only on the host's PATH could not even be resolved. The
+    // other named variables never arrived either — nothing read the list.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let probe = dir.path().join("heel-path-probe.exe");
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    std::fs::copy(format!("{system_root}\\System32\\findstr.exe"), &probe)
+        .expect("the host stages an executable under a name only PATH finds");
+    let haystack = dir.path().join("haystack.txt");
+    std::fs::write(&haystack, "needle").expect("the host stages a file to search");
+
+    let path = std::env::join_paths(std::iter::once(dir.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set")),
+    ))
+    .expect("the staged directory joins the host search path");
+    // SAFETY: nextest runs each test in its own process, and these writes
+    // happen before the test spawns anything that could read the environment
+    // while it changes.
+    unsafe {
+        std::env::set_var("HEEL_PASSTHROUGH_PROBE", "probe-value");
+        std::env::set_var("PATH", &path);
+    }
+
+    let config = SandboxConfigBuilder::default()
+        .grant(dir.path(), Access::READ | Access::EXEC)
+        .env_passthroughs(["Path", "HEEL_PASSTHROUGH_PROBE"])
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    let output = cmd(&sandbox, "echo %HEEL_PASSTHROUGH_PROBE%").await;
+    assert_eq!(stdout(&output), "probe-value", "{}", stderr(&output));
+    let output = cmd(&sandbox, "echo %PATH%").await;
+    assert_eq!(
+        stdout(&output),
+        path.to_str().expect("the search path is UTF-8"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = sandbox
+        .command("heel-path-probe")
+        .arg("/c:needle")
+        .arg(haystack.to_string_lossy().as_ref())
+        .output()
+        .await
+        .expect("the staged program resolves through the passed-through PATH");
+    assert!(
+        output.status.success() && stdout(&output).contains("needle"),
+        "the staged program must run inside the sandbox: status={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
 /// Compile a fixture program into `dir` and return its path.
 fn compile_fixture(dir: &Path, fixture: &str, output: &str) -> PathBuf {
     let source = match fixture {
