@@ -497,7 +497,11 @@ mod tests {
         data.adopt_persistent_grants();
 
         let profile = generate_profile(&data, None).expect("the profile is generated");
-        let path = escape_path(directory.path()).expect("the grant path escapes");
+        let canonical = directory
+            .path()
+            .canonicalize()
+            .expect("the grant path canonicalizes");
+        let path = escape_path(&canonical).expect("the grant path escapes");
         assert!(
             profile.contains(&format!("(allow file-read* (subpath \"{path}\"))")),
             "the persistent grant is present in the profile:\n{profile}"
