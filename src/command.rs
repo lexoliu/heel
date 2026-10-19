@@ -6,7 +6,7 @@ use std::process::{ExitStatus, Output, Stdio};
 
 use crate::config::SandboxConfigData;
 use crate::error::Result;
-use crate::platform::{Backend, Child, NativeBackend, SpawnRequest};
+use crate::platform::{Backend, Child, NativeBackend, SpawnRequest, env_name_eq};
 use crate::sandbox::ProcessTracker;
 
 /// The `PATH` a sandboxed process gets when nothing else specifies one.
@@ -309,7 +309,11 @@ pub(crate) fn sandbox_environment(
         // the caller spelled differently is stored under the canonical name:
         // left as spelled it would sit beside the computed `PATH` in one
         // block, and which of the two the child reads is not ours to say.
-        let key = if is_path(key) { "PATH" } else { key.as_str() };
+        let key = if env_name_eq(key, "PATH") {
+            "PATH"
+        } else {
+            key.as_str()
+        };
         envs.insert(key.to_string(), value.clone());
     }
 
@@ -332,15 +336,14 @@ fn sandbox_path(config: &SandboxConfigData, user_envs: &[(String, String)]) -> S
     let base = user_envs
         .iter()
         .rev()
-        .find(|(key, _)| is_path(key))
+        .find(|(key, _)| env_name_eq(key, "PATH"))
         .map(|(_, value)| value.clone())
         .or_else(|| {
             config
                 .env_passthrough()
                 .iter()
-                .any(|var| is_path(var))
-                .then(|| std::env::var("PATH").ok())
-                .flatten()
+                .find(|var| env_name_eq(var, "PATH"))
+                .and_then(|var| std::env::var(var).ok())
         })
         .unwrap_or_else(default_sandbox_path);
 
@@ -356,22 +359,5 @@ fn sandbox_path(config: &SandboxConfigData, user_envs: &[(String, String)]) -> S
             tracing::warn!(%error, "failed to extend PATH with the IPC shim directory");
             base
         }
-    }
-}
-
-/// Whether `name` spells the search-path variable.
-///
-/// Windows compares environment names case-insensitively and stores the
-/// search path as `Path`, so a caller collecting names from
-/// `std::env::vars_os` passes that spelling — which a case-sensitive match
-/// would miss. Everywhere else the name is exact.
-fn is_path(name: &str) -> bool {
-    #[cfg(windows)]
-    {
-        name.eq_ignore_ascii_case("PATH")
-    }
-    #[cfg(not(windows))]
-    {
-        name == "PATH"
     }
 }

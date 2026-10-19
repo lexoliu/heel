@@ -36,7 +36,7 @@ use sid::Sid;
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
-use crate::platform::{Backend, Child, SpawnRequest};
+use crate::platform::{Backend, Child, SpawnRequest, env_name_eq};
 
 /// A launch-prep failure that names the call which produced it.
 ///
@@ -184,7 +184,7 @@ impl WindowsBackend {
             .envs
             .iter()
             .rev()
-            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .find(|(name, _)| env_name_eq(name, "PATH"))
             .map(|(_, value)| value);
         let program = which::which_in(request.program, path, request.working_dir())
             .map_err(|source| Error::path(request.program, std::io::Error::other(source)))?;
@@ -300,11 +300,7 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
 /// a `PATH` the request spelled `Path` must not sit beside the variable being
 /// filled in behind it.
 fn supplied(env: &[(OsString, OsString)], name: &str) -> bool {
-    env.iter().any(|(existing, _)| {
-        existing
-            .as_encoded_bytes()
-            .eq_ignore_ascii_case(name.as_bytes())
-    })
+    env.iter().any(|(existing, _)| env_name_eq(existing, name))
 }
 
 /// Summarize a launch's environment for a failure message.

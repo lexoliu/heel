@@ -41,6 +41,22 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
 }
 
+fn env_value(output: &Output, name: &str) -> String {
+    assert!(output.status.success(), "{}", stderr(output));
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            key.eq_ignore_ascii_case(name).then(|| value.to_string())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{name} was absent from `set` output {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+}
+
 /// A sandbox with the default, deny-everything configuration.
 async fn default_sandbox() -> Sandbox {
     Sandbox::with_config_and_executor(SandboxConfig::new(), executor_core::tokio::TokioGlobal)
@@ -75,9 +91,24 @@ async fn the_temp_directory_is_private_to_the_container() {
 async fn passthrough_variables_reach_the_container_under_their_host_spelling() {
     // Windows stores the search path as `Path`, and a caller collecting names
     // from `std::env::vars_os` passes that spelling: a case-sensitive match
-    // never saw it, so the container fell back to the System32 default and a
-    // program found only on the host's PATH could not even be resolved. The
-    // other named variables never arrived either — nothing read the list.
+    // never saw it, so the container fell back to the System32 default.
+    let username = std::env::var("USERNAME").expect("USERNAME is set");
+    let path = std::env::var("PATH").expect("PATH is set");
+    let config = SandboxConfigBuilder::default()
+        .env_passthroughs(["Path", "uSeRnAmE"])
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    let output = cmd(&sandbox, "set USERNAME").await;
+    assert_eq!(env_value(&output, "USERNAME"), username);
+    let output = cmd(&sandbox, "set PATH").await;
+    assert_eq!(env_value(&output, "PATH"), path);
+}
+
+#[tokio::test]
+async fn an_explicit_path_spelled_path_resolves_a_program_found_only_there() {
     let dir = tempfile::tempdir().expect("tempdir");
     let probe = dir.path().join("heel-path-probe.exe");
     let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
@@ -90,39 +121,21 @@ async fn passthrough_variables_reach_the_container_under_their_host_spelling() {
         std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set")),
     ))
     .expect("the staged directory joins the host search path");
-    // SAFETY: nextest runs each test in its own process, and these writes
-    // happen before the test spawns anything that could read the environment
-    // while it changes.
-    unsafe {
-        std::env::set_var("HEEL_PASSTHROUGH_PROBE", "probe-value");
-        std::env::set_var("PATH", &path);
-    }
-
     let config = SandboxConfigBuilder::default()
         .grant(dir.path(), Access::READ | Access::EXEC)
-        .env_passthroughs(["Path", "HEEL_PASSTHROUGH_PROBE"])
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts");
 
-    let output = cmd(&sandbox, "echo %HEEL_PASSTHROUGH_PROBE%").await;
-    assert_eq!(stdout(&output), "probe-value", "{}", stderr(&output));
-    let output = cmd(&sandbox, "echo %PATH%").await;
-    assert_eq!(
-        stdout(&output),
-        path.to_str().expect("the search path is UTF-8"),
-        "{}",
-        stderr(&output)
-    );
-
     let output = sandbox
         .command("heel-path-probe")
         .arg("/c:needle")
         .arg(haystack.to_string_lossy().as_ref())
+        .env("Path", path.to_str().expect("the search path is UTF-8"))
         .output()
         .await
-        .expect("the staged program resolves through the passed-through PATH");
+        .expect("the staged program resolves through the explicit Path");
     assert!(
         output.status.success() && stdout(&output).contains("needle"),
         "the staged program must run inside the sandbox: status={:?} stdout={:?} stderr={:?}",
