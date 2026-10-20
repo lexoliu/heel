@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -729,6 +729,64 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
     );
 }
 
+/// Poll `children` until all exit or `timeout` passes — stragglers are killed
+/// — then collect each one's output. Returns a failure line per child that
+/// timed out or exited unsuccessfully, empty when every `role` succeeded.
+fn collect_children(mut children: Vec<Child>, role: &str, timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    let mut finished = vec![false; children.len()];
+    let mut timed_out = vec![false; children.len()];
+    loop {
+        let mut running = false;
+        for (index, child) in children.iter_mut().enumerate() {
+            if finished[index] {
+                continue;
+            }
+            if child
+                .try_wait()
+                .unwrap_or_else(|source| panic!("a {role} cannot be polled: {source}"))
+                .is_some()
+            {
+                finished[index] = true;
+            } else {
+                running = true;
+            }
+        }
+        if !running {
+            break;
+        }
+        if Instant::now() >= deadline {
+            for (index, child) in children.iter_mut().enumerate() {
+                if !finished[index] {
+                    timed_out[index] = true;
+                    child.kill().unwrap_or_else(|source| {
+                        panic!("a timed-out {role} cannot be stopped: {source}")
+                    });
+                }
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let mut failures = Vec::new();
+    for (index, child) in children.into_iter().enumerate() {
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|source| panic!("a {role}'s output cannot be collected: {source}"));
+        if timed_out[index] || !output.status.success() {
+            failures.push(format!(
+                "{role} {index} timed_out={} status={:?} stderr={} stdout={}",
+                timed_out[index],
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            ));
+        }
+    }
+    failures
+}
+
 #[tokio::test]
 async fn acl_concurrency_child() {
     // This child role is a no-op in the regular suite; the parent supplies the
@@ -800,61 +858,84 @@ async fn concurrent_acl_grants_preserve_each_container_entry() {
             .write_all(b"go")
             .expect("the release file is written");
 
-        let deadline = Instant::now() + ROUND_TIMEOUT;
-        let mut finished = vec![false; children.len()];
-        let mut timed_out = vec![false; children.len()];
-        loop {
-            let mut running = false;
-            for (index, child) in children.iter_mut().enumerate() {
-                if finished[index] {
-                    continue;
-                }
-                if child
-                    .try_wait()
-                    .expect("a grant worker can be polled")
-                    .is_some()
-                {
-                    finished[index] = true;
-                } else {
-                    running = true;
-                }
-            }
-            if !running {
-                break;
-            }
-            if Instant::now() >= deadline {
-                for (index, child) in children.iter_mut().enumerate() {
-                    if !finished[index] {
-                        timed_out[index] = true;
-                        child.kill().expect("a timed-out worker is stopped");
-                    }
-                }
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-
-        let mut failures = Vec::new();
-        for (index, child) in children.into_iter().enumerate() {
-            let output = child
-                .wait_with_output()
-                .expect("a grant worker's output is collected");
-            if timed_out[index] || !output.status.success() {
-                failures.push(format!(
-                    "worker {index} timed_out={} status={:?} stderr={} stdout={}",
-                    timed_out[index],
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr),
-                    String::from_utf8_lossy(&output.stdout)
-                ));
-            }
-        }
+        let failures = collect_children(children, "worker", ROUND_TIMEOUT);
         assert!(
             failures.is_empty(),
             "ACL grant round {round} failed:\n{}",
             failures.join("\n")
         );
     }
+}
+
+#[test]
+fn profile_open_child() {
+    // This child role is a no-op in the regular suite; the parent supplies the
+    // identity name and release file so separate processes open one profile
+    // together.
+    let Some(name) = std::env::var_os("HEEL_PROFILE_OPEN_NAME") else {
+        return;
+    };
+    let go_file =
+        std::env::var_os("HEEL_PROFILE_OPEN_GO").expect("the parent supplies the release file");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !Path::new(&go_file).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the parent did not release the profile openers"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    Identity::named(name.to_string_lossy())
+        .expect("the identity name is valid")
+        .prepare()
+        .expect("the shared identity opens");
+}
+
+#[test]
+fn concurrent_opens_of_one_identity_all_succeed() {
+    // Reproduce #98's race with independent processes opening one fresh named
+    // profile together: a colliding first-time create failed one caller, and
+    // an ALREADY_EXISTS follower could reach the profile folder before its
+    // creator made it. Each opener is the test binary re-executed; all are
+    // released at once by the file the parent writes last.
+    const OPENERS: usize = 8;
+    const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+
+    let mut identity = IdentityCleanup::new(
+        Identity::named(format!("t-{:016x}", rand::random::<u64>()))
+            .expect("the identity name is valid"),
+    );
+    let release = tempfile::tempdir().expect("the release directory exists");
+    let go_file = release.path().join("go");
+    let test_binary = std::env::current_exe().expect("the test binary path is available");
+    let mut children = Vec::with_capacity(OPENERS);
+    for _ in 0..OPENERS {
+        children.push(
+            Command::new(&test_binary)
+                .args(["--exact", "profile_open_child", "--nocapture"])
+                .env("HEEL_PROFILE_OPEN_NAME", identity.identity().name())
+                .env("HEEL_PROFILE_OPEN_GO", &go_file)
+                .env("RUST_LOG", "off")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("a profile opener starts"),
+        );
+    }
+    fs::File::create(&go_file)
+        .expect("the release file is created after every opener starts")
+        .write_all(b"go")
+        .expect("the release file is written");
+
+    let failures = collect_children(children, "opener", OPEN_TIMEOUT);
+    assert!(
+        failures.is_empty(),
+        "concurrent opens of one identity failed:\n{}",
+        failures.join("\n")
+    );
+
+    identity.remove();
 }
 
 #[tokio::test]

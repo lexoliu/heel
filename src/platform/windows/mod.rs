@@ -20,6 +20,7 @@ mod launch;
 #[cfg(test)]
 mod launch_tests;
 mod loopback;
+mod machine_lock;
 mod priority;
 mod profile;
 mod sid;
@@ -29,6 +30,8 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Output;
+
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
 
 pub(crate) use child::AppContainerChild;
 use container::Container;
@@ -391,6 +394,19 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// A `LocalAlloc` allocation released when it goes out of scope.
+pub(crate) struct LocalBuffer(pub(crate) *mut core::ffi::c_void);
+
+impl Drop for LocalBuffer {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the pointer came from an API documented to return
+            // `LocalAlloc` memory, and is freed exactly once.
+            unsafe { LocalFree(Some(HLOCAL(self.0))) };
+        }
+    }
 }
 
 /// Everything one launch needs, built before the process starts.

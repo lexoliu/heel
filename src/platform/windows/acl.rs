@@ -12,29 +12,30 @@
 //! everything beneath it.
 
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::Path;
 
-use windows::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree, WAIT_ABANDONED, WAIT_FAILED,
-    WAIT_OBJECT_0, WIN32_ERROR,
-};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, WIN32_ERROR};
 #[cfg(test)]
-use windows::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
+#[cfg(test)]
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo, REVOKE_ACCESS,
-    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetEntriesInAclW,
-    SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
+    SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
 };
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_FLAGS, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, EqualSid, GENERIC_MAPPING, GetAce, GetSecurityDescriptorControl,
     INHERIT_ONLY_ACE, INHERITED_ACE, InitializeSecurityDescriptor, MapGenericMask,
     OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERIT_REQ,
-    SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SECURITY_DESCRIPTOR_CONTROL, SetFileSecurityW, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl,
+    SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL,
+    SetFileSecurityW, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
 };
 #[cfg(test)]
 use windows::Win32::Storage::FileSystem::FILE_TRAVERSE;
@@ -46,120 +47,18 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
 };
-use windows::Win32::System::Threading::{
-    CreateMutexExW, INFINITE, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE,
-    WaitForSingleObject,
-};
 use windows::core::{PCWSTR, PWSTR};
+
+use super::{LocalBuffer, machine_lock};
 
 /// A machine-wide name because heel processes in different sessions can grant
 /// the same shared directory and must serialize its ACL update.
 const ACL_UPDATE_MUTEX_NAME: &str = "Global\\heel-acl-update";
 
-/// SYSTEM and Administrators need full access; Authenticated Users need only
-/// the rights to wait and release. A standard-user probe could create a Global
-/// mutex, but the default DACL denied opening an administrator-created one
-/// with error 5; AppContainer tokens receive no rights from this descriptor.
-const ACL_UPDATE_MUTEX_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100001;;;AU)";
-
-/// Owns an acquired mutex and releases it before closing the handle.
-pub(crate) struct Guard {
-    handle: OwnedHandle,
-}
-
-impl Drop for Guard {
-    fn drop(&mut self) {
-        // SAFETY: `handle` is the mutex acquired by this thread and remains
-        // open until the field is dropped after this method returns.
-        if let Err(source) = unsafe { ReleaseMutex(HANDLE(self.handle.as_raw_handle())) } {
-            tracing::error!(%source, "cannot release the ACL update mutex");
-        }
-    }
-}
-
 /// Acquire the machine-wide lock around an ACL read, merge, write, and the
 /// `SetNamedSecurityInfoW` propagation that applies the write to a tree.
-///
-/// `WAIT_ABANDONED` still grants ownership: the prior holder died, but each
-/// ACL write is atomic for its object, so there is no partial list to repair.
-fn acquire() -> io::Result<Guard> {
-    let wide_sddl: Vec<u16> = ACL_UPDATE_MUTEX_SDDL
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    // SAFETY: `wide_sddl` is NUL-terminated and `descriptor` is a valid
-    // out-parameter for the LocalAlloc-backed security descriptor.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(wide_sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            None,
-        )
-    }
-    .map_err(|source| {
-        io::Error::other(format!(
-            "cannot create the ACL update mutex security descriptor: {source}"
-        ))
-    })?;
-    let _descriptor = LocalBuffer(descriptor.0.cast());
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: false.into(),
-    };
-    let wide_name: Vec<u16> = ACL_UPDATE_MUTEX_NAME
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    // SAFETY: `attributes` and its descriptor remain alive through the call,
-    // `wide_name` is NUL-terminated, and the requested rights match the DACL.
-    let handle = unsafe {
-        CreateMutexExW(
-            Some(&attributes),
-            PCWSTR(wide_name.as_ptr()),
-            0,
-            SYNCHRONIZATION_SYNCHRONIZE.0 | MUTEX_MODIFY_STATE.0,
-        )
-    }
-    .map_err(|source| {
-        io::Error::other(format!(
-            "CreateMutexExW failed for {ACL_UPDATE_MUTEX_NAME}: {source}"
-        ))
-    })?;
-    // SAFETY: the handle was returned by CreateMutexExW and is transferred
-    // to this owner exactly once.
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0.cast()) };
-
-    // SAFETY: `handle` is an open mutex handle owned by this guard attempt.
-    let result = unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), INFINITE) };
-    match result {
-        WAIT_OBJECT_0 => {}
-        WAIT_ABANDONED => {
-            // The previous holder died. Each ACL write is atomic per object,
-            // so there is no half-written list for this holder to repair.
-        }
-        WAIT_FAILED => {
-            return Err(io::Error::other(format!(
-                "WaitForSingleObject failed for {ACL_UPDATE_MUTEX_NAME}: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        result => {
-            return Err(io::Error::other(format!(
-                "WaitForSingleObject returned {result:?} for {ACL_UPDATE_MUTEX_NAME}"
-            )));
-        }
-    }
-
-    Ok(Guard { handle })
-}
-
-/// Acquire the machine-wide lock used by ACL mutations.
-pub(crate) fn lock() -> io::Result<Guard> {
-    acquire()
+pub(crate) fn lock() -> io::Result<machine_lock::Guard> {
+    machine_lock::lock(ACL_UPDATE_MUTEX_NAME)
 }
 
 /// What one entry grants, and to what it applies.
@@ -191,19 +90,6 @@ impl Scope {
             // rule is set on, which is what lets the container enter it.
             Self::Directories => CONTAINER_INHERIT_ACE,
             Self::Files => ACE_FLAGS(OBJECT_INHERIT_ACE.0 | INHERIT_ONLY_ACE.0),
-        }
-    }
-}
-
-/// A `LocalAlloc` allocation released when it goes out of scope.
-struct LocalBuffer(*mut core::ffi::c_void);
-
-impl Drop for LocalBuffer {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: the pointer came from an API documented to return
-            // `LocalAlloc` memory, and is freed exactly once.
-            unsafe { LocalFree(Some(HLOCAL(self.0))) };
         }
     }
 }
@@ -302,7 +188,7 @@ fn reread(object: &str, mut attempt: impl FnMut() -> WIN32_ERROR) -> io::Result<
 /// The handle must already carry `WRITE_DAC`, which the caller arranges by
 /// how it opens the object. The object itself is the only scope it has.
 fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
-    let _guard = acquire()?;
+    let _guard = lock()?;
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut current: *mut ACL = std::ptr::null_mut();
 
@@ -388,7 +274,7 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<Str
 /// The resolved name the entry was written to is returned, as `grant`
 /// returns it, for the matching `revoke_this_only` call.
 pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result<String> {
-    let _guard = acquire()?;
+    let _guard = lock()?;
     let name = resolve(path)?;
     let (descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
     let updated = merge(
@@ -407,7 +293,7 @@ pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result
 /// Add inheritable entries to `path` without propagating them to its children.
 #[cfg(test)]
 pub(crate) fn add_without_propagation(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<()> {
-    let _guard = acquire()?;
+    let _guard = lock()?;
     let name = resolve(path)?;
     let (descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
     let updated = merge(sid, current, entries, &name)?;
@@ -422,7 +308,7 @@ pub(crate) fn add_without_propagation(path: &Path, sid: &str, entries: &[Entry])
 /// not take the mutex. `SetNamedSecurityInfoW` then propagates the removal
 /// through the tree the same way the grant propagated the entry.
 pub(crate) fn revoke(name: &str, sddl: &str) -> io::Result<()> {
-    let _guard = acquire()?;
+    let _guard = lock()?;
     let (_descriptor, current) = read_dacl(name, SE_FILE_OBJECT)?;
     let updated = without(sddl, current, name)?;
     write_dacl(name, updated, SE_FILE_OBJECT)
@@ -431,7 +317,7 @@ pub(crate) fn revoke(name: &str, sddl: &str) -> io::Result<()> {
 /// Remove every entry `sddl` holds on the file `name` refers to, touching
 /// nothing beneath it — the counterpart of `grant_this_only`.
 pub(crate) fn revoke_this_only(name: &str, sddl: &str) -> io::Result<()> {
-    let _guard = acquire()?;
+    let _guard = lock()?;
     let (descriptor, current) = read_dacl(name, SE_FILE_OBJECT)?;
     let updated = without(sddl, current, name)?;
     write_file_dacl(name, &descriptor, updated)
@@ -695,7 +581,7 @@ fn without(sddl: &str, current: *mut ACL, object: &str) -> io::Result<LocalBuffe
 /// already spelled verbatim, or an object name such as a device or pipe —
 /// and `kind` tells the APIs how to open it.
 fn apply(name: &str, sddl: &str, entries: &[Entry], kind: SE_OBJECT_TYPE) -> io::Result<()> {
-    let _guard = acquire()?;
+    let _guard = lock()?;
     let (_descriptor, current) = read_dacl(name, kind)?;
     let updated = merge(sddl, current, entries, name)?;
     write_dacl(name, updated, kind)

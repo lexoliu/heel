@@ -19,6 +19,7 @@ use windows::Win32::Security::Isolation::{
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 
+use super::machine_lock;
 use super::sid::Sid;
 use super::{Win32Failure, wide};
 
@@ -72,7 +73,19 @@ impl Profile {
     }
 
     /// Open the persistent profile named `name`, creating it when absent.
+    ///
+    /// Concurrent opens of one name race: a colliding first-time create fails
+    /// one caller outright, and an opener told the profile already exists can
+    /// reach `from_sid` before its creator made the profile folder. The whole
+    /// open — the create call, the ALREADY_EXISTS derive, folder resolution
+    /// and `Temp` creation — runs under a machine-wide mutex named for the
+    /// profile, so a concurrent opener waits and then sees the finished
+    /// profile. `Identity::named` bars every character a kernel object name
+    /// forbids, so the profile name is safe inside the mutex name.
     pub(crate) fn open_named(name: &str) -> Result<Self, Win32Failure> {
+        let mutex = format!("Global\\heel-profile-{name}");
+        let _guard = machine_lock::lock(&mutex)
+            .map_err(Win32Failure::io("lock the AppContainer profile"))?;
         let name_wide = wide(name);
         let display = wide("heel sandbox");
         let description = wide("heel sandbox");
