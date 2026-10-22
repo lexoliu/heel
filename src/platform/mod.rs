@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::future::Future;
 use std::path::Path;
 use std::process::Output;
@@ -6,6 +7,23 @@ use crate::command::StdioConfig;
 use crate::config::SandboxConfigData;
 use crate::error::Result;
 pub use child::Child;
+
+/// Whether two environment variable names are equal under host rules.
+///
+/// Windows compares names case-insensitively; other supported platforms treat
+/// distinct cases as distinct variables.
+pub(crate) fn env_name_eq(name: impl AsRef<OsStr>, expected: impl AsRef<OsStr>) -> bool {
+    let name = name.as_ref().as_encoded_bytes();
+    let expected = expected.as_ref().as_encoded_bytes();
+    #[cfg(windows)]
+    {
+        name.eq_ignore_ascii_case(expected)
+    }
+    #[cfg(not(windows))]
+    {
+        name == expected
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -99,4 +117,20 @@ pub(crate) fn create_native_backend(
     _config: &SandboxConfigData,
 ) -> Result<std::convert::Infallible> {
     Err(crate::error::Error::UnsupportedPlatform)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_names_match_under_host_rules() {
+        assert!(env_name_eq("PATH", "PATH"));
+        assert!(!env_name_eq("PATH", "PATHEXT"));
+
+        #[cfg(windows)]
+        assert!(env_name_eq("Path", "PATH"));
+        #[cfg(not(windows))]
+        assert!(!env_name_eq("Path", "PATH"));
+    }
 }

@@ -4,7 +4,8 @@
 //! the proxy is a loopback listener, so every filtering policy depends on
 //! this. The exemption is machine-wide and keyed on the container SID: adding
 //! it reads the firewall's table, inserts the SID when absent and writes it
-//! back; the guard removes it again on drop.
+//! back. An ephemeral container holds a guard that removes the exemption on
+//! drop; a named identity retains it until the identity is removed.
 //!
 //! The read-modify-write is not atomic — two sandboxes launched at the same
 //! moment can lose one another's entries — but it is a line in a shared table
@@ -98,10 +99,7 @@ impl Drop for Config {
     }
 }
 
-/// The loopback exemption granted to one container.
-///
-/// Dropping the guard withdraws the container's permission to reach the
-/// proxy on loopback.
+/// An ephemeral container's loopback exemption, withdrawn on drop.
 #[derive(Debug)]
 pub(crate) struct LoopbackExemption {
     /// The container's package SID, kept to remove on drop.
@@ -111,35 +109,46 @@ pub(crate) struct LoopbackExemption {
 impl LoopbackExemption {
     /// Add `sid` to the firewall's loopback table, unless it is already there.
     pub(crate) fn add(sid: Sid) -> io::Result<Self> {
+        Self::ensure(&sid)?;
+        Ok(Self { sid })
+    }
+
+    /// Ensure `sid` stays in the firewall's loopback table.
+    pub(crate) fn ensure(sid: &Sid) -> io::Result<()> {
+        Self::update(sid, true)
+    }
+
+    /// Remove `sid` from the firewall's loopback table.
+    pub(crate) fn remove_persistent(sid: &Sid) -> io::Result<()> {
+        Self::update(sid, false)
+    }
+
+    fn update(sid: &Sid, present: bool) -> io::Result<()> {
         let config = Config::get()?;
         let ours = sid.as_psid();
         let mut entries = config.entries().to_vec();
-        let present = entries.iter().any(|entry|
+        let had_entry = entries.iter().any(|entry|
             // SAFETY: both arguments are valid SIDs for the call.
             unsafe { EqualSid(entry.Sid, ours) }.is_ok());
-        if !present {
+
+        if present && !had_entry {
             entries.push(SID_AND_ATTRIBUTES {
                 Sid: ours,
                 Attributes: 0,
             });
+        } else if !present && had_entry {
+            entries.retain(|entry|
+                // SAFETY: both arguments are valid SIDs for the call.
+                unsafe { EqualSid(entry.Sid, ours) }.is_err());
+        } else {
+            return Ok(());
         }
-        Config::set(&entries)?;
-        Ok(Self { sid })
+        Config::set(&entries)
     }
 
     /// Take the SID back out of the table.
     fn remove(&self) -> io::Result<()> {
-        let config = Config::get()?;
-        let ours = self.sid.as_psid();
-        let entries: Vec<_> = config
-            .entries()
-            .iter()
-            .copied()
-            .filter(|entry|
-                // SAFETY: both arguments are valid SIDs for the call.
-                unsafe { EqualSid(entry.Sid, ours) }.is_err())
-            .collect();
-        Config::set(&entries)
+        Self::remove_persistent(&self.sid)
     }
 }
 

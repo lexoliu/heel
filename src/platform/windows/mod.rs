@@ -15,10 +15,12 @@ mod acl;
 mod capability;
 mod child;
 mod container;
+pub(crate) mod identity;
 mod launch;
 #[cfg(test)]
 mod launch_tests;
 mod loopback;
+mod machine_lock;
 mod priority;
 mod profile;
 mod sid;
@@ -29,6 +31,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Output;
 
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
+
 pub(crate) use child::AppContainerChild;
 use container::Container;
 use loopback::LoopbackExemption;
@@ -36,7 +40,7 @@ use sid::Sid;
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
-use crate::platform::{Backend, Child, SpawnRequest};
+use crate::platform::{Backend, Child, SpawnRequest, env_name_eq};
 
 /// A launch-prep failure that names the call which produced it.
 ///
@@ -81,30 +85,31 @@ impl Win32Failure {
     fn io(call: &'static str) -> impl FnOnce(io::Error) -> Self {
         move |source| Self::Io { call, source }
     }
+
+    /// Build a failure for the Rust-side call `call`, naming `path` in its
+    /// source error.
+    fn io_at<'a>(call: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> Self + 'a {
+        move |source| Self::Io {
+            call,
+            source: io::Error::other(format!("{}: {source}", path.display())),
+        }
+    }
 }
 
-/// Variables a launched process inherits from the parent when the request is
-/// silent.
+/// Variables a launched process inherits when the request does not replace
+/// the parent's environment.
 ///
 /// A custom environment replaces the parent's entirely, and a process without
 /// `SystemRoot` or `ComSpec` fails before its first instruction, so these are
 /// filled in when nothing supplied them. Windows compares names
 /// case-insensitively, so the check does too — a `PATH` the caller spelled
 /// `Path` must not be duplicated.
-const INHERITED_VARIABLES: &[&str] = &[
-    "SystemRoot",
-    "windir",
-    "ComSpec",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-    "PATH",
-];
+const INHERITED_VARIABLES: &[&str] = &["SystemRoot", "windir", "ComSpec", "PATHEXT", "PATH"];
 
 /// Machine facts a Windows process expects to find in its environment.
 ///
-/// The inherited variables already fill in `SystemRoot`, `windir`, `ComSpec`,
-/// `PATHEXT` and the temp variables. These are the rest of what the loader
+/// The inherited variables already fill in `SystemRoot`, `windir`, `ComSpec`
+/// and `PATHEXT`. These are the rest of what the loader
 /// and the C runtime consult, and they describe the machine rather than the
 /// user, so passing them through leaks nothing: the user's own variables stay
 /// out.
@@ -125,18 +130,14 @@ const MACHINE_FACTS: &[&str] = &[
     "CommonProgramW6432",
 ];
 
-/// Variables naming the user's own directories.
-///
-/// An AppContainer's per-container profile lives under
-/// `%LOCALAPPDATA%\Packages`, and Windows resolves it from the environment of
-/// the process being created, so a container started without these cannot be
-/// given a profile to run in.
+/// User directories retained from the parent environment.
 ///
 /// They name the user, which a sandbox would rather not disclose, but nothing
-/// is disclosed that was not already: the working directory sits inside the
-/// user's temp directory and is handed to the process as `TEMP`, so its path
-/// carries the user's name regardless.
-const USER_DIRECTORIES: &[&str] = &["USERPROFILE", "LOCALAPPDATA", "APPDATA", "ALLUSERSPROFILE"];
+/// is disclosed that was not already: the container's temporary directory sits
+/// under the user's profile, so its path carries the user's name regardless.
+/// The remaining entries are passed for what Windows and the C runtime consult.
+/// `LOCALAPPDATA` is set separately from the profile folder.
+const USER_DIRECTORIES: &[&str] = &["USERPROFILE", "APPDATA", "ALLUSERSPROFILE"];
 
 /// Windows sandbox backend.
 #[derive(Debug)]
@@ -145,8 +146,8 @@ pub struct WindowsBackend {
 }
 
 impl WindowsBackend {
-    /// Create the AppContainer this sandbox's processes will run in, and open
-    /// the configured paths to it.
+    /// Open or create the AppContainer this sandbox's processes will run in,
+    /// and open the configured paths to it.
     ///
     /// The paths are granted here rather than at the first launch because
     /// Windows grants by inheritance: setting the entries propagates them to
@@ -155,10 +156,13 @@ impl WindowsBackend {
     ///
     /// # Errors
     ///
-    /// Returns an error if the AppContainer profile cannot be created, or if a
-    /// configured path cannot be opened to it.
+    /// Returns an error if the AppContainer profile cannot be opened or
+    /// created, or if a configured path cannot be opened to it.
     pub fn new(config: &SandboxConfigData) -> Result<Self> {
-        let container = Container::create()?;
+        let container = match config.identity() {
+            Some(identity) => Container::named(identity)?.0,
+            None => Container::create()?,
+        };
         container.grant_configured_paths(config)?;
         Ok(Self { container })
     }
@@ -174,8 +178,8 @@ impl WindowsBackend {
 
     /// Prepare everything one launch needs.
     ///
-    /// Returns the program, the capability and the loopback exemption, the
-    /// last of which must outlive the process it is granted for.
+    /// Returns the program, capabilities and loopback exemption, the last of
+    /// which must outlive the process it is granted for.
     fn prepare(&self, request: &SpawnRequest<'_>) -> Result<Prepared> {
         // The container has to read the program to run it. Anything under the
         // system directories is already open to every package; a program
@@ -184,22 +188,38 @@ impl WindowsBackend {
             .envs
             .iter()
             .rev()
-            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .find(|(name, _)| env_name_eq(name, "PATH"))
             .map(|(_, value)| value);
-        let program = which::which_in(request.program, path, request.working_dir())
-            .map_err(|source| Error::path(request.program, std::io::Error::other(source)))?;
-        self.container.grant_program(&program)?;
+        // A program that does not resolve names the search it failed: the
+        // sandbox's PATH is computed from the request and the passthrough
+        // list, so the caller cannot otherwise tell which one it was.
+        let program =
+            which::which_in(request.program, path, request.working_dir()).map_err(|source| {
+                let pathext = std::env::var_os("PATHEXT");
+                Error::path(
+                    request.program,
+                    std::io::Error::other(format!(
+                        "{source} (PATH searched: {}; PATHEXT: {})",
+                        path.map_or("unset", String::as_str),
+                        pathext
+                            .as_deref()
+                            .map_or("unset".into(), |ext| ext.to_string_lossy()),
+                    )),
+                )
+            })?;
+        let capabilities = self.container.capabilities(request.proxy_port.is_some())?;
+        self.container.grant_program(&program, &capabilities)?;
 
         // A proxy port means a filtering policy, which only works if the
         // container may reach the proxy on loopback.
         let loopback = match request.proxy_port {
-            Some(_) => Some(self.container.exempt_loopback()?),
+            Some(_) => self.container.exempt_loopback()?,
             None => None,
         };
 
         Ok(Prepared {
             program,
-            capability: self.container.capabilities(request.proxy_port.is_some())?,
+            capabilities,
             loopback,
         })
     }
@@ -214,11 +234,15 @@ impl WindowsBackend {
         // crate asks for the same thing on all three anyway.
         let options = launch::Launch {
             package: self.container.sid(),
-            capability: prepared.capability.as_ref(),
+            capabilities: &prepared.capabilities,
             exe: prepared.program,
             cmdline: command_line(&request),
             cwd: request.working_dir().to_path_buf(),
-            env: environment(&request),
+            env: environment(
+                &request,
+                self.container.local_app_data(),
+                self.container.profile_folder(),
+            ),
             stdio: stdio(request.stdout),
             memory_bytes: limits
                 .max_memory_bytes()
@@ -257,16 +281,30 @@ impl WindowsBackend {
 /// variable and reads like something else entirely. Inherited variables are
 /// appended to whatever the request supplied, so sorting has to happen after
 /// them rather than at the point the variables are collected.
-fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
+fn environment(
+    request: &SpawnRequest<'_>,
+    local_app_data: &Path,
+    profile_folder: &Path,
+) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = request
         .envs
         .iter()
         .map(|(key, value)| (key.into(), value.into()))
         .collect();
 
+    // Variables the caller named for pass-through join whatever the request
+    // already carries. What the request supplies wins where the two overlap.
+    for name in request.config.env_passthrough() {
+        if let Some(value) = std::env::var_os(name)
+            && !supplied(&env, name)
+        {
+            env.push((name.into(), value));
+        }
+    }
+
     for name in MACHINE_FACTS.iter().chain(USER_DIRECTORIES) {
         if let Some(value) = std::env::var_os(name)
-            && !env.iter().any(|(existing, _)| existing == name)
+            && !supplied(&env, name)
         {
             env.push(((*name).into(), value));
         }
@@ -274,18 +312,40 @@ fn environment(request: &SpawnRequest<'_>) -> Vec<(OsString, OsString)> {
 
     for name in INHERITED_VARIABLES {
         if let Some(value) = std::env::var_os(name)
-            && !env.iter().any(|(existing, _)| {
-                existing
-                    .as_encoded_bytes()
-                    .eq_ignore_ascii_case(name.as_bytes())
-            })
+            && !supplied(&env, name)
         {
             env.push(((*name).into(), value));
         }
     }
 
+    // Windows rewrites a child's LOCALAPPDATA to
+    // `<LOCALAPPDATA>\Packages\<profile>\AC` and derives TEMP/TMP beneath it.
+    // GetAppContainerFolderPath reports the existing profile folder; passing
+    // its validated base makes the rewritten value name that folder. The
+    // explicit TEMP/TMP values match what Windows derives, and TMPDIR follows
+    // TEMP for programs that consult it.
+    env.retain(|(name, _)| {
+        !["LOCALAPPDATA", "TEMP", "TMP", "TMPDIR"]
+            .iter()
+            .any(|reserved| env_name_eq(name, reserved))
+    });
+    let temp = profile_folder.join("Temp");
+    env.push(("LOCALAPPDATA".into(), local_app_data.as_os_str().to_owned()));
+    env.push(("TEMP".into(), temp.as_os_str().to_owned()));
+    env.push(("TMP".into(), temp.as_os_str().to_owned()));
+    env.push(("TMPDIR".into(), temp.as_os_str().to_owned()));
+
     env.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_lowercase());
     env
+}
+
+/// Whether `env` already supplies `name`.
+///
+/// Windows compares variable names case-insensitively, so the check does too:
+/// a `PATH` the request spelled `Path` must not sit beside the variable being
+/// filled in behind it.
+fn supplied(env: &[(OsString, OsString)], name: &str) -> bool {
+    env.iter().any(|(existing, _)| env_name_eq(existing, name))
 }
 
 /// Summarize a launch's environment for a failure message.
@@ -336,12 +396,25 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
         .collect()
 }
 
+/// A `LocalAlloc` allocation released when it goes out of scope.
+pub(crate) struct LocalBuffer(pub(crate) *mut core::ffi::c_void);
+
+impl Drop for LocalBuffer {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the pointer came from an API documented to return
+            // `LocalAlloc` memory, and is freed exactly once.
+            unsafe { LocalFree(Some(HLOCAL(self.0))) };
+        }
+    }
+}
+
 /// Everything one launch needs, built before the process starts.
 struct Prepared {
     /// The resolved path to the program to run.
     program: std::path::PathBuf,
-    /// `internetClient`, when the process may reach the proxy.
-    capability: Option<Sid>,
+    /// Capabilities the process receives.
+    capabilities: Vec<Sid>,
     /// The loopback exemption, held for the life of the process.
     loopback: Option<LoopbackExemption>,
 }

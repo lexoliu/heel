@@ -11,8 +11,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::Deserialize;
 use serde::de::{Deserializer, Visitor};
+use serde::{Deserialize, Serialize};
 
 /// The operations a [`Grant`] permits.
 ///
@@ -85,6 +85,15 @@ impl fmt::Display for Access {
             f.write_str("x")?;
         }
         Ok(())
+    }
+}
+
+impl Serialize for Access {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 
@@ -219,6 +228,23 @@ mod tests {
         assert!(!Access::WRITE.can_execute());
         assert!(Access::EXEC.can_execute());
         assert!(!Access::EXEC.can_write());
+    }
+
+    #[test]
+    fn access_round_trips_as_a_mode_string() {
+        for (access, mode) in [
+            (Access::READ, "r"),
+            (Access::WRITE, "rw"),
+            (Access::EXEC, "rx"),
+            (Access::WRITE | Access::EXEC, "rwx"),
+        ] {
+            let json = serde_json::to_string(&access).expect("the access serializes");
+            assert_eq!(json, format!("\"{mode}\""));
+            assert_eq!(
+                serde_json::from_str::<Access>(&json).expect("the access deserializes"),
+                access
+            );
+        }
     }
 
     #[test]

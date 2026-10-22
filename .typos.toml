@@ -1,3 +1,8 @@
+[default]
+# SDDL access-control entries such as `(A;;GA;;;BA)` spell trustees as
+# two-letter aliases.
+extend-ignore-re = ['\((?:A|D);[^()]*\)']
+
 [default.extend-words]
 ANE = "ANE"
 ane = "ane"

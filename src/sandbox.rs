@@ -223,6 +223,9 @@ impl<N: NetworkPolicy> Sandbox<N> {
     ) -> Result<Self> {
         let (policy, mut config_data, router) = config.into_parts();
 
+        #[cfg(not(windows))]
+        config_data.adopt_persistent_grants();
+
         // Create and canonicalize the working directory before anything else
         // derives paths from it.
         let requested_dir = config_data.working_dir().to_path_buf();
@@ -569,12 +572,11 @@ mod tests {
     #[test]
     fn temporary_files_land_somewhere_the_sandbox_can_write() {
         // The guarantee is that temporary files have a writable home inside the
-        // sandbox, not that it sits at a particular path. On Unix the sandbox
-        // points `TMPDIR` at its working directory. Windows decides for itself:
-        // an AppContainer is given a private temp directory inside its own
-        // package folder, which nothing outside the container can read, and
-        // that redirection overrides whatever `TEMP` is set to. Both satisfy
-        // the guarantee, so it is the behaviour that is asserted.
+        // sandbox, not that it sits at a particular path. On Unix the command
+        // layer points `TMPDIR` at the working directory. On Windows the backend
+        // sets `TEMP`, `TMP` and `TMPDIR` to a private directory inside the
+        // AppContainer's profile folder. Both satisfy the guarantee, so it is
+        // the behaviour that is asserted.
         smol::block_on(async {
             let sandbox = Sandbox::new().await.unwrap();
             let output = shell(&sandbox, ROUND_TRIP_THROUGH_TEMP).await;

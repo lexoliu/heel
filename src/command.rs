@@ -6,7 +6,7 @@ use std::process::{ExitStatus, Output, Stdio};
 
 use crate::config::SandboxConfigData;
 use crate::error::Result;
-use crate::platform::{Backend, Child, NativeBackend, SpawnRequest};
+use crate::platform::{Backend, Child, NativeBackend, SpawnRequest, env_name_eq};
 use crate::sandbox::ProcessTracker;
 
 /// The `PATH` a sandboxed process gets when nothing else specifies one.
@@ -266,14 +266,9 @@ impl<'a> Command<'a> {
 
 /// The variables that name the directory for temporary files.
 ///
-/// Unix programs read `TMPDIR`; the Windows runtimes read `TEMP` and `TMP`, and
-/// a sandboxed process that consulted the host's would be writing where it has
-/// no permission. `TMPDIR` is set on Windows too, for ported tools that look
-/// for it.
-#[cfg(windows)]
-const TEMP_DIR_VARS: &[&str] = &["TEMP", "TMP", "TMPDIR"];
-
-/// The variables that name the directory for temporary files.
+/// Unix programs read `TMPDIR`, which this layer points at the working
+/// directory. On Windows, the backend sets `TEMP`, `TMP` and `TMPDIR` to the
+/// container's own temporary folder.
 #[cfg(not(windows))]
 const TEMP_DIR_VARS: &[&str] = &["TMPDIR"];
 
@@ -296,16 +291,27 @@ pub(crate) fn sandbox_environment(
         }
     }
 
-    // The working directory is the one place a sandboxed process can always
-    // write, so it is also where temporary files belong. Strict mode denies the
-    // shared temp directories outright.
+    // On Unix, the working directory is the one place a sandboxed process can
+    // always write, so it is also where temporary files belong. Strict mode
+    // denies the shared temp directories outright.
+    #[cfg(not(windows))]
     let working_dir = config.working_dir().display().to_string();
+    #[cfg(not(windows))]
     for key in TEMP_DIR_VARS {
         envs.insert((*key).to_string(), working_dir.clone());
     }
 
     for (key, value) in user_envs {
-        envs.insert(key.clone(), value.clone());
+        // Windows compares environment names case-insensitively, so a `Path`
+        // the caller spelled differently is stored under the canonical name:
+        // left as spelled it would sit beside the computed `PATH` in one
+        // block, and which of the two the child reads is not ours to say.
+        let key = if env_name_eq(key, "PATH") {
+            "PATH"
+        } else {
+            key.as_str()
+        };
+        envs.insert(key.to_string(), value.clone());
     }
 
     if let Some(socket) = config.ipc_socket() {
@@ -327,15 +333,14 @@ fn sandbox_path(config: &SandboxConfigData, user_envs: &[(String, String)]) -> S
     let base = user_envs
         .iter()
         .rev()
-        .find(|(key, _)| key == "PATH")
+        .find(|(key, _)| env_name_eq(key, "PATH"))
         .map(|(_, value)| value.clone())
         .or_else(|| {
             config
                 .env_passthrough()
                 .iter()
-                .any(|var| var == "PATH")
-                .then(|| std::env::var("PATH").ok())
-                .flatten()
+                .find(|var| env_name_eq(var, "PATH"))
+                .and_then(|var| std::env::var(var).ok())
         })
         .unwrap_or_else(default_sandbox_path);
 

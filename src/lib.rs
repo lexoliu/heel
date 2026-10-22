@@ -40,8 +40,10 @@
 //!
 //! # Filesystem
 //!
-//! Sandboxed processes may always read and write their working directory, which
-//! is also exported as `TMPDIR`. Everything else is opt-in through
+//! Sandboxed processes may always read and write their working directory. On
+//! Unix it is also exported as `TMPDIR`; on Windows the backend sets `TEMP`,
+//! `TMP` and `TMPDIR` to the container's own temporary folder. Everything else
+//! is opt-in through
 //! [`SandboxConfigBuilder::grant`], which pairs a path with the [`Access`] the
 //! sandbox has to it, and no location a process can write to may be executed.
 //! An [`Access::EXEC`] grant is the deliberate exception: it may name a single
@@ -55,6 +57,24 @@
 //!     .readable("/usr/share")
 //!     .grant("target", Access::WRITE | Access::EXEC)
 //!     .build();
+//! ```
+//!
+//! # Stable identities
+//!
+//! A named identity can retain access to a toolchain directory across Windows
+//! sandboxes. Prepare it while installing the toolchain; on macOS and Linux,
+//! persistent grants are ordinary policy grants for each sandbox.
+//!
+//! ```rust,ignore
+//! use heel::{Access, Grant, Identity, SandboxConfig};
+//!
+//! let identity = Identity::named("toolchain")?
+//!     .persistent_grant(Grant::new("/opt/rust", Access::READ));
+//!
+//! // Run while installing the toolchain.
+//! identity.prepare()?;
+//!
+//! let config = SandboxConfig::builder().identity(identity).build();
 //! ```
 //!
 //! # Python
@@ -85,6 +105,7 @@ mod command;
 mod config;
 mod error;
 mod grant;
+mod identity;
 pub mod ipc;
 mod network;
 mod platform;
@@ -106,6 +127,7 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use grant::{Access, Grant, ParseAccessError};
+pub use identity::Identity;
 pub use ipc::{CommandMeta, IpcClient, IpcCommand, IpcError, IpcRouter, NoArgs};
 pub use network::{
     AllowAll, AllowList, Audited, CustomPolicy, DenyAll, DomainRequest, NetworkAuditLog,
