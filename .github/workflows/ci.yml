@@ -26,7 +26,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A release-plz bump changes workspace versions and the changelog and
+  # nothing else, so it cannot change what a compiler, a test or an audit
+  # observes beyond the version string, and the jobs that build or audit the
+  # crate skip it. Typos still reads the changelog it wrote. The script reads
+  # the diff rather than the branch name: code pushed onto a release branch
+  # runs every job. A job skipped by `if:` reports success.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.bump.outputs.only != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Version-only diff
+        id: bump
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          only=$(python3 -I .github/scripts/version-only.py "$(git merge-base "$BASE" "$HEAD")" "$HEAD")
+          echo "only=$only" >> "$GITHUB_OUTPUT"
+
   lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Lint
     runs-on: ubuntu-latest
     steps:
@@ -46,6 +73,8 @@ jobs:
   # dead helpers unnoticed. `cargo clippy` needs a target's standard library but
   # never links, so both are lintable from this runner without a Windows one.
   cross-lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Cross-target Lint
     runs-on: ubuntu-latest
     steps:
@@ -63,6 +92,8 @@ jobs:
         run: cargo clippy --target aarch64-unknown-linux-gnu --all-targets --all-features -- -D warnings
 
   coverage:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Coverage
     runs-on: ubuntu-latest
     steps:
@@ -88,6 +119,8 @@ jobs:
       - uses: crate-ci/typos@v1
 
   audit:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
@@ -102,6 +135,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   unused-deps:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Unused Dependencies
     runs-on: ubuntu-latest
     steps:
@@ -114,6 +149,8 @@ jobs:
       - run: cargo machete
 
   feature-checks:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Features
     runs-on: ubuntu-latest
     steps:
@@ -127,5 +164,7 @@ jobs:
       - run: cargo hack check --feature-powerset --no-dev-deps
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Test
     uses: ./.github/workflows/test.yml
