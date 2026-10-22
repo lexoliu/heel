@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/lexoliu/heel/compare/heel-v0.5.0...heel-v0.5.1) - 2026-10-22
+
+### Added
+
+- *(windows)* stable AppContainer identity with persistent grants ([#91](https://github.com/lexoliu/heel/pull/91))
+
+### Fixed
+
+- *(windows)* serialize concurrent opens of one named profile across processes
+- *(windows)* keep auto-inheritance on this-object ACL writes
+- *(windows)* keep AppContainer temp paths in profile ([#89](https://github.com/lexoliu/heel/pull/89))
+- *(windows)* respect AppContainer ACE trustees ([#90](https://github.com/lexoliu/heel/pull/90))
+- *(windows)* serialize ACL updates ([#69](https://github.com/lexoliu/heel/pull/69))
+- *(windows)* name the PATH and PATHEXT an unresolvable program was searched with
+- *(windows)* honor env_passthroughs and match PATH without case
+
+### Other
+
+- *(windows)* share the inherited-ACE test helper ([#91](https://github.com/lexoliu/heel/pull/91))
+- *(windows)* make persistent-grant ACL fixtures auto-inherited ([#91](https://github.com/lexoliu/heel/pull/91))
+- compare macOS profile paths canonically ([#91](https://github.com/lexoliu/heel/pull/91))
+- *(windows)* build the auto-inherited directory the ACL test needs ([#95](https://github.com/lexoliu/heel/pull/95))
+- Merge pull request #94 from lexoliu/fix/89-container-temp
+- let typos skip SDDL entries
+- *(windows)* share one environment-name matcher across launch and PATH selection
+
 ## [0.5.0](https://github.com/lexoliu/heel/compare/heel-v0.4.2...heel-v0.5.0) - 2026-10-18
 
 ### Fixed
