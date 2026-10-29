@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/lexoliu/heel/compare/heel-v0.5.1...heel-v0.6.0) - 2026-10-29
+
+### Added
+
+- deny credential reads and persistence writes on Linux through a seccomp broker
+
+### Fixed
+
+- *(test)* number O_TMPFILE per architecture and allow Linux interface names in typos
+- *(windows)* honour filesystem_strict and refuse writable_file_system
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/106-credential-read-policy
+- skip the build and audit jobs on a version-only diff
+
 ## [0.5.1](https://github.com/lexoliu/heel/compare/heel-v0.5.0...heel-v0.5.1) - 2026-10-22
 
 ### Added
