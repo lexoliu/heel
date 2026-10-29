@@ -301,20 +301,15 @@ async fn exit_codes_are_reported_faithfully() {
 }
 
 #[tokio::test]
-async fn a_missing_configured_path_is_an_error_rather_than_a_silent_denial() {
+async fn a_missing_configured_path_fails_sandbox_creation() {
     let config = SandboxConfigBuilder::default()
         .readable("/definitely/not/a/real/path")
         .build();
-    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
-        .await
-        .expect("sandbox starts");
-
-    let error = sandbox
-        .command("/bin/echo")
-        .arg("hello")
-        .output()
-        .await
-        .expect_err("a path that cannot be granted must fail");
+    let error =
+        match Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await {
+            Ok(_) => panic!("a path that cannot be granted must fail creation"),
+            Err(error) => error,
+        };
 
     assert!(
         error.to_string().contains("/definitely/not/a/real/path"),

@@ -56,6 +56,9 @@ pub(crate) struct SpawnRequest<'a> {
     /// Policy-independent sandbox configuration.
     pub config: &'a SandboxConfigData,
     /// Port of the sandbox proxy, when network access is enabled.
+    ///
+    /// macOS bakes it into the profile generated with the sandbox.
+    #[cfg_attr(target_os = "macos", expect(dead_code))]
     pub proxy_port: Option<u16>,
     /// Program to run.
     pub program: &'a str,
@@ -108,13 +111,25 @@ pub(crate) type NativeBackend = windows::WindowsBackend;
 
 /// Create the native backend for the current platform.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-pub(crate) fn create_native_backend(config: &SandboxConfigData) -> Result<NativeBackend> {
-    NativeBackend::new(config)
+pub(crate) fn create_native_backend(
+    config: &SandboxConfigData,
+    proxy_port: Option<u16>,
+) -> Result<NativeBackend> {
+    #[cfg(windows)]
+    config.require_enforceable()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return NativeBackend::new(config, proxy_port);
+    #[cfg(target_os = "windows")]
+    {
+        let _ = proxy_port;
+        NativeBackend::new(config)
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub(crate) fn create_native_backend(
     _config: &SandboxConfigData,
+    _proxy_port: Option<u16>,
 ) -> Result<std::convert::Infallible> {
     Err(crate::error::Error::UnsupportedPlatform)
 }
