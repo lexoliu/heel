@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/lexoliu/heel/compare/heel-v0.7.0...heel-v0.7.1) - 2026-10-29
+
+### Fixed
+
+- *(windows)* run a named identity's deny-all sandboxes under a profile that is never loopback-exempt
+
 ## [0.7.0](https://github.com/lexoliu/heel/compare/heel-v0.6.0...heel-v0.7.0) - 2026-10-29
 
 ### Added
