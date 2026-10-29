@@ -297,24 +297,31 @@ impl ChildHook {
 /// `/proc/sys/kernel/yama/ptrace_scope`, when Yama is loaded.
 const YAMA_SCOPE: &str = "/proc/sys/kernel/yama/ptrace_scope";
 
+/// The highest `kernel.yama.ptrace_scope` under which a parent can read its child.
+const MAX_PTRACE_SCOPE: u8 = 1;
+
 /// Refuse a kernel whose Yama setting stops a parent from reading its child.
 fn check_ptrace_scope() -> Result<()> {
     match std::fs::read_to_string(YAMA_SCOPE) {
-        Ok(text) => {
-            let scope: u32 = text.trim().parse().map_err(|_| {
-                Error::InitFailed(format!("cannot read {YAMA_SCOPE}: {}", text.trim()))
-            })?;
-            if scope >= 2 {
-                return Err(Error::InitFailed(format!(
-                    "the broker reads the memory of the processes it serves, which {YAMA_SCOPE} = \
-                     {scope} forbids; set it to 1 or lower"
-                )));
-            }
-            Ok(())
-        }
+        Ok(text) => parse_ptrace_scope(&text),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(Error::path(YAMA_SCOPE, error)),
     }
+}
+
+/// Judge the contents of [`YAMA_SCOPE`].
+fn parse_ptrace_scope(text: &str) -> Result<()> {
+    let scope: u8 = text
+        .trim()
+        .parse()
+        .map_err(|_| Error::InitFailed(format!("cannot read {YAMA_SCOPE}: {}", text.trim())))?;
+    if scope > MAX_PTRACE_SCOPE {
+        return Err(Error::PtraceScopeTooStrict {
+            scope,
+            max: MAX_PTRACE_SCOPE,
+        });
+    }
+    Ok(())
 }
 
 impl Broker {
@@ -328,8 +335,7 @@ impl Broker {
         if !denylists && proxy_port.is_none() {
             return Ok(None);
         }
-        notify::check_sizes()
-            .map_err(|error| Error::InitFailed(format!("seccomp user notification: {error}")))?;
+        notify::check_sizes()?;
         check_ptrace_scope()?;
 
         let abi = REQUIRED_ABI;
@@ -520,5 +526,44 @@ fn launch(
             }
         });
         let _ = job.reply.send(outcome);
+    }
+}
+
+#[cfg(test)]
+mod ptrace_scope_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_scopes_the_broker_works_under() {
+        for text in ["0\n", "1\n"] {
+            parse_ptrace_scope(text).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_stricter_scopes_with_a_typed_error() {
+        let error = parse_ptrace_scope("2\n").unwrap_err();
+        assert!(matches!(
+            error,
+            Error::PtraceScopeTooStrict { scope: 2, max: 1 }
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("kernel.yama.ptrace_scope is 2"),
+            "{message}"
+        );
+        assert!(message.contains("needs 1 or lower"), "{message}");
+        assert!(matches!(
+            parse_ptrace_scope("3").unwrap_err(),
+            Error::PtraceScopeTooStrict { scope: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn garbage_is_not_a_scope() {
+        assert!(matches!(
+            parse_ptrace_scope("lots").unwrap_err(),
+            Error::InitFailed(_)
+        ));
     }
 }

@@ -49,7 +49,7 @@ pub(crate) enum Reply {
 /// Check that the kernel's notification structures are the ones this build was
 /// written against. They have not changed since the interface appeared, so a
 /// difference is a kernel this code has not been checked against.
-pub(crate) fn check_sizes() -> io::Result<()> {
+pub(crate) fn check_sizes() -> crate::error::Result<()> {
     let mut sizes = MaybeUninit::<libc::seccomp_notif_sizes>::zeroed();
     // SAFETY: `SECCOMP_GET_NOTIF_SIZES` writes one `seccomp_notif_sizes`.
     let result = unsafe {
@@ -61,7 +61,9 @@ pub(crate) fn check_sizes() -> io::Result<()> {
         )
     };
     if result != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(crate::error::Error::SeccompNotifyUnavailable(
+            io::Error::last_os_error(),
+        ));
     }
     // SAFETY: the call succeeded, so the structure is initialized.
     let sizes = unsafe { sizes.assume_init() };
@@ -78,7 +80,7 @@ pub(crate) fn check_sizes() -> io::Result<()> {
     if actual == expected {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
+        Err(crate::error::Error::InitFailed(format!(
             "the kernel's seccomp notification structures are {actual:?} bytes, not the \
              {expected:?} this build knows"
         )))

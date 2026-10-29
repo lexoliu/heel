@@ -2,14 +2,16 @@ use napi::bindgen_prelude::*;
 
 /// Convert a heel error into a NAPI error with a descriptive code.
 ///
-/// The match is exhaustive on purpose: a new error variant should fail this
-/// build rather than silently fall into a generic bucket.
+/// `heel::Error` is `#[non_exhaustive]`, so the match needs a wildcard arm;
+/// every variant known today is listed so each keeps its own code.
 pub fn convert_error(err: heel::Error) -> Error {
     let code = match &err {
         heel::Error::UnsupportedPlatform => "ERR_UNSUPPORTED_PLATFORM",
         heel::Error::UnsupportedPlatformVersion { .. } => "ERR_UNSUPPORTED_PLATFORM_VERSION",
         heel::Error::UnsupportedSetting { .. } => "ERR_UNSUPPORTED_SETTING",
         heel::Error::InitFailed(_) => "ERR_INIT_FAILED",
+        heel::Error::PtraceScopeTooStrict { .. } => "ERR_PTRACE_SCOPE",
+        heel::Error::SeccompNotifyUnavailable(_) => "ERR_SECCOMP_NOTIFY_UNAVAILABLE",
         heel::Error::NotEnforced(_) => "ERR_NOT_ENFORCED",
         heel::Error::InvalidProfile(_) => "ERR_INVALID_PROFILE",
         heel::Error::Path { .. } => "ERR_PATH",
@@ -24,6 +26,7 @@ pub fn convert_error(err: heel::Error) -> Error {
         heel::Error::Io(_) => "ERR_IO",
         heel::Error::Ipc(_) => "ERR_IPC",
         heel::Error::Pty(_) => "ERR_PTY",
+        _ => "ERR_UNKNOWN",
     };
 
     Error::new(Status::GenericFailure, format!("[{code}] {err}"))
