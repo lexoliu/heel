@@ -69,23 +69,15 @@ trait Probes {
 
     /// Write to `path`, which lies outside the sandbox.
     fn write(path: &Path) -> String;
-
-    /// Remove the directory `dir`, leaving the shell outside it, and put a
-    /// link to `target` where it was, in one command: the sandbox's own working
-    /// directory may be the one removed, and no later process could start
-    /// there. The command exits [`REMOVE_FAILED`] when the removal is denied and
-    /// [`LINK_FAILED`] when the link is, so a failure says which step it was.
-    fn swap_for_link(dir: &Path, target: &Path) -> String;
 }
 
-/// The exit code of a swap command that could not leave the directory it
-/// removes (Windows only: the unix command leaves for `/`).
-const LEAVE_FAILED: u32 = 20;
-
-/// The exit code of a swap command whose removal of the directory failed.
+/// The exit code of the unix swap command whose removal of the directory
+/// failed.
+#[cfg(unix)]
 const REMOVE_FAILED: u32 = 21;
 
-/// The exit code of a swap command whose link could not be planted.
+/// The exit code of the unix swap command whose link could not be planted.
+#[cfg(unix)]
 const LINK_FAILED: u32 = 22;
 
 /// The probes for this platform.
@@ -111,15 +103,6 @@ impl Probes for Platform {
 
     fn write(path: &Path) -> String {
         format!("printf %s escaped > {}", path.display())
-    }
-
-    fn swap_for_link(dir: &Path, target: &Path) -> String {
-        format!(
-            "cd / && {{ rmdir {dir} || exit {REMOVE_FAILED}; }} && \
-             {{ ln -s {target} {dir} || exit {LINK_FAILED}; }}",
-            dir = dir.display(),
-            target = target.display()
-        )
     }
 }
 
@@ -162,28 +145,6 @@ impl Probes for Platform {
 
     fn write(path: &Path) -> String {
         format!("echo escaped> {}", path.display())
-    }
-
-    // A junction, because creating one needs no privilege: it is what a
-    // sandboxed process can actually plant.
-    // Each step reports itself, because the cause of "Access is denied" on a
-    // sandboxed `mklink` is not established: it may be the removal or the
-    // mount point. The step's own message and exit code are in the failure.
-    // The shell leaves the directory for its parent, which the test grants
-    // and so is a directory the sandbox can enter, rather than for
-    // `%SystemRoot%`, which a package is not promised to enter: the first
-    // run with `cd /d %SystemRoot%` failed with exit code 1, a code none of
-    // the mapped steps can produce, so it was that `cd`.
-    fn swap_for_link(dir: &Path, target: &Path) -> String {
-        let parent = dir.parent().expect("the swapped directory has a parent");
-        format!(
-            "(cd /d {parent} || (echo cd failed & exit /b {LEAVE_FAILED})) \
-             && (rmdir /S /Q {dir} || (echo rmdir failed & exit /b {REMOVE_FAILED})) \
-             && (mklink /J {dir} {target} || (echo mklink failed & exit /b {LINK_FAILED}))",
-            parent = parent.display(),
-            dir = dir.display(),
-            target = target.display()
-        )
     }
 }
 
@@ -400,12 +361,9 @@ async fn writing_to(granted: &[heel::ResolvedPath]) -> heel::Result<Sandbox> {
 /// directory inside it that is the thing swapped, and a directory elsewhere
 /// that must stay out of reach.
 ///
-/// The swapped directory's parent is readable and writable too: removing a
-/// directory needs the right to change its parent on Linux and Windows, and a
-/// grant nested in another is how a sandbox ends up able to do it. A write-only
-/// grant is not enough on Windows: removing the directory's contents lists it,
-/// and entering the parent asks for `FILE_TRAVERSE`, which on a directory is
-/// the execute right.
+/// The swapped directory's parent is writable too: removing a directory needs
+/// the right to change its parent on Linux and Windows, and a grant nested in
+/// another is how a sandbox ends up able to do it.
 struct Swap {
     _guard: tempfile::TempDir,
     parent: std::path::PathBuf,
@@ -429,51 +387,61 @@ impl Swap {
         }
     }
 
-    /// The sandboxed process replaces the swapped directory with a link to the
-    /// target, then tries to write through the link. The swap must have
-    /// happened, the write must have run and failed, and nothing may have
-    /// reached the target.
-    async fn plant_and_write_through(&self, sandbox: &Sandbox) {
-        let swapped = shell(
-            sandbox,
-            &Platform::swap_for_link(&self.swapped, &self.target),
-        )
-        .await;
-        #[cfg(windows)]
-        let diagnostic = if swapped.status.success() {
-            String::new()
-        } else {
-            let parent = self.swapped.parent().expect("has a parent");
-            let host = std::process::Command::new("icacls")
-                .arg(parent)
-                .output()
-                .expect("icacls runs");
-            let inside = shell(
-                sandbox,
-                &format!(
-                    "cd & dir {p} & icacls {p} & cd /d {p} & cd",
-                    p = parent.display()
-                ),
-            )
-            .await;
-            format!(
-                "\ndiagnostic: parent {parent:?}\nhost icacls:\n{}\nsandboxed:\n{}{}",
-                stdout(&host),
-                stdout(&inside),
-                stderr(&inside)
-            )
-        };
-        #[cfg(not(windows))]
-        let diagnostic = String::new();
+    /// Replace the swapped directory with a link to the target.
+    ///
+    /// On unix the sandboxed process does it, in one command because its own
+    /// working directory may be the one removed and no later process could
+    /// start there; the command exits [`REMOVE_FAILED`] or [`LINK_FAILED`] so
+    /// a failure says which step it was.
+    #[cfg(unix)]
+    async fn plant_link(&self, sandbox: &Sandbox) {
+        let script = format!(
+            "cd / && {{ rmdir {dir} || exit {REMOVE_FAILED}; }} && \
+             {{ ln -s {target} {dir} || exit {LINK_FAILED}; }}",
+            dir = self.swapped.display(),
+            target = self.target.display()
+        );
+        let swapped = shell(sandbox, &script).await;
         assert!(
             swapped.status.success(),
             "the sandboxed process must be able to plant the link (exit code {:?}: \
-             {LEAVE_FAILED} is leaving the directory, {REMOVE_FAILED} the removal, \
-             {LINK_FAILED} the link): {}{}{diagnostic}",
+             {REMOVE_FAILED} is the removal, {LINK_FAILED} the link): {}{}",
             swapped.status.code(),
             stdout(&swapped),
             stderr(&swapped)
         );
+    }
+
+    /// Replace the swapped directory with a link to the target.
+    ///
+    /// On Windows the host does it, as a junction (which needs no privilege):
+    /// a sandboxed process cannot list or enter a granted directory there
+    /// (lexoliu/heel#131), so it cannot reach the swap. What the guarantee is
+    /// about is unchanged: the sandbox cannot write through the planted link,
+    /// and the next build refuses the redirected grant.
+    #[cfg(windows)]
+    async fn plant_link(&self, _sandbox: &Sandbox) {
+        std::fs::remove_dir_all(&self.swapped).expect("the host removes the directory");
+        let mklink = std::process::Command::new("cmd.exe")
+            .args(["/C", "mklink", "/J"])
+            .arg(&self.swapped)
+            .arg(&self.target)
+            .output()
+            .expect("cmd.exe runs");
+        assert!(
+            mklink.status.success(),
+            "the host must create the junction (exit code {:?}): {}{}",
+            mklink.status.code(),
+            stdout(&mklink),
+            stderr(&mklink)
+        );
+    }
+
+    /// The swapped directory becomes a link to the target, then the sandboxed
+    /// process tries to write through it. The swap must have happened, the
+    /// write must have run and failed, and nothing may have reached the target.
+    async fn plant_and_write_through(&self, sandbox: &Sandbox) {
+        self.plant_link(sandbox).await;
         assert!(
             std::fs::symlink_metadata(&self.swapped)
                 .expect("the swapped path exists")
@@ -524,23 +492,17 @@ async fn a_grant_the_sandbox_replaced_with_a_link_fails_the_next_build() {
     // write through the link, and the next sandbox must not follow it: the
     // link's target would become writable.
     let swap = Swap::new();
-    let parent = fixtures::resolved(&swap.parent);
-    let swapped = fixtures::resolved(&swap.swapped);
-    let build = || {
-        let config = SandboxConfigBuilder::default()
-            .grant(
-                parent.clone(),
-                heel::Access::READ | heel::Access::WRITE | heel::Access::EXEC,
-            )
-            .writable(swapped.clone())
-            .build();
-        Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
-    };
-    let sandbox = build().await.expect("the unchanged grant builds");
+    let grants = [
+        fixtures::resolved(&swap.parent),
+        fixtures::resolved(&swap.swapped),
+    ];
+    let sandbox = writing_to(&grants)
+        .await
+        .expect("the unchanged grant builds");
 
     swap.plant_and_write_through(&sandbox).await;
 
-    let error = build()
+    let error = writing_to(&grants)
         .await
         .err()
         .expect("a granted path behind a link must refuse the build");
@@ -559,10 +521,7 @@ async fn a_working_directory_the_sandbox_replaced_with_a_link_fails_the_next_bui
     let parent = fixtures::resolved(&swap.parent);
     let config = |swap: &Swap| {
         SandboxConfigBuilder::default()
-            .grant(
-                parent.clone(),
-                heel::Access::READ | heel::Access::WRITE | heel::Access::EXEC,
-            )
+            .writable(parent.clone())
             .working_dir(&swap.swapped)
             .build()
     };
