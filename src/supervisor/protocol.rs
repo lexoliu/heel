@@ -27,6 +27,25 @@ pub struct TreeReport {
     pub survivors: Vec<LeftoverProcess>,
 }
 
+/// Why the supervisor could not start the command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{message}")]
+pub struct SpawnFailure {
+    /// The OS error number (`ENOENT`, `EACCES`, ...), when the failure had one.
+    pub os_error: Option<i32>,
+    /// What the OS said.
+    pub message: String,
+}
+
+impl From<&std::io::Error> for SpawnFailure {
+    fn from(error: &std::io::Error) -> Self {
+        Self {
+            os_error: error.raw_os_error(),
+            message: error.to_string(),
+        }
+    }
+}
+
 /// How long the supervisor lives, which is what `heel supervise` is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -74,6 +93,13 @@ pub(crate) enum Event {
     Leftover(TreeReport),
     /// A [`Request::Kill`] was carried out.
     Killed(TreeReport),
+    /// The command could not be started; nothing ran.
+    SpawnFailed(SpawnFailure),
+    /// The command had not exited when the teardown budget ran out. The report
+    /// is the teardown's, and names what was still alive.
+    CommandUnreaped(TreeReport),
+    /// The supervisor failed, after tearing down what it could.
+    Failed(String),
     /// The supervisor is exiting on its own account: the last thing it says.
     Done,
 }

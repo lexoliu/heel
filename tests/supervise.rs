@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use heel::supervisor::{Background, Foreground};
-use heel::{Sandbox, SandboxConfigBuilder};
+use heel::{Error, Sandbox, SandboxConfigBuilder};
 
 /// Long enough for a loaded CI machine, short enough to fail a stuck test.
 const BOUND: Duration = Duration::from_secs(30);
@@ -63,6 +63,23 @@ async fn pid_file(dir: &Path, name: &str) -> u32 {
 /// Whether the kernel still lists `pid`, as a zombie or otherwise.
 fn listed(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The fields of `/proc/<pid>/stat` after the name: state, ppid, pgrp, session.
+fn stat_fields(pid: u32) -> Option<Vec<String>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.get(stat.rfind(')')? + 1..)?;
+    Some(after_name.split_whitespace().map(str::to_owned).collect())
+}
+
+/// The kernel's state letter for `pid`, `Z` for a zombie.
+fn state(pid: u32) -> Option<char> {
+    stat_fields(pid)?.first()?.chars().next()
+}
+
+/// Whether `pid` is a session leader, which `setsid` makes it.
+fn leads_its_session(pid: u32) -> bool {
+    stat_fields(pid).is_some_and(|fields| fields.get(3).and_then(|id| id.parse().ok()) == Some(pid))
 }
 
 /// `(pid, ppid)` of every process.
@@ -149,26 +166,35 @@ async fn a_setsid_descendant_that_outlives_its_parent_is_killed_and_reported() {
 #[tokio::test]
 async fn a_background_command_stays_until_its_descendant_exits() {
     let sandbox = sandbox().await;
-    let script = "echo $$ > shell; \
-                  setsid sh -c 'while [ ! -e release ]; do sleep 0.05; done' & \
-                  echo $! > helper";
+    // The shell exits only once the helper has left its session, so the helper
+    // is outside the supervisor's process group when it is orphaned: the case a
+    // reap limited to that group cannot see. Field 6 of the stat line is the
+    // session, which is the helper's own pid after `setsid`.
+    let script = "setsid sh -c 'while [ ! -e release ]; do sleep 0.05; done' & pid=$!; \
+                  echo $pid > helper; \
+                  until [ \"$(cut -d' ' -f6 /proc/$pid/stat)\" = \"$pid\" ]; do sleep 0.01; done; \
+                  echo $$ > shell";
     let mut child = sandbox
         .command("/bin/sh")
         .args(["-c", script])
         .spawn_supervised(Background { reap_timeout: REAP })
         .await
         .expect("spawns");
+    let supervisor = child.id();
 
     let dir = sandbox.working_dir();
     let shell = pid_file(dir, "shell").await;
     let helper = pid_file(dir, "helper").await;
-    eventually("the shell to be reaped", || !listed(shell)).await;
+    eventually("the supervisor to reap the shell", || !listed(shell)).await;
+    // A supervisor that was going to exit on reaping the shell does so within
+    // moments, and would be a zombie of this process by then.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(
-        child.child_mut().try_wait().unwrap().is_none(),
+        state(supervisor).is_some_and(|state| state != 'Z'),
         "the supervisor outlives the command while a descendant runs"
     );
-    assert!(listed(helper), "the helper is still running");
+    assert!(leads_its_session(helper), "the helper is still running");
 
     std::fs::write(dir.join("release"), "").unwrap();
     let status = bounded("the background command", child.wait())
@@ -176,7 +202,7 @@ async fn a_background_command_stays_until_its_descendant_exits() {
         .expect("the supervisor reports");
 
     assert!(status.success(), "the command's status is kept: {status:?}");
-    assert!(!listed(helper));
+    assert!(!listed(helper), "the helper is gone, zombie included");
 }
 
 #[tokio::test]
@@ -225,8 +251,11 @@ async fn a_tree_kill_ends_every_descendant_including_a_forking_loop() {
 #[tokio::test]
 async fn no_zombie_remains_under_the_host() {
     let sandbox = sandbox().await;
-    let script = "setsid sleep 300 & setsid sleep 300 & echo $! > last; \
-                  sleep 0.2; exit 0";
+    // Both helpers are in sessions of their own before the shell exits.
+    let script = "setsid sleep 300 & a=$!; setsid sleep 300 & b=$!; \
+                  for pid in $a $b; do \
+                    until [ \"$(cut -d' ' -f6 /proc/$pid/stat)\" = \"$pid\" ]; do sleep 0.01; done; \
+                  done; exit 0";
     let mut child = sandbox
         .command("/bin/sh")
         .args(["-c", script])
@@ -294,4 +323,85 @@ async fn killing_a_tree_that_has_already_ended_is_not_an_error() {
         .await
         .expect("an ended tree is already killed");
     assert!(report.killed.is_empty() && report.survivors.is_empty());
+}
+
+/// A command that leaves a `setsid` helper behind and stays in the foreground.
+const SETSID_HELPER: &str = "setsid sleep 300 & echo $! > helper; wait";
+
+/// Spawn [`SETSID_HELPER`] and return the helper, once it is in its own session.
+async fn spawn_with_helper(
+    sandbox: &Sandbox,
+) -> (heel::supervisor::SupervisedChild<Background>, u32) {
+    let child = sandbox
+        .command("/bin/sh")
+        .args(["-c", SETSID_HELPER])
+        .spawn_supervised(Background { reap_timeout: REAP })
+        .await
+        .expect("spawns");
+    let helper = pid_file(sandbox.working_dir(), "helper").await;
+    eventually("the helper to leave the session", || {
+        leads_its_session(helper)
+    })
+    .await;
+    (child, helper)
+}
+
+#[tokio::test]
+async fn dropping_the_sandbox_leaves_no_setsid_descendant_running() {
+    let sandbox = sandbox().await;
+    let (child, helper) = spawn_with_helper(&sandbox).await;
+    let supervisor = child.id();
+
+    // The handle is still alive: the sandbox ends the tree through the
+    // supervisor, and does not signal the supervisor's process group, which the
+    // helper has left.
+    drop(sandbox);
+
+    assert!(!listed(helper), "the helper survived the sandbox");
+    assert!(!listed(supervisor), "the supervisor is reaped");
+    drop(child);
+}
+
+#[tokio::test]
+async fn dropping_the_handle_then_the_sandbox_leaves_no_setsid_descendant_running() {
+    let sandbox = sandbox().await;
+    let (child, helper) = spawn_with_helper(&sandbox).await;
+    let supervisor = child.id();
+
+    // Closing the control socket makes the supervisor tear the tree down; the
+    // sandbox then waits for that teardown instead of racing it.
+    drop(child);
+    drop(sandbox);
+
+    assert!(!listed(helper), "the helper survived the sandbox");
+    assert!(!listed(supervisor), "the supervisor is reaped");
+}
+
+#[tokio::test]
+async fn a_command_that_cannot_start_is_a_typed_spawn_error_in_both_modes() {
+    let sandbox = sandbox().await;
+
+    let mut foreground = sandbox
+        .command("/nonexistent/program")
+        .spawn_supervised(Foreground { reap_timeout: REAP })
+        .await
+        .expect("the supervisor starts");
+    match bounded("the foreground spawn failure", foreground.wait()).await {
+        Err(Error::SupervisedSpawnFailed(failure)) => {
+            assert_eq!(failure.os_error, Some(libc::ENOENT), "{failure}");
+        }
+        other => panic!("expected a spawn failure, got {other:?}"),
+    }
+
+    let mut background = sandbox
+        .command("/nonexistent/program")
+        .spawn_supervised(Background { reap_timeout: REAP })
+        .await
+        .expect("the supervisor starts");
+    match bounded("the background spawn failure", background.wait()).await {
+        Err(Error::SupervisedSpawnFailed(failure)) => {
+            assert_eq!(failure.os_error, Some(libc::ENOENT), "{failure}");
+        }
+        other => panic!("expected a spawn failure, got {other:?}"),
+    }
 }

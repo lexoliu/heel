@@ -22,7 +22,11 @@
 //! is treated as success because the process is gone, unless the pid space
 //! wraps inside that one pass.
 //!
-//! `waitpid(-1)` is safe for the same reason: every child is the command's.
+//! Reaping waits for *any* child (`wait4(-1)`, rustix's `wait`), never
+//! `waitpid(None)`: that one is `wait4(0)` and sees only children in the
+//! supervisor's own process group, which a `setsid` descendant has left. Taking
+//! every child is safe for the same reason as above: every child is the
+//! command's.
 //!
 //! # Wake-ups
 //!
@@ -30,7 +34,7 @@
 //! the host's control socket. Nothing here sleeps or polls on a timer: the
 //! only timeout is the budget a teardown gets to see its processes die.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
@@ -43,11 +47,12 @@ use std::time::{Duration, Instant};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
 use rustix::process::{
-    Pid, Signal, WaitOptions, getpid, kill_process, set_child_subreaper, waitpid,
+    Pid, Resource, Rlimit, Signal, WaitOptions, getpid, kill_process, set_child_subreaper,
+    setrlimit, wait,
 };
 
 use super::procfs;
-use super::protocol::{Event, LeftoverProcess, Mode, Request, TreeReport};
+use super::protocol::{Event, LeftoverProcess, Mode, Request, SpawnFailure, TreeReport};
 
 /// What `heel supervise` was asked to run.
 #[derive(Debug)]
@@ -77,8 +82,10 @@ pub struct Config {
 ///
 /// # Errors
 ///
-/// Fails if the supervisor cannot be set up, the command cannot be started, or
-/// the command had not exited when the teardown budget ran out.
+/// Fails if the supervisor cannot be set up, the command cannot be started, the
+/// supervisor fails while serving, or the command had not exited when the
+/// teardown budget ran out. The host is told which, before this returns, and
+/// whatever the supervisor had frozen has been killed.
 pub fn run(config: Config) -> io::Result<i32> {
     let Config {
         mode,
@@ -87,6 +94,11 @@ pub fn run(config: Config) -> io::Result<i32> {
         program,
         args,
     } = config;
+
+    // An ignored `SIGCHLD` survives `exec` and makes the kernel reap children
+    // behind our back, which would hide the command's status and every member
+    // from `wait`.
+    reset_child_signal()?;
 
     // Descendants must not inherit the host's socket: its closing is how the
     // supervisor learns the host is gone.
@@ -100,6 +112,7 @@ pub fn run(config: Config) -> io::Result<i32> {
         Ok(command) => command,
         Err(error) => {
             // Nothing was started, so there is nothing left to account for.
+            send(&control, &Event::SpawnFailed(SpawnFailure::from(&error)))?;
             send(&control, &Event::Done)?;
             return Err(error);
         }
@@ -122,20 +135,67 @@ pub fn run(config: Config) -> io::Result<i32> {
         frozen: BTreeSet::new(),
         killed: BTreeSet::new(),
     };
-    supervisor.serve()?;
-    send(&supervisor.control, &Event::Done)?;
+    let report = match supervisor.serve() {
+        Ok(report) => report,
+        Err(error) => {
+            // The tree must not outlive the supervisor, whatever went wrong.
+            if let Err(teardown) = supervisor.kill_tree(supervisor.reap_timeout) {
+                tracing::warn!(%teardown, "the teardown after a failure failed too");
+            }
+            supervisor.tell(&Event::Failed(error.to_string()));
+            supervisor.tell(&Event::Done);
+            return Err(error);
+        }
+    };
 
-    let status = supervisor.command_status.ok_or_else(|| {
-        io::Error::other("the command had not exited when the teardown budget ran out")
-    })?;
+    let Some(status) = supervisor.command_status else {
+        supervisor.tell(&Event::CommandUnreaped(report));
+        supervisor.tell(&Event::Done);
+        return Err(io::Error::other(
+            "the command had not exited when the teardown budget ran out",
+        ));
+    };
+    send(&supervisor.control, &Event::Done)?;
     Ok(exit_like(status))
 }
 
+/// Give `SIGCHLD` its default action, which ignores the signal without the
+/// kernel's auto-reaping.
+fn reset_child_signal() -> io::Result<()> {
+    // SAFETY: an all-zero `sigaction` with `SIG_DFL` as its handler and no
+    // flags is a valid value, and the action of `SIGCHLD` may be replaced.
+    let result = unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGCHLD, &raw const action, std::ptr::null_mut())
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// End this process the way the command ended.
+///
+/// A command that dumped core did so itself. Re-raising its signal would dump
+/// the supervisor's core too, into the sandbox or to the system's collector
+/// under the name `heel`, so core dumps are switched off first: the host sees
+/// the same signal, without a core-dump bit, which would otherwise describe the
+/// supervisor and not the command.
 fn exit_like(status: ExitStatus) -> i32 {
     let Some(signal) = status.signal() else {
         return status.code().unwrap_or(1);
     };
+    if status.core_dumped() {
+        let none = Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        };
+        if let Err(error) = setrlimit(Resource::Core, none) {
+            tracing::warn!(%error, "could not disable core dumps before re-raising");
+        }
+    }
     // SAFETY: restoring the default action of a signal and raising it at
     // ourselves touches no memory. The default is restored first because the
     // runtime ignores `SIGPIPE`, which would otherwise swallow the re-raise.
@@ -143,7 +203,9 @@ fn exit_like(status: ExitStatus) -> i32 {
         libc::signal(signal, libc::SIG_DFL);
         libc::raise(signal);
     }
-    // Reached only for a signal whose default is not to terminate.
+    // Reached only if raising the signal did not end this process, as for the
+    // init of a pid namespace. The shell convention then still tells the host
+    // that a signal ended the command.
     128 + signal
 }
 
@@ -180,17 +242,27 @@ struct Supervisor {
 }
 
 impl Supervisor {
-    /// Run until the tree is gone or has been torn down.
-    fn serve(&mut self) -> io::Result<()> {
+    /// Tell the host something while already failing: a failure to do so is
+    /// logged, not allowed to hide the one being reported.
+    fn tell(&self, event: &Event) {
+        if let Err(error) = send(&self.control, event) {
+            tracing::warn!(%error, "could not tell the host");
+        }
+    }
+
+    /// Run until the tree is gone or has been torn down, returning the report
+    /// of the teardown (empty when there was none to make).
+    fn serve(&mut self) -> io::Result<TreeReport> {
         loop {
             let descendants = self.reap()?;
             if self.command_status.is_some() {
                 match self.mode {
                     Mode::Foreground => {
                         let report = self.kill_tree(self.reap_timeout)?;
-                        return send(&self.control, &Event::Leftover(report));
+                        send(&self.control, &Event::Leftover(report.clone()))?;
+                        return Ok(report);
                     }
-                    Mode::Background if !descendants => return Ok(()),
+                    Mode::Background if !descendants => return Ok(TreeReport::default()),
                     Mode::Background => {}
                 }
             }
@@ -198,12 +270,10 @@ impl Supervisor {
                 Wake::Child => {}
                 Wake::Kill => {
                     let report = self.kill_tree(self.reap_timeout)?;
-                    return send(&self.control, &Event::Killed(report));
+                    send(&self.control, &Event::Killed(report.clone()))?;
+                    return Ok(report);
                 }
-                Wake::HostGone => {
-                    self.kill_tree(self.reap_timeout)?;
-                    return Ok(());
-                }
+                Wake::HostGone => return self.kill_tree(self.reap_timeout),
             }
         }
     }
@@ -259,7 +329,7 @@ impl Supervisor {
     /// Returns whether any child is left.
     fn reap(&mut self) -> io::Result<bool> {
         loop {
-            match waitpid(None, WaitOptions::NOHANG) {
+            match wait(WaitOptions::NOHANG) {
                 Ok(Some((pid, status))) => {
                     let pid = pid_number(pid);
                     // The pid is free again, to be handed to a new member.
@@ -282,9 +352,51 @@ impl Supervisor {
     ///
     /// The report names every process that was running when the tree was
     /// frozen (read then, so a process that had only just forked shows the
-    /// program it execed), and every one still alive when the budget ran out.
+    /// program it execed), and every member still alive when the budget ran
+    /// out, frozen or not.
+    ///
+    /// On an error, everything frozen so far is killed and reaped before the
+    /// error is returned: a stopped member left behind would stay stopped
+    /// under init for good.
     fn kill_tree(&mut self, budget: Duration) -> io::Result<TreeReport> {
         let deadline = Instant::now() + budget;
+        match self.teardown(deadline) {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                self.abort_freeze(deadline);
+                Err(error)
+            }
+        }
+    }
+
+    /// Kill and reap what a failed teardown had frozen, within `deadline`. A
+    /// failure here is logged: the caller returns the error that led here.
+    fn abort_freeze(&mut self, deadline: Instant) {
+        for &pid in &self.frozen {
+            if let Err(error) = signal(pid, Signal::KILL) {
+                tracing::warn!(pid, %error, "could not kill a frozen member");
+            }
+        }
+        loop {
+            match self.reap() {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "could not reap after a failed teardown");
+                    return;
+                }
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            if let Err(error) = self.block_for_child(remaining) {
+                tracing::warn!(%error, "could not wait after a failed teardown");
+                return;
+            }
+        }
+    }
+
+    fn teardown(&mut self, deadline: Instant) -> io::Result<TreeReport> {
         let mut killed = Vec::new();
         loop {
             self.freeze(deadline)?;
@@ -304,9 +416,11 @@ impl Supervisor {
                     });
                 }
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    // Members the freeze never reached are alive too, so the
+                    // survivors come from the table, not from `frozen`.
                     return Ok(TreeReport {
                         killed,
-                        survivors: describe(self.frozen.iter().copied())?,
+                        survivors: self.live_members()?,
                     });
                 };
                 // A process forked in the instant before its parent stopped
@@ -350,6 +464,33 @@ impl Supervisor {
                 return Ok(());
             }
         }
+    }
+
+    /// Every running process whose chain of parents leads to this one.
+    fn live_members(&self) -> io::Result<Vec<LeftoverProcess>> {
+        let table = procfs::snapshot()?;
+        let parents: HashMap<u32, u32> =
+            table.iter().map(|entry| (entry.pid, entry.ppid)).collect();
+        let descends = |start: u32| {
+            let mut pid = start;
+            // A chain longer than the table is a loop.
+            for _ in 0..=parents.len() {
+                match parents.get(&pid) {
+                    Some(&parent) if parent == self.own => return true,
+                    Some(&parent) => pid = parent,
+                    None => return false,
+                }
+            }
+            false
+        };
+        Ok(table
+            .iter()
+            .filter(|entry| !entry.is_zombie() && descends(entry.pid))
+            .map(|entry| LeftoverProcess {
+                pid: entry.pid,
+                name: entry.name.clone(),
+            })
+            .collect())
     }
 
     fn has_unfrozen_child(&self) -> io::Result<bool> {

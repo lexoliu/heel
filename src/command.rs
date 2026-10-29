@@ -292,7 +292,16 @@ impl<'a> Command<'a> {
                 binary.display()
             ))
         })?;
-        let (host, inherited) = std::os::unix::net::UnixStream::pair()?;
+        let (host, supervisor_end) = std::os::unix::net::UnixStream::pair()?;
+        // Above the standard streams: `std` installs those over the child's
+        // descriptors 0-2 before `exec`, which would replace the socket if it
+        // had landed on one of them (a host started with a stream closed).
+        let inherited =
+            rustix::io::fcntl_dupfd_cloexec(&supervisor_end, 3).map_err(std::io::Error::from)?;
+        // Our only other copy of it, closed so the host sees the supervisor's
+        // exit as the end of the stream.
+        drop(supervisor_end);
+        let shared = crate::supervisor::Shared::new(host, mode.reap_timeout())?;
         let arguments = crate::supervisor::arguments(
             mode.mode(),
             inherited.as_raw_fd(),
@@ -317,9 +326,12 @@ impl<'a> Command<'a> {
         // The supervisor holds its end now; keeping ours would hide its exit.
         drop(inherited);
 
-        self.process_tracker.register(child.id());
+        // Dropping the sandbox ends the tree through the supervisor, not by
+        // signalling its process group.
+        self.process_tracker
+            .register_supervisor(child.id(), std::sync::Arc::downgrade(&shared));
         let child = child.with_tracker(self.process_tracker.clone());
-        crate::supervisor::SupervisedChild::new(child, host, mode.reap_timeout())
+        Ok(crate::supervisor::SupervisedChild::new(child, shared))
     }
 }
 

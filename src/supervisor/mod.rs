@@ -14,6 +14,10 @@
 //! - [`TreeControl::kill`] ends the tree on request, in either mode, and
 //!   reports survivors as an error.
 //!
+//! Dropping the [`Sandbox`](crate::Sandbox) ends a supervised tree through its
+//! supervisor too (a kill request, then reaping the supervisor), never by
+//! signalling its process group, which would hand every `setsid` member to init.
+//!
 //! The supervisor reports the command's exit status unchanged: the host
 //! waiting on the spawned [`Child`](crate::Child) sees the command's status.
 //!
@@ -25,10 +29,10 @@ mod procfs;
 mod protocol;
 mod run;
 
-pub(crate) use host::arguments;
 pub use host::{
     Background, Foreground, ForegroundExit, SupervisedChild, Supervision, TreeControl,
     TreeKillError,
 };
-pub use protocol::{LeftoverProcess, Mode, TreeReport};
+pub(crate) use host::{Shared, arguments};
+pub use protocol::{LeftoverProcess, Mode, SpawnFailure, TreeReport};
 pub use run::{Config, run};

@@ -2,9 +2,10 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::marker::PhantomData;
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::process::ExitStatus;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use blocking::unblock;
@@ -12,7 +13,7 @@ use blocking::unblock;
 use crate::error::{Error, Result};
 use crate::platform::Child;
 
-use super::protocol::{Event, Mode, Request, TreeReport, reap_timeout_argument};
+use super::protocol::{Event, Mode, Request, SpawnFailure, TreeReport, reap_timeout_argument};
 
 mod sealed {
     pub trait Sealed {}
@@ -105,9 +106,14 @@ impl Supervision for Background {
 #[non_exhaustive]
 pub enum TreeKillError {
     /// Processes were still alive after `SIGKILL` and the reap budget, for
-    /// example one stuck in an uninterruptible kernel call.
-    #[error("{} process(es) of the tree survived SIGKILL", .0.survivors.len())]
+    /// example one stuck in an uninterruptible kernel call; or the budget ran
+    /// out before the whole tree was frozen.
+    #[error("{} process(es) of the tree survived the kill", .0.survivors.len())]
     Survived(TreeReport),
+    /// The supervisor failed while tearing the tree down. It killed what it had
+    /// frozen first, but processes it had not reached may still run.
+    #[error("the supervisor failed: {0}")]
+    SupervisorFailed(String),
     /// The supervisor ended without answering, so nothing is known about the
     /// tree.
     #[error("the supervisor ended without reporting the kill")]
@@ -117,91 +123,223 @@ pub enum TreeKillError {
     Io(#[from] std::io::Error),
 }
 
+/// How the supervisor ended other than by a clean report.
+#[derive(Debug)]
+enum Ending {
+    /// The command could not be started.
+    Spawn(SpawnFailure),
+    /// The command was still unreaped when the teardown budget ran out.
+    Unreaped(TreeReport),
+    /// The supervisor failed.
+    Failed(String),
+}
+
 /// What the supervisor has said so far.
-struct Inbox {
-    from_supervisor: BufReader<UnixStream>,
+#[derive(Debug, Default)]
+struct State {
     /// The latest teardown report.
     report: Option<TreeReport>,
+    /// How many teardown reports have arrived.
+    reports: u64,
+    /// A failure the supervisor reported before its last word.
+    ending: Option<Ending>,
     /// The supervisor said its last word.
     done: bool,
     /// The socket reached its end.
     closed: bool,
 }
 
-impl Inbox {
-    /// Take in one message, returning it.
-    fn next(&mut self) -> std::io::Result<Option<Event>> {
-        let mut line = String::new();
-        if self.from_supervisor.read_line(&mut line)? == 0 {
-            self.closed = true;
-            return Ok(None);
-        }
-        let event: Event = serde_json::from_str(&line)?;
-        match &event {
+impl State {
+    fn ended(&self) -> bool {
+        self.done || self.closed
+    }
+
+    fn apply(&mut self, event: Event) {
+        match event {
             Event::Leftover(report) | Event::Killed(report) => {
-                self.report = Some(report.clone());
+                self.report = Some(report);
+                self.reports += 1;
             }
+            Event::SpawnFailed(failure) => self.ending = Some(Ending::Spawn(failure)),
+            Event::CommandUnreaped(report) => self.ending = Some(Ending::Unreaped(report)),
+            Event::Failed(message) => self.ending = Some(Ending::Failed(message)),
             Event::Done => self.done = true,
         }
-        Ok(Some(event))
+    }
+
+    /// What a kill request amounts to once the supervisor has ended.
+    fn kill_after_end(&self) -> std::result::Result<TreeReport, TreeKillError> {
+        match &self.ending {
+            Some(Ending::Failed(message)) => Err(TreeKillError::SupervisorFailed(message.clone())),
+            Some(Ending::Unreaped(report)) => Err(TreeKillError::Survived(report.clone())),
+            // Nothing was ever started, so there is no tree to kill.
+            Some(Ending::Spawn(_)) => Ok(TreeReport::default()),
+            None if self.done => survivors_or_empty(self.report.as_ref()),
+            None => Err(TreeKillError::SupervisorLost),
+        }
     }
 }
 
-struct Shared {
-    to_supervisor: UnixStream,
-    inbox: Mutex<Inbox>,
-    reap_timeout: Duration,
+/// The supervisor's messages as the reader thread has received them.
+#[derive(Debug, Default)]
+struct Mailbox {
+    state: Mutex<State>,
+    changed: Condvar,
 }
 
-impl Shared {
-    fn inbox(&self) -> MutexGuard<'_, Inbox> {
-        // A panic while reading leaves a consistent inbox: it only ever gains
-        // messages.
-        self.inbox
+impl Mailbox {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // A panic while holding the lock leaves a consistent state: it only
+        // ever gains messages.
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn kill(&self) -> std::result::Result<TreeReport, TreeKillError> {
-        let mut inbox = self.inbox();
-        if inbox.done {
-            // The supervisor finished by itself, which it does only when no
-            // descendant is left or after a teardown that has been reported.
-            return survivors_or_empty(inbox.report.as_ref());
-        }
-        if inbox.closed {
-            return Err(TreeKillError::SupervisorLost);
-        }
+    /// Block until `ready` holds of the state.
+    fn wait_until(&self, ready: impl Fn(&State) -> bool) -> MutexGuard<'_, State> {
+        self.changed
+            .wait_while(self.lock(), |state| !ready(state))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
-        let mut request = serde_json::to_vec(&Request::Kill).map_err(std::io::Error::from)?;
-        request.push(b'\n');
+    fn update(&self, change: impl FnOnce(&mut State)) {
+        change(&mut self.lock());
+        self.changed.notify_all();
+    }
+}
+
+/// Read the supervisor's messages until its end, whoever is asking.
+///
+/// This runs for as long as the supervisor does, so the supervisor never
+/// blocks on a full socket, however large its report. It stops at the end of
+/// the stream, which comes when the supervisor exits.
+fn read_events(mut from_supervisor: BufReader<UnixStream>, mailbox: &Mailbox) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match from_supervisor.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => match serde_json::from_str::<Event>(&line) {
+                Ok(event) => mailbox.update(|state| state.apply(event)),
+                Err(error) => {
+                    mailbox.update(|state| {
+                        state.ending = Some(Ending::Failed(format!(
+                            "an unreadable message from the supervisor: {error}"
+                        )));
+                    });
+                    break;
+                }
+            },
+            Err(error) => {
+                mailbox.update(|state| {
+                    state.ending = Some(Ending::Failed(format!(
+                        "reading from the supervisor failed: {error}"
+                    )));
+                });
+                break;
+            }
+        }
+    }
+    mailbox.update(|state| state.closed = true);
+}
+
+/// The host's end of the control socket, shared by everything that talks to
+/// one supervisor.
+#[derive(Debug)]
+pub(crate) struct Shared {
+    to_supervisor: UnixStream,
+    mailbox: Arc<Mailbox>,
+    reap_timeout: Duration,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Nobody on the host can ask for anything any more. The reader thread
+        // keeps its own copy of the socket open, so closing ours would not
+        // reach the supervisor; shutting down the write side does, and is what
+        // makes it tear the tree down.
+        let _ = self.to_supervisor.shutdown(Shutdown::Write);
+    }
+}
+
+impl Shared {
+    /// Start reading the supervisor's messages from `to_supervisor`.
+    pub(crate) fn new(
+        to_supervisor: UnixStream,
+        reap_timeout: Duration,
+    ) -> std::io::Result<Arc<Self>> {
+        let from_supervisor = BufReader::new(to_supervisor.try_clone()?);
+        let mailbox = Arc::new(Mailbox::default());
+        let reader = Arc::clone(&mailbox);
+        std::thread::Builder::new()
+            .name("heel-supervisor-reader".into())
+            .spawn(move || read_events(from_supervisor, &reader))?;
+        Ok(Arc::new(Self {
+            to_supervisor,
+            mailbox,
+            reap_timeout,
+        }))
+    }
+
+    fn send(&self, request: &Request) -> std::io::Result<()> {
+        let mut line = serde_json::to_vec(request).map_err(std::io::Error::from)?;
+        line.push(b'\n');
         // A supervisor that has already exited cannot be written to; what it
-        // said before leaving is read below.
-        match (&self.to_supervisor).write_all(&request) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(error) => return Err(error.into()),
-        }
-
-        match inbox.next()? {
-            Some(Event::Killed(report)) => survivors_or_report(report),
-            // The command ended first and the supervisor tore the tree down on
-            // its own: that is the report this kill was after.
-            Some(Event::Leftover(report)) => survivors_or_report(report),
-            Some(Event::Done) => survivors_or_empty(inbox.report.as_ref()),
-            None => Err(TreeKillError::SupervisorLost),
+        // said before leaving is in the mailbox.
+        match (&self.to_supervisor).write_all(&line) {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            other => other,
         }
     }
 
-    /// Read everything the supervisor says until its last word.
-    fn finish(&self) -> Result<Option<TreeReport>> {
-        let mut inbox = self.inbox();
-        while !inbox.done {
-            if inbox.next()?.is_none() {
-                return Err(Error::SupervisorLost);
-            }
+    /// Ask the supervisor to tear the tree down, without waiting for it.
+    ///
+    /// Nothing here takes a lock a waiter may be holding, so it works while
+    /// another task is waiting for the command.
+    pub(crate) fn request_teardown(&self) {
+        if let Err(error) = self.send(&Request::Kill) {
+            tracing::warn!(%error, "could not ask the supervisor to tear the tree down");
         }
-        Ok(inbox.report.take())
+    }
+
+    fn kill(&self) -> std::result::Result<TreeReport, TreeKillError> {
+        let seen = {
+            let state = self.mailbox.lock();
+            if state.ended() {
+                // The supervisor finished by itself, which it does only when no
+                // descendant is left or after a teardown that has been
+                // reported.
+                return state.kill_after_end();
+            }
+            state.reports
+        };
+
+        self.send(&Request::Kill)?;
+
+        let state = self
+            .mailbox
+            .wait_until(|state| state.reports > seen || state.ended());
+        match (&state.report, state.reports > seen) {
+            // Either the answer to this request or, when the command ended
+            // first, the supervisor's own teardown: the report this kill was
+            // after.
+            (Some(report), true) => survivors_or_report(report.clone()),
+            _ => state.kill_after_end(),
+        }
+    }
+
+    /// Wait for the supervisor's last word, returning the teardown report it
+    /// made, if any.
+    fn finish(&self) -> Result<Option<TreeReport>> {
+        let state = self.mailbox.wait_until(|state| state.ended());
+        match &state.ending {
+            Some(Ending::Spawn(failure)) => Err(Error::SupervisedSpawnFailed(failure.clone())),
+            Some(Ending::Unreaped(report)) => Err(Error::SupervisedCommandUnreaped(report.clone())),
+            Some(Ending::Failed(message)) => Err(Error::SupervisorFailed(message.clone())),
+            None if state.done => Ok(state.report.clone()),
+            None => Err(Error::SupervisorLost),
+        }
     }
 }
 
@@ -250,8 +388,9 @@ impl TreeControl {
     ///
     /// # Errors
     ///
-    /// [`TreeKillError::Survived`] when a process outlived the kill, with the
-    /// report naming it; it is never reported as success.
+    /// [`TreeKillError::Survived`] when a process outlived the kill, or the
+    /// budget ran out before the tree was frozen, with the report naming what
+    /// is still alive; it is never reported as success.
     pub async fn kill(&self) -> std::result::Result<TreeReport, TreeKillError> {
         let shared = Arc::clone(&self.shared);
         unblock(move || shared.kill()).await
@@ -262,6 +401,10 @@ impl TreeControl {
 ///
 /// The spawned process is the supervisor, which is the command's parent; the
 /// command's exit status is the supervisor's.
+///
+/// The tree is ended through the supervisor only: [`kill_tree`](Self::kill_tree),
+/// dropping this handle, or dropping the sandbox. Dropping the handle closes
+/// the supervisor's control socket, which makes it tear the tree down.
 #[derive(Debug)]
 pub struct SupervisedChild<M: Supervision> {
     child: Child,
@@ -270,28 +413,12 @@ pub struct SupervisedChild<M: Supervision> {
 }
 
 impl<M: Supervision> SupervisedChild<M> {
-    pub(crate) fn new(
-        child: Child,
-        to_supervisor: UnixStream,
-        reap_timeout: Duration,
-    ) -> Result<Self> {
-        let from_supervisor = BufReader::new(to_supervisor.try_clone()?);
-        Ok(Self {
+    pub(crate) fn new(child: Child, shared: Arc<Shared>) -> Self {
+        Self {
             child,
-            control: TreeControl {
-                shared: Arc::new(Shared {
-                    to_supervisor,
-                    inbox: Mutex::new(Inbox {
-                        from_supervisor,
-                        report: None,
-                        done: false,
-                        closed: false,
-                    }),
-                    reap_timeout,
-                }),
-            },
+            control: TreeControl { shared },
             mode: PhantomData,
-        })
+        }
     }
 
     /// The supervisor's process id, which is the root of the tree.
@@ -299,12 +426,34 @@ impl<M: Supervision> SupervisedChild<M> {
         self.child.id()
     }
 
-    /// The process handle, for the command's standard streams.
-    ///
-    /// Its `kill` signals the supervisor's process group only; use
-    /// [`kill_tree`](Self::kill_tree) to end the whole tree.
-    pub fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
+    /// The command's standard input, when it was piped.
+    pub fn stdin(&mut self) -> Option<&mut std::fs::File> {
+        self.child.stdin()
+    }
+
+    /// The command's standard output, when it was piped.
+    pub fn stdout(&mut self) -> Option<&mut std::fs::File> {
+        self.child.stdout()
+    }
+
+    /// The command's standard error, when it was piped.
+    pub fn stderr(&mut self) -> Option<&mut std::fs::File> {
+        self.child.stderr()
+    }
+
+    /// Take ownership of the command's standard input.
+    pub fn take_stdin(&mut self) -> Option<std::fs::File> {
+        self.child.take_stdin()
+    }
+
+    /// Take ownership of the command's standard output.
+    pub fn take_stdout(&mut self) -> Option<std::fs::File> {
+        self.child.take_stdout()
+    }
+
+    /// Take ownership of the command's standard error.
+    pub fn take_stderr(&mut self) -> Option<std::fs::File> {
+        self.child.take_stderr()
     }
 
     /// A handle to kill the tree while something else waits for the command.
@@ -326,13 +475,21 @@ impl<M: Supervision> SupervisedChild<M> {
     ///
     /// # Errors
     ///
-    /// [`Error::SupervisorLost`] when the supervisor ended without its last
-    /// report (it was killed from outside, so the tree may still be running).
+    /// - [`Error::SupervisedSpawnFailed`] when the command could not be
+    ///   started;
+    /// - [`Error::SupervisedCommandUnreaped`] when the command had not exited
+    ///   when the teardown budget ran out;
+    /// - [`Error::SupervisorFailed`] when the supervisor failed;
+    /// - [`Error::SupervisorLost`] when the supervisor ended without its last
+    ///   report (it was killed from outside, so the tree may still be running).
     pub async fn wait(&mut self) -> Result<M::Exit> {
-        let status = self.child.wait().await?;
         let shared = Arc::clone(&self.control.shared);
-        let report = unblock(move || shared.finish()).await?;
-        M::finish(status, report)
+        // Both at once: the supervisor's messages are read by their own
+        // thread, so neither side waits on the other.
+        let (status, report) =
+            futures_lite::future::zip(self.child.wait(), unblock(move || shared.finish())).await;
+        let status = status?;
+        M::finish(status, report?)
     }
 
     /// The budget a teardown gets, as this command was started with.
@@ -362,4 +519,98 @@ pub(crate) fn arguments(
     ];
     arguments.extend_from_slice(args);
     arguments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::supervisor::protocol::LeftoverProcess;
+
+    fn send_event(stream: &mut UnixStream, event: &Event) {
+        let mut line = serde_json::to_vec(event).unwrap();
+        line.push(b'\n');
+        stream.write_all(&line).unwrap();
+    }
+
+    #[test]
+    fn a_report_larger_than_the_socket_buffer_does_not_block_the_supervisor() {
+        let (host, mut supervisor) = UnixStream::pair().unwrap();
+        let shared = Shared::new(host, Duration::from_secs(1)).unwrap();
+
+        let report = TreeReport {
+            killed: (0..40_000)
+                .map(|pid| LeftoverProcess {
+                    pid,
+                    name: "sleep".into(),
+                })
+                .collect(),
+            survivors: Vec::new(),
+        };
+        let sent = report.clone();
+        // The writer finishes only if something reads while it writes; nothing
+        // on the host has asked for anything yet.
+        let writer = std::thread::spawn(move || {
+            send_event(&mut supervisor, &Event::Leftover(sent));
+            send_event(&mut supervisor, &Event::Done);
+        });
+        let received = shared.finish().unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(received, Some(report));
+    }
+
+    #[test]
+    fn a_kill_is_answered_with_the_report_made_for_it() {
+        let (host, mut supervisor) = UnixStream::pair().unwrap();
+        let shared = Shared::new(host, Duration::from_secs(1)).unwrap();
+        let answer = TreeReport {
+            killed: vec![LeftoverProcess {
+                pid: 9,
+                name: "sleep".into(),
+            }],
+            survivors: Vec::new(),
+        };
+        let sent = answer.clone();
+        let supervisor_side = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(supervisor.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(request.trim(), r#""Kill""#);
+            send_event(&mut supervisor, &Event::Killed(sent));
+            send_event(&mut supervisor, &Event::Done);
+        });
+
+        assert_eq!(shared.kill().unwrap(), answer);
+        supervisor_side.join().unwrap();
+        // A later kill sees the same teardown, not an empty tree.
+        assert_eq!(shared.kill().unwrap(), answer);
+    }
+
+    #[test]
+    fn a_spawn_failure_is_a_typed_error() {
+        let (host, mut supervisor) = UnixStream::pair().unwrap();
+        let shared = Shared::new(host, Duration::from_secs(1)).unwrap();
+        let failure = SpawnFailure {
+            os_error: Some(2),
+            message: "No such file or directory".into(),
+        };
+        send_event(&mut supervisor, &Event::SpawnFailed(failure.clone()));
+        send_event(&mut supervisor, &Event::Done);
+
+        match shared.finish() {
+            Err(Error::SupervisedSpawnFailed(found)) => assert_eq!(found, failure),
+            other => panic!("expected the spawn failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_supervisor_that_vanishes_is_lost() {
+        let (host, supervisor) = UnixStream::pair().unwrap();
+        let shared = Shared::new(host, Duration::from_secs(1)).unwrap();
+        drop(supervisor);
+
+        assert!(matches!(shared.finish(), Err(Error::SupervisorLost)));
+        assert!(matches!(shared.kill(), Err(TreeKillError::SupervisorLost)));
+    }
 }

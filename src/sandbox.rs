@@ -85,7 +85,17 @@ fn search_path_for_binary(name: &str) -> Option<PathBuf> {
 /// Tracks the processes spawned inside a sandbox so they can be killed on drop.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProcessTracker {
-    pids: Arc<Mutex<Vec<u32>>>,
+    pids: Arc<Mutex<Vec<Tracked>>>,
+}
+
+/// One process the sandbox spawned.
+#[derive(Debug)]
+struct Tracked {
+    pid: u32,
+    /// The control socket of the supervisor this process is, if it is one.
+    /// Weak, so that the host dropping its handles still closes the socket.
+    #[cfg(target_os = "linux")]
+    supervisor: Option<std::sync::Weak<crate::supervisor::Shared>>,
 }
 
 impl ProcessTracker {
@@ -99,7 +109,7 @@ impl ProcessTracker {
     /// sandboxed processes alive is worse than reading a list that a panicking
     /// thread may have left mid-update, which for a `Vec<u32>` is still a valid
     /// list of PIDs.
-    fn lock(&self) -> MutexGuard<'_, Vec<u32>> {
+    fn lock(&self) -> MutexGuard<'_, Vec<Tracked>> {
         self.pids.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("process tracker lock was poisoned; recovering");
             poisoned.into_inner()
@@ -108,13 +118,32 @@ impl ProcessTracker {
 
     /// Register a spawned process.
     pub(crate) fn register(&self, pid: u32) {
-        self.lock().push(pid);
+        self.lock().push(Tracked {
+            pid,
+            #[cfg(target_os = "linux")]
+            supervisor: None,
+        });
         tracing::debug!(pid, "registered child process");
+    }
+
+    /// Register a process that is a per-command supervisor, which ends its
+    /// tree itself when asked.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn register_supervisor(
+        &self,
+        pid: u32,
+        control: std::sync::Weak<crate::supervisor::Shared>,
+    ) {
+        self.lock().push(Tracked {
+            pid,
+            supervisor: Some(control),
+        });
+        tracing::debug!(pid, "registered supervisor process");
     }
 
     /// Forget a process that has already been reaped.
     pub(crate) fn unregister(&self, pid: u32) {
-        self.lock().retain(|&tracked| tracked != pid);
+        self.lock().retain(|tracked| tracked.pid != pid);
         tracing::debug!(pid, "unregistered child process");
     }
 
@@ -122,7 +151,8 @@ impl ProcessTracker {
     pub(crate) fn kill_all(&self) {
         let pids = std::mem::take(&mut *self.lock());
 
-        for pid in pids {
+        for tracked in pids {
+            let pid = tracked.pid;
             tracing::debug!(pid, "killing child process");
 
             #[cfg(unix)]
@@ -141,6 +171,29 @@ impl ProcessTracker {
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
                 {
                     tracing::debug!(pid, "skipping non-child PID");
+                    continue;
+                }
+
+                #[cfg(target_os = "linux")]
+                if let Some(control) = &tracked.supervisor {
+                    // The supervisor ends its tree itself: freeze, kill, reap.
+                    // Signalling its process group instead would hand every
+                    // member that left the group to init. A handle that is
+                    // already gone has closed the socket, which makes the
+                    // supervisor do the same, so it is only awaited.
+                    if let Some(control) = control.upgrade() {
+                        control.request_teardown();
+                    }
+                    loop {
+                        // SAFETY: reaps the supervisor, our own child, which
+                        // exits once its tree is gone (within its reap budget).
+                        let waited = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+                        let interrupted = waited == -1
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+                        if !interrupted {
+                            break;
+                        }
+                    }
                     continue;
                 }
 
