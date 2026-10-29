@@ -439,11 +439,37 @@ impl Swap {
             &Platform::swap_for_link(&self.swapped, &self.target),
         )
         .await;
+        #[cfg(windows)]
+        let diagnostic = if swapped.status.success() {
+            String::new()
+        } else {
+            let parent = self.swapped.parent().expect("has a parent");
+            let host = std::process::Command::new("icacls")
+                .arg(parent)
+                .output()
+                .expect("icacls runs");
+            let inside = shell(
+                sandbox,
+                &format!(
+                    "cd & dir {p} & icacls {p} & cd /d {p} & cd",
+                    p = parent.display()
+                ),
+            )
+            .await;
+            format!(
+                "\ndiagnostic: parent {parent:?}\nhost icacls:\n{}\nsandboxed:\n{}{}",
+                stdout(&host),
+                stdout(&inside),
+                stderr(&inside)
+            )
+        };
+        #[cfg(not(windows))]
+        let diagnostic = String::new();
         assert!(
             swapped.status.success(),
             "the sandboxed process must be able to plant the link (exit code {:?}: \
              {LEAVE_FAILED} is leaving the directory, {REMOVE_FAILED} the removal, \
-             {LINK_FAILED} the link): {}{}",
+             {LINK_FAILED} the link): {}{}{diagnostic}",
             swapped.status.code(),
             stdout(&swapped),
             stderr(&swapped)
