@@ -11,7 +11,7 @@
 //! handles rather than `std::process` streams — and that is why
 //! [`crate::platform::child::Child`] is generic over its handle.
 
-mod acl;
+pub(crate) mod acl;
 mod capability;
 mod child;
 mod container;
@@ -101,9 +101,10 @@ impl Win32Failure {
     /// [`Error::GrantRedirected`], not a message.
     fn grant_at<'a>(call: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> Self + 'a {
         move |source| {
-            if acl::is_redirected(&source) {
+            if let Some(reason) = acl::redirection(&source) {
                 Self::Internal(Error::GrantRedirected {
                     path: path.to_path_buf(),
+                    reason,
                 })
             } else {
                 Self::io_at(call, path)(source)
@@ -249,7 +250,8 @@ impl WindowsBackend {
         // could have planted the link: the launch itself still names the program
         // as it was found.
         let granted = crate::resolve::resolve_outside(&program, &request.config.writable_paths())?;
-        self.container.grant_program(&granted, &capabilities)?;
+        self.container
+            .grant_program(granted.as_path(), &capabilities)?;
 
         // A proxy port means a filtering policy, which only works if the
         // container may reach the proxy on loopback.

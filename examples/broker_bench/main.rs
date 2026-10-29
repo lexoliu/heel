@@ -17,7 +17,8 @@
 use std::path::Path;
 
 use heel::{
-    DenyAll, ReadDenylist, Sandbox, SandboxConfigBuilder, SecurityConfigBuilder, WriteDenylist,
+    DenyAll, ReadDenylist, ResolvedPath, Sandbox, SandboxConfigBuilder, SecurityConfigBuilder,
+    WriteDenylist,
 };
 
 const WORKLOAD: &str = include_str!("workload.rs");
@@ -40,7 +41,7 @@ fn builder(
         .filesystem_strict(false)
         .security(security)
         .writable_file_system(true)
-        .executable(workload);
+        .executable(ResolvedPath::new(workload).expect("the workload is a resolved path"));
     match arrangement {
         Arrangement::NoBroker => base,
         Arrangement::Broker { sync_wake_up } => base

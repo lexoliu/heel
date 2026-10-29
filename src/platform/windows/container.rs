@@ -355,27 +355,37 @@ impl Container {
     /// written once by the system. Walking it and granting each child again
     /// re-propagated every subtree once per directory above it — a
     /// toolchain tree cost minutes per sandbox.
+    ///
+    /// The path is opened once, first, without following a link, and the
+    /// check of what the container already holds, whether it is a directory
+    /// and the write all go through that handle: a path swapped for a link
+    /// meanwhile cannot make the check read one object and the write change
+    /// another, nor let a redirected path pass as already open.
     fn grant_path(&self, path: &Path, access: Access) -> Result<()> {
+        let opened = acl::open(path)
+            .map_err(|source| acl_error(path, source, "cannot open the path to the container"))?;
         let entries = access_tree(access);
         // The entry that applies to `path` itself is what the access check
         // asks about: a container already holding it needs nothing written.
-        let desired = if path.is_dir() {
+        let directory = opened.is_directory();
+        let desired = if directory {
             entries[0].access
         } else {
             entries[1].access
         };
-        if self.already_open(path, desired, &[])? {
+        if self.holds(path, &opened, desired, &[])? {
             tracing::debug!(
                 path = %path.display(),
                 "path already grants the container its access"
             );
             return Ok(());
         }
-        if path.is_dir() {
-            self.grant(path, &entries, desired)
+        if directory {
+            self.grant(path, &opened, &entries, desired)
         } else {
             self.grant(
                 path,
+                &opened,
                 &[Entry {
                     access: desired,
                     applies_to: Scope::ThisOnly,
@@ -393,14 +403,22 @@ impl Container {
             if ancestor.parent().is_none() {
                 continue;
             }
-            if self.already_open(ancestor, TRAVERSE, &[])? {
+            let opened = acl::open(ancestor).map_err(|source| {
+                acl_error(
+                    ancestor,
+                    source,
+                    "cannot open the ancestor to the container",
+                )
+            })?;
+            if self.holds(ancestor, &opened, TRAVERSE, &[])? {
                 tracing::debug!(
                     path = %ancestor.display(),
                     "ancestor already grants the container traverse"
                 );
                 continue;
             }
-            let name = acl::grant_this_only(ancestor, self.grantee().as_string(), TRAVERSE)
+            let name = opened
+                .grant_this_only(self.grantee().as_string(), TRAVERSE)
                 .map_err(|source| {
                     acl_error(
                         ancestor,
@@ -428,8 +446,12 @@ impl Container {
             );
             return Ok(());
         }
+        let opened = acl::open(program).map_err(|source| {
+            acl_error(program, source, "cannot open the program to the container")
+        })?;
         self.grant(
             program,
+            &opened,
             &[Entry {
                 access: PROGRAM_ACCESS,
                 applies_to: Scope::ThisOnly,
@@ -454,6 +476,28 @@ impl Container {
     /// count a capability that is not common to every launch. A program is
     /// checked per launch and can include the capability that launch receives.
     fn already_open(&self, path: &Path, desired: u32, capabilities: &[Sid]) -> Result<bool> {
+        let held = acl::effective_rights(path, &self.trustees(capabilities))
+            .map_err(|source| Error::path(path, source))?;
+        Ok(held & desired == desired)
+    }
+
+    /// Like [`Self::already_open`], reading the list through the handle `opened`
+    /// holds on `path` instead of resolving the name again.
+    fn holds(
+        &self,
+        path: &Path,
+        opened: &acl::Opened,
+        desired: u32,
+        capabilities: &[Sid],
+    ) -> Result<bool> {
+        let held = opened
+            .rights(&self.trustees(capabilities))
+            .map_err(|source| acl_error(path, source, "cannot read what the container holds"))?;
+        Ok(held & desired == desired)
+    }
+
+    /// The SIDs an AppContainer access check can match for this container.
+    fn trustees<'a>(&'a self, capabilities: &'a [Sid]) -> Vec<&'a str> {
         let mut trustees = vec![self.sid().as_string(), ALL_APPLICATION_PACKAGES];
         if let Some(identity) = &self.identity {
             trustees.push(identity.capability.as_string());
@@ -461,25 +505,31 @@ impl Container {
         for capability in capabilities {
             trustees.push(capability.as_string());
         }
-        let held =
-            acl::effective_rights(path, &trustees).map_err(|source| Error::path(path, source))?;
-        Ok(held & desired == desired)
+        trustees
     }
 
     /// Add entries to a path's access control list, and record the grant
     /// for `drop`. `desired` names the rights being added, so a failure —
     /// a real error, not a case to absorb — says what the container lacks.
-    fn grant(&self, path: &Path, entries: &[Entry], desired: u32) -> Result<()> {
-        let name = acl::grant(path, self.grantee().as_string(), entries).map_err(|source| {
-            acl_error(
-                path,
-                source,
-                &format!(
-                    "the container does not already hold {} here",
-                    describe(desired)
-                ),
-            )
-        })?;
+    fn grant(
+        &self,
+        path: &Path,
+        opened: &acl::Opened,
+        entries: &[Entry],
+        desired: u32,
+    ) -> Result<()> {
+        let name = opened
+            .grant(self.grantee().as_string(), entries)
+            .map_err(|source| {
+                acl_error(
+                    path,
+                    source,
+                    &format!(
+                        "the container does not already hold {} here",
+                        describe(desired)
+                    ),
+                )
+            })?;
         self.record(name, Removal::Tree);
         Ok(())
     }
@@ -556,9 +606,10 @@ impl Container {
 /// is not the object it names is [`Error::GrantRedirected`], anything else a
 /// path error saying what `context` was attempted.
 fn acl_error(path: &Path, source: io::Error, context: &str) -> Error {
-    if acl::is_redirected(&source) {
+    if let Some(reason) = acl::redirection(&source) {
         Error::GrantRedirected {
             path: path.to_path_buf(),
+            reason,
         }
     } else {
         Error::path(path, io::Error::other(format!("{context}: {source}")))
@@ -997,7 +1048,10 @@ mod tests {
     #[test]
     fn complete_record_does_not_propagate_a_root_only_marker() {
         let (_outer, root, probe) = auto_inherited_grant_tree();
-        let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
+        let mut identity = test_identity([crate::grant::Grant::new(
+            crate::platform::unresolved::resolved(&root),
+            Access::READ,
+        )]);
 
         let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
             .expect("the named container");
@@ -1051,7 +1105,10 @@ mod tests {
         let directory = crate::platform::unresolved::resolved_tempdir();
         let root = directory.path().join("granted");
         std::fs::create_dir(&root).expect("the granted directory");
-        let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
+        let mut identity = test_identity([crate::grant::Grant::new(
+            crate::platform::unresolved::resolved(&root),
+            Access::READ,
+        )]);
         let name = identity.identity().profile_name(NamedProfile::Proxied);
 
         identity
@@ -1084,7 +1141,10 @@ mod tests {
     #[test]
     fn missing_record_reapplies_tree_propagation_and_records_the_grant() {
         let (_outer, root, probe) = auto_inherited_grant_tree();
-        let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
+        let mut identity = test_identity([crate::grant::Grant::new(
+            crate::platform::unresolved::resolved(&root),
+            Access::READ,
+        )]);
 
         let package = Profile::derive_sid(&identity.identity().profile_name(NamedProfile::Proxied))
             .expect("the package SID derives")
@@ -1129,11 +1189,20 @@ mod tests {
         let name = format!("t-{:016x}", rand::random::<u64>());
         let narrow = crate::identity::Identity::named(name.clone())
             .expect("the identity name is valid")
-            .persistent_grant(crate::grant::Grant::new(&root, Access::READ));
+            .persistent_grant(crate::grant::Grant::new(
+                crate::platform::unresolved::resolved(&root),
+                Access::READ,
+            ));
         let widened = crate::identity::Identity::named(name)
             .expect("the identity name is valid")
-            .persistent_grant(crate::grant::Grant::new(&root, Access::READ))
-            .persistent_grant(crate::grant::Grant::new(&root, Access::WRITE));
+            .persistent_grant(crate::grant::Grant::new(
+                crate::platform::unresolved::resolved(&root),
+                Access::READ,
+            ))
+            .persistent_grant(crate::grant::Grant::new(
+                crate::platform::unresolved::resolved(&root),
+                Access::WRITE,
+            ));
         let mut identity = IdentityCleanup::new(widened);
 
         let (container, outcomes) =
@@ -1165,7 +1234,10 @@ mod tests {
         std::fs::create_dir(&root).expect("the granted directory");
         let probe = root.join("probe.txt");
         std::fs::write(&probe, "probe").expect("the probe file");
-        let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
+        let mut identity = test_identity([crate::grant::Grant::new(
+            crate::platform::unresolved::resolved(&root),
+            Access::READ,
+        )]);
 
         let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
             .expect("the named container");
@@ -1208,7 +1280,10 @@ mod tests {
         let directory = crate::platform::unresolved::resolved_tempdir();
         let root = directory.path().join("granted");
         std::fs::create_dir(&root).expect("the granted directory");
-        let mut identity = test_identity([crate::grant::Grant::new(&root, Access::WRITE)]);
+        let mut identity = test_identity([crate::grant::Grant::new(
+            crate::platform::unresolved::resolved(&root),
+            Access::WRITE,
+        )]);
         let name = identity.identity().name().to_owned();
 
         let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
@@ -1219,7 +1294,10 @@ mod tests {
 
         let narrowed = crate::identity::Identity::named(name)
             .expect("the identity name is valid")
-            .persistent_grant(crate::grant::Grant::new(&root, Access::READ));
+            .persistent_grant(crate::grant::Grant::new(
+                crate::platform::unresolved::resolved(&root),
+                Access::READ,
+            ));
         let (container, outcomes) =
             Container::named(&narrowed, NamedProfile::Proxied).expect("the grant is narrowed");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
@@ -1249,8 +1327,14 @@ mod tests {
         let mut identity = IdentityCleanup::new(
             crate::identity::Identity::named(name.clone())
                 .expect("the identity name is valid")
-                .persistent_grant(crate::grant::Grant::new(&first_root, Access::READ))
-                .persistent_grant(crate::grant::Grant::new(&second_root, Access::READ)),
+                .persistent_grant(crate::grant::Grant::new(
+                    crate::platform::unresolved::resolved(&first_root),
+                    Access::READ,
+                ))
+                .persistent_grant(crate::grant::Grant::new(
+                    crate::platform::unresolved::resolved(&second_root),
+                    Access::READ,
+                )),
         );
 
         let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
@@ -1281,7 +1365,10 @@ mod tests {
 
         let only_second = crate::identity::Identity::named(name.clone())
             .expect("the identity name is valid")
-            .persistent_grant(crate::grant::Grant::new(&second_root, Access::READ));
+            .persistent_grant(crate::grant::Grant::new(
+                crate::platform::unresolved::resolved(&second_root),
+                Access::READ,
+            ));
         let (container, outcomes) = Container::named(&only_second, NamedProfile::Proxied)
             .expect("the remaining grant is reconciled");
         assert_eq!(
@@ -1341,7 +1428,10 @@ mod tests {
         );
         let granted = crate::identity::Identity::named(name)
             .expect("the identity name is valid")
-            .persistent_grant(crate::grant::Grant::new(&root, Access::READ));
+            .persistent_grant(crate::grant::Grant::new(
+                crate::platform::unresolved::resolved(&root),
+                Access::READ,
+            ));
         let profile_name = granted.profile_name(NamedProfile::Proxied);
 
         granted.prepare().expect("the persistent grant is prepared");
@@ -1382,7 +1472,10 @@ mod tests {
         std::fs::create_dir(&root).expect("the granted directory");
         let probe = root.join("probe.txt");
         std::fs::write(&probe, "probe").expect("the probe file");
-        let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
+        let mut identity = test_identity([crate::grant::Grant::new(
+            crate::platform::unresolved::resolved(&root),
+            Access::READ,
+        )]);
         let profile_name = identity.identity().profile_name(NamedProfile::Proxied);
 
         let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
@@ -1484,7 +1577,7 @@ mod tests {
         let work = crate::platform::unresolved::resolved_tempdir();
         let config = crate::SandboxConfig::builder()
             .working_dir(work.path())
-            .writable(&granted)
+            .writable(crate::platform::unresolved::resolved(&granted))
             .build();
         let container = Container::create().expect("a container");
         container
@@ -1501,7 +1594,7 @@ mod tests {
             .grant_configured_paths(config.data())
             .expect_err("a junction must refuse the build");
         assert!(
-            matches!(&error, Error::GrantRedirected { path } if *path == granted),
+            matches!(&error, Error::GrantRedirected { path, .. } if *path == granted),
             "{error:?}"
         );
         assert!(
@@ -1519,7 +1612,10 @@ mod tests {
         let target = root.path().join("target");
         std::fs::create_dir_all(&granted).expect("the granted directory");
         std::fs::create_dir_all(&target).expect("the target directory");
-        let mut identity = test_identity([crate::grant::Grant::new(&granted, Access::READ)]);
+        let mut identity = test_identity([crate::grant::Grant::new(
+            crate::platform::unresolved::resolved(&granted),
+            Access::READ,
+        )]);
         let (container, _) = Container::named(identity.identity(), NamedProfile::Proxied)
             .expect("the unchanged grant is applied");
         let package = container.sid().as_string().to_owned();
@@ -1531,7 +1627,7 @@ mod tests {
         let error = Container::named(identity.identity(), NamedProfile::Proxied)
             .expect_err("a junction must refuse the persistent grant");
         assert!(
-            matches!(&error, Error::GrantRedirected { path } if *path == granted),
+            matches!(&error, Error::GrantRedirected { path, .. } if *path == granted),
             "{error:?}"
         );
         assert!(
@@ -1553,7 +1649,7 @@ mod tests {
         let work = crate::platform::unresolved::resolved_tempdir();
         let config = crate::SandboxConfig::builder()
             .working_dir(work.path())
-            .writable(&granted)
+            .writable(crate::platform::unresolved::resolved(&granted))
             .build();
 
         let container = Container::create().expect("a container");

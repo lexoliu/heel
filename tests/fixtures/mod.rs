@@ -13,6 +13,11 @@ pub fn tempdir() -> tempfile::TempDir {
         .expect("a temporary directory")
 }
 
+/// A path the test has just made, as the resolved path a grant takes.
+pub fn resolved(path: impl AsRef<Path>) -> heel::ResolvedPath {
+    heel::ResolvedPath::new(path).expect("the path is resolved")
+}
+
 pub fn compile(dir: &Path, source: &str, name: &str) -> PathBuf {
     let binary = dir
         .join(name)

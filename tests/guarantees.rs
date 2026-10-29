@@ -71,9 +71,18 @@ trait Probes {
     fn write(path: &Path) -> String;
 
     /// Remove the directory `dir`, leaving the shell outside it, and put a
-    /// link to `target` where it was.
+    /// link to `target` where it was, in one command: the sandbox's own working
+    /// directory may be the one removed, and no later process could start
+    /// there. The command exits [`REMOVE_FAILED`] when the removal is denied and
+    /// [`LINK_FAILED`] when the link is, so a failure says which step it was.
     fn swap_for_link(dir: &Path, target: &Path) -> String;
 }
+
+/// The exit code of a swap command whose removal of the directory failed.
+const REMOVE_FAILED: u32 = 21;
+
+/// The exit code of a swap command whose link could not be planted.
+const LINK_FAILED: u32 = 22;
 
 /// The probes for this platform.
 struct Platform;
@@ -102,7 +111,8 @@ impl Probes for Platform {
 
     fn swap_for_link(dir: &Path, target: &Path) -> String {
         format!(
-            "cd / && rmdir {dir} && ln -s {target} {dir}",
+            "cd / && {{ rmdir {dir} || exit {REMOVE_FAILED}; }} && \
+             {{ ln -s {target} {dir} || exit {LINK_FAILED}; }}",
             dir = dir.display(),
             target = target.display()
         )
@@ -152,9 +162,13 @@ impl Probes for Platform {
 
     // A junction, because creating one needs no privilege: it is what a
     // sandboxed process can actually plant.
+    // Each step reports itself, because the cause of "Access is denied" on a
+    // sandboxed `mklink` is not established: it may be the removal or the
+    // mount point. The step's own message and exit code are in the failure.
     fn swap_for_link(dir: &Path, target: &Path) -> String {
         format!(
-            "cd /d %SystemRoot% && rmdir /S /Q {dir} && mklink /J {dir} {target}",
+            "cd /d %SystemRoot% && (rmdir /S /Q {dir} || (echo rmdir failed & exit /b {REMOVE_FAILED})) \
+             && (mklink /J {dir} {target} || (echo mklink failed & exit /b {LINK_FAILED}))",
             dir = dir.display(),
             target = target.display()
         )
@@ -224,7 +238,9 @@ async fn a_granted_directory_opens_the_tree_already_in_it() {
     std::fs::write(&staged, "staged-value").expect("writes");
     std::fs::write(&deep, "nested-value").expect("writes");
 
-    let config = SandboxConfigBuilder::default().readable(&dir).build();
+    let config = SandboxConfigBuilder::default()
+        .readable(fixtures::resolved(&dir))
+        .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts");
@@ -357,12 +373,12 @@ async fn the_working_directory_is_removed_when_the_sandbox_is_dropped() {
 }
 
 /// Start a sandbox that may write every one of `granted`.
-async fn writing_to(granted: &[&Path]) -> heel::Result<Sandbox> {
+async fn writing_to(granted: &[heel::ResolvedPath]) -> heel::Result<Sandbox> {
     let config = SandboxConfigBuilder::default()
         .grants(
             granted
                 .iter()
-                .map(|path| heel::Grant::new(path, heel::Access::WRITE)),
+                .map(|path| heel::Grant::new(path.clone(), heel::Access::WRITE)),
         )
         .build();
     Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await
@@ -410,7 +426,10 @@ impl Swap {
         .await;
         assert!(
             swapped.status.success(),
-            "the sandboxed process must be able to plant the link: {}",
+            "the sandboxed process must be able to plant the link (exit code {:?}: \
+             {REMOVE_FAILED} is the removal, {LINK_FAILED} the link): {}{}",
+            swapped.status.code(),
+            stdout(&swapped),
             stderr(&swapped)
         );
         assert!(
@@ -447,7 +466,9 @@ async fn an_unchanged_grant_builds_and_is_writable() {
     let granted = root.join("granted");
     std::fs::create_dir(&granted).expect("creates");
 
-    let sandbox = writing_to(&[&granted]).await.expect("sandbox starts");
+    let sandbox = writing_to(&[fixtures::resolved(&granted)])
+        .await
+        .expect("sandbox starts");
     let target = granted.join("written.txt");
     shell(&sandbox, &Platform::write(&target)).await;
 
@@ -461,7 +482,10 @@ async fn a_grant_the_sandbox_replaced_with_a_link_fails_the_next_build() {
     // write through the link, and the next sandbox must not follow it: the
     // link's target would become writable.
     let swap = Swap::new();
-    let grants = [swap.parent.as_path(), swap.swapped.as_path()];
+    let grants = [
+        fixtures::resolved(&swap.parent),
+        fixtures::resolved(&swap.swapped),
+    ];
     let sandbox = writing_to(&grants)
         .await
         .expect("the unchanged grant builds");
@@ -473,7 +497,7 @@ async fn a_grant_the_sandbox_replaced_with_a_link_fails_the_next_build() {
         .err()
         .expect("a granted path behind a link must refuse the build");
     assert!(
-        matches!(&error, heel::Error::GrantRedirected { path } if *path == swap.swapped),
+        matches!(&error, heel::Error::GrantRedirected { path, .. } if *path == swap.swapped),
         "expected the redirected grant to be named, got {error:?}"
     );
     swap.assert_target_untouched();
@@ -484,9 +508,10 @@ async fn a_working_directory_the_sandbox_replaced_with_a_link_fails_the_next_bui
     // The working directory is writable whatever the configuration says, so a
     // link followed into place of a reused one would make its target writable.
     let swap = Swap::new();
+    let parent = fixtures::resolved(&swap.parent);
     let config = |swap: &Swap| {
         SandboxConfigBuilder::default()
-            .writable(&swap.parent)
+            .writable(parent.clone())
             .working_dir(&swap.swapped)
             .build()
     };
@@ -502,14 +527,14 @@ async fn a_working_directory_the_sandbox_replaced_with_a_link_fails_the_next_bui
         .err()
         .expect("a working directory behind a link must refuse the build");
     assert!(
-        matches!(&error, heel::Error::GrantRedirected { path } if *path == swap.swapped),
+        matches!(&error, heel::Error::GrantRedirected { path, .. } if *path == swap.swapped),
         "expected the redirected working directory to be named, got {error:?}"
     );
     swap.assert_target_untouched();
 }
 
-#[tokio::test]
-async fn a_dot_component_is_refused_instead_of_granting_nothing() {
+#[test]
+fn a_dot_component_is_refused_instead_of_granting_nothing() {
     let (_guard, root) = resolved_dir();
     let granted = root.join("granted");
     std::fs::create_dir(&granted).expect("creates");
@@ -518,10 +543,8 @@ async fn a_dot_component_is_refused_instead_of_granting_nothing() {
         root.join("other").join("..").join("granted"),
         root.join(".").join("granted"),
     ] {
-        let error = writing_to(&[&spelling])
-            .await
-            .err()
-            .expect("a non-normal spelling must not build a sandbox that grants nothing");
+        let error = heel::ResolvedPath::new(&spelling)
+            .expect_err("a non-normal spelling must not become a grant that grants nothing");
         assert!(matches!(error, heel::Error::Path { .. }), "{error:?}");
     }
 }

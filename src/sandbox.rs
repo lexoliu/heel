@@ -1,6 +1,6 @@
 //! The sandbox itself: setup, command execution and teardown.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -16,6 +16,7 @@ use crate::grant::Access;
 use crate::ipc::{IpcLayout, IpcServer};
 use crate::network::{DenyAll, NetworkPolicy, NetworkProxy};
 use crate::platform::{self, NativeBackend};
+use crate::resolve::ResolvedPath;
 use crate::workdir::WorkingDir;
 
 fn create_ipc_socket_dir() -> Result<(WorkingDir, PathBuf)> {
@@ -37,12 +38,15 @@ fn create_ipc_socket_dir() -> Result<(WorkingDir, PathBuf)> {
 /// is often reached through a link (a package manager's shim): the link is
 /// followed unless it lies at or below a path the sandbox may write, where the
 /// sandbox could have planted it.
-fn resolve_heel_binary(
-    configured: Option<&std::path::Path>,
-    writable: &[&std::path::Path],
-) -> Result<PathBuf> {
-    let chosen = choose_heel_binary(configured)?;
-    crate::resolve::resolve_outside(&chosen, writable)
+async fn resolve_heel_binary(
+    configured: Option<PathBuf>,
+    writable: Vec<PathBuf>,
+) -> Result<ResolvedPath> {
+    unblock(move || {
+        let chosen = choose_heel_binary(configured.as_deref())?;
+        crate::resolve::resolve_outside(&chosen, &writable)
+    })
+    .await
 }
 
 fn choose_heel_binary(configured: Option<&std::path::Path>) -> Result<PathBuf> {
@@ -262,8 +266,11 @@ impl<N: NetworkPolicy> Sandbox<N> {
             }
             (None, Some(endpoint)) => {
                 let (socket_dir, socket) = unblock(create_ipc_socket_dir).await?;
-                let heel_binary =
-                    resolve_heel_binary(config_data.heel_binary(), &config_data.writable_paths())?;
+                let heel_binary = resolve_heel_binary(
+                    config_data.heel_binary().map(Path::to_path_buf),
+                    config_data.writable_paths(),
+                )
+                .await?;
                 config_data.push_grant(heel_binary, Access::EXEC);
                 config_data.set_ipc_socket(Some(socket.clone()));
                 let server = IpcServer::new(socket, endpoint, executor).await?;
@@ -326,13 +333,16 @@ impl<N: NetworkPolicy> Sandbox<N> {
         router: crate::ipc::IpcRouter,
         executor: E,
     ) -> Result<(IpcServer, WorkingDir)> {
-        let heel_binary =
-            resolve_heel_binary(config_data.heel_binary(), &config_data.writable_paths())?;
+        let heel_binary = resolve_heel_binary(
+            config_data.heel_binary().map(Path::to_path_buf),
+            config_data.writable_paths(),
+        )
+        .await?;
 
         // Writing the shims and creating the socket directory are both blocking
         // filesystem work; the router is handed to the worker and handed back so
         // it can move on to the server.
-        let write_binary = heel_binary.clone();
+        let write_binary = heel_binary.as_path().to_path_buf();
         let (router, socket_dir, bin_dir, socket) = unblock(
             move || -> Result<(crate::ipc::IpcRouter, WorkingDir, PathBuf, PathBuf)> {
                 let (socket_dir, socket) = create_ipc_socket_dir()?;
@@ -343,7 +353,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
             },
         )
         .await?;
-        config_data.push_grant(bin_dir.clone(), Access::EXEC);
+        config_data.push_grant(ResolvedPath::new(&bin_dir)?, Access::EXEC);
         config_data.set_ipc_bin_dir(bin_dir);
 
         // The launcher execs the host binary, so it must be executable from

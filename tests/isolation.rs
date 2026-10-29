@@ -53,7 +53,7 @@ fn secret_file() -> (tempfile::TempDir, std::path::PathBuf) {
 async fn an_explicitly_readable_path_is_readable() {
     let (_dir, secret) = secret_file();
     let config = SandboxConfigBuilder::default()
-        .readable(secret.parent().expect("has a parent"))
+        .readable(fixtures::resolved(secret.parent().expect("has a parent")))
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -71,7 +71,7 @@ async fn a_persistent_identity_grant_is_readable_without_an_ordinary_grant() {
     let identity = Identity::named("persistent-read-test")
         .expect("the identity name is valid")
         .persistent_grant(Grant::new(
-            secret.parent().expect("the file has a parent"),
+            fixtures::resolved(secret.parent().expect("the file has a parent")),
             Access::READ,
         ));
     let config = SandboxConfigBuilder::default()
@@ -101,7 +101,9 @@ async fn an_explicit_allow_beats_a_default_protection() {
     std::fs::create_dir_all(&scratch).expect("creates");
     std::fs::write(scratch.join("data.txt"), "visible").expect("writes");
 
-    let config = SandboxConfigBuilder::default().readable(&scratch).build();
+    let config = SandboxConfigBuilder::default()
+        .readable(fixtures::resolved(&scratch))
+        .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts");
@@ -303,10 +305,14 @@ async fn exit_codes_are_reported_faithfully() {
 }
 
 #[tokio::test]
-async fn a_missing_configured_path_fails_sandbox_creation() {
+async fn a_configured_path_removed_before_creation_fails_sandbox_creation() {
+    let dir = fixtures::tempdir();
+    let missing = dir.path().join("definitely-not-a-real-path");
+    std::fs::create_dir(&missing).expect("creates");
     let config = SandboxConfigBuilder::default()
-        .readable("/definitely/not/a/real/path")
+        .readable(fixtures::resolved(&missing))
         .build();
+    std::fs::remove_dir(&missing).expect("removes");
     let error =
         match Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await {
             Ok(_) => panic!("a path that cannot be granted must fail creation"),
@@ -314,7 +320,7 @@ async fn a_missing_configured_path_fails_sandbox_creation() {
         };
 
     assert!(
-        error.to_string().contains("/definitely/not/a/real/path"),
+        error.to_string().contains(&*missing.to_string_lossy()),
         "the error must name the path: {error}"
     );
 }

@@ -203,15 +203,16 @@ mod tests {
 
     #[test]
     fn persistent_grants_union_access_for_the_same_path() {
-        let directory = std::env::temp_dir();
+        let directory = crate::platform::unresolved::resolved_tempdir();
+        let path = crate::platform::unresolved::resolved(directory.path());
         let identity = Identity::named("build")
             .expect("the identity name is valid")
-            .persistent_grant(Grant::new(&directory, Access::READ))
-            .persistent_grant(Grant::new(&directory, Access::EXEC));
+            .persistent_grant(Grant::new(path.clone(), Access::READ))
+            .persistent_grant(Grant::new(path.clone(), Access::EXEC));
 
         assert_eq!(
             identity.persistent_grants(),
-            [Grant::new(directory, Access::READ | Access::EXEC)]
+            [Grant::new(path, Access::READ | Access::EXEC)]
         );
     }
 }

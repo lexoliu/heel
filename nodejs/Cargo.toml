@@ -16,6 +16,9 @@ workspace = true
 # Core heel library
 heel = { path = ".." }
 
+# Blocking filesystem work off the async threads
+blocking = { version = "1.6.2", default-features = false }
+
 # NAPI-RS for Node.js bindings
 napi = { version = "2", default-features = false, features = [
     "async",

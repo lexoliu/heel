@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use heel::ResolvedPath;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -24,8 +25,8 @@ pub struct VenvConfigJs {
 
 impl VenvConfigJs {
     /// Build the configuration around `path`, the environment's resolved location.
-    pub fn into_rust(self, path: PathBuf) -> Result<heel::VenvConfig> {
-        let mut builder = heel::VenvConfig::builder().path(path);
+    pub fn into_rust(self, path: &ResolvedPath) -> Result<heel::VenvConfig> {
+        let mut builder = heel::VenvConfig::builder().path(path.as_path());
         if let Some(python) = self.python {
             builder = builder.python(PathBuf::from(python));
         }
@@ -82,7 +83,7 @@ impl PythonConfigJs {
     }
 
     /// Build the configuration around `venv_path`, the environment's resolved location.
-    pub fn into_rust(self, venv_path: PathBuf) -> Result<heel::PythonConfig> {
+    pub fn into_rust(self, venv_path: &ResolvedPath) -> Result<heel::PythonConfig> {
         let mut builder = heel::PythonConfig::builder();
 
         builder = builder.venv(self.venv.unwrap_or_default().into_rust(venv_path)?);

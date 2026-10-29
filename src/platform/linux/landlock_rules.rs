@@ -641,6 +641,7 @@ fn open_unresolved(path: &Path) -> Result<OwnedFd> {
     .map_err(|errno| match errno {
         Errno::LOOP => Error::GrantRedirected {
             path: path.to_path_buf(),
+            reason: crate::error::Redirection::SymbolicLink,
         },
         errno => Error::path(path, errno.into()),
     })
@@ -802,9 +803,15 @@ mod tests {
 
     #[test]
     fn missing_configured_paths_are_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::platform::unresolved::resolved_tempdir();
         let missing = dir.path().join("absent");
-        let (data, _dir) = prepared(SandboxConfig::builder().readable(&missing).build());
+        std::fs::create_dir(&missing).expect("creates");
+        let (data, _dir) = prepared(
+            SandboxConfig::builder()
+                .readable(crate::platform::unresolved::resolved(&missing))
+                .build(),
+        );
+        std::fs::remove_dir(&missing).expect("removes");
 
         let error = build_ruleset(&data, None).expect_err("must fail");
         assert!(
@@ -823,7 +830,11 @@ mod tests {
         let elsewhere = root.join("elsewhere");
         fs::create_dir_all(elsewhere.join("granted")).expect("creates");
 
-        let (data, _dir) = prepared(SandboxConfig::builder().writable(&granted).build());
+        let (data, _dir) = prepared(
+            SandboxConfig::builder()
+                .writable(crate::platform::unresolved::resolved(&granted))
+                .build(),
+        );
         build_ruleset(&data, None).expect("an unchanged grant builds");
 
         // The grant itself, then a parent of it.
@@ -836,7 +847,7 @@ mod tests {
 
             let error = build_ruleset(&data, None).expect_err("must fail");
             assert!(
-                matches!(&error, Error::GrantRedirected { path } if *path == granted),
+                matches!(&error, Error::GrantRedirected { path, .. } if *path == granted),
                 "expected the redirected grant to be named, got {error:?}"
             );
         }
@@ -874,13 +885,16 @@ mod tests {
         let cache = tempfile::tempdir().expect("tempdir");
         let (data, _dir) = prepared(
             SandboxConfig::builder()
-                .writable(cache.path())
-                .executable(cache.path())
+                .writable(crate::platform::unresolved::resolved(cache.path()))
+                .executable(crate::platform::unresolved::resolved(cache.path()))
                 .build(),
         );
         assert_eq!(
             data.grants(),
-            [Grant::new(cache.path(), Access::WRITE | Access::EXEC)],
+            [Grant::new(
+                crate::platform::unresolved::resolved(cache.path()),
+                Access::WRITE | Access::EXEC
+            )],
             "granting a path twice must widen one grant, not add a second"
         );
 
@@ -908,13 +922,22 @@ mod tests {
                 .identity(
                     crate::identity::Identity::named("landlock-test")
                         .expect("the identity name is valid")
-                        .persistent_grant(Grant::new(directory.path(), Access::READ)),
+                        .persistent_grant(Grant::new(
+                            crate::platform::unresolved::resolved(directory.path()),
+                            Access::READ,
+                        )),
                 )
                 .build(),
         );
         data.adopt_persistent_grants();
 
-        assert_eq!(data.grants(), [Grant::new(directory.path(), Access::READ)]);
+        assert_eq!(
+            data.grants(),
+            [Grant::new(
+                crate::platform::unresolved::resolved(directory.path()),
+                Access::READ
+            )]
+        );
         assert!(
             configured_rules(&data, ABI::V4)
                 .iter()

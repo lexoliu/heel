@@ -83,16 +83,18 @@ pub enum Error {
         source: io::Error,
     },
 
-    /// A granted path reaches a symbolic link, or a Windows junction.
+    /// A path the sandbox is configured with is not the object it names.
     ///
     /// A grant names a path the caller has already resolved, and the sandbox
     /// never follows a link to honour it: a component that has become a link
     /// since the caller resolved the path would redirect the grant to the
     /// link's target, so the build is refused and nothing is granted.
-    #[error("granted path {path} passes through a symbolic link")]
+    #[error("{path} is not the object it names: {reason}")]
     GrantRedirected {
-        /// The granted path, as the caller configured it.
+        /// The path, as the caller configured it.
         path: PathBuf,
+        /// What redirects it.
+        reason: Redirection,
     },
 
     /// The working directory could not be prepared or removed.
@@ -153,4 +155,24 @@ impl Error {
             source,
         }
     }
+}
+
+/// What stands between a configured path and the object it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Redirection {
+    /// A component is a symbolic link. On Windows this covers any
+    /// name-surrogate reparse point that is not recognised as a junction.
+    #[error("a component is a symbolic link")]
+    SymbolicLink,
+
+    /// A component is a Windows junction (a mount-point reparse point).
+    #[error("a component is a junction")]
+    Junction,
+
+    /// The object opened lives at a different final path than the one asked
+    /// for: a component redirected the open without being reported as a link,
+    /// or the path spells a short name or a different case than the resolved
+    /// path.
+    #[error("its final path differs from the path asked for")]
+    DifferentFinalPath,
 }

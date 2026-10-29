@@ -73,21 +73,65 @@ fn process_is_alive(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Remove the pools that processes which have since exited left behind.
-fn remove_stale(directory: &Path, prefix: &str) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
+/// Remove the pools that processes which have since exited left behind, in the
+/// directory `root` holds.
+///
+/// Everything is relative to the descriptor, so a link planted under the
+/// directory is unlinked rather than followed and nothing outside it is touched.
+fn remove_stale(root: BorrowedFd<'_>, prefix: &str) {
+    let Ok(listing) = rustix::fs::openat(
+        root,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    let Ok(entries) = rustix::fs::Dir::new(listing) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(prefix)) else {
+        let Ok(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(prefix) else {
             continue;
         };
         let pid = rest.split('-').next().and_then(|pid| pid.parse().ok());
         if pid.is_some_and(|pid| !process_is_alive(pid)) {
-            let _ = std::fs::remove_dir_all(entry.path());
+            let _ = remove_tree(root, name);
         }
     }
+}
+
+/// Remove `name` under `parent` and everything beneath it, unlinking any link
+/// found instead of following it.
+fn remove_tree(parent: BorrowedFd<'_>, name: &str) -> rustix::io::Result<()> {
+    match rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty()) {
+        Err(Errno::ISDIR | Errno::PERM) => {}
+        result => return result,
+    }
+    let directory = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let children: Vec<String> = rustix::fs::Dir::read_from(&directory)?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().ok().map(str::to_owned))
+        .filter(|child| child != "." && child != "..")
+        .collect();
+    for child in children {
+        remove_tree(directory.as_fd(), &child)?;
+    }
+    rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::REMOVEDIR)
+}
+
+/// The cache directory the pool prefers, opened once.
+struct Cache {
+    path: PathBuf,
+    root: OwnedFd,
 }
 
 fn cache_directory() -> Option<PathBuf> {
@@ -109,10 +153,22 @@ impl Pool {
         ancestors: &[Ancestor],
         grant: &mut Grant<'_>,
     ) -> Result<Self> {
-        let cache = cache_directory();
-        if let Some(cache) = &cache {
-            remove_stale(cache, "pool-");
-        }
+        let cache = cache_directory().and_then(|path| match open_or_create_directory(&path) {
+            Ok(root) => {
+                remove_stale(root.as_fd(), "pool-");
+                Some(Cache { path, root })
+            }
+            Err(errno) => {
+                tracing::warn!(
+                    cache = %path.display(),
+                    %errno,
+                    "broker: the cache directory cannot hold the inode pool (a link stands in \
+                     its path, or it cannot be made); using the filesystems of the protected \
+                     paths instead"
+                );
+                None
+            }
+        });
         let mut keyed: BTreeMap<(u64, u64), Vec<&Ancestor>> = BTreeMap::new();
         for ancestor in ancestors {
             let device = std::fs::metadata(&ancestor.path)
@@ -134,7 +190,7 @@ impl Pool {
                 .fold(BitFlags::<AccessFs>::empty(), |all, ancestor| {
                     all | ancestor.rights
                 });
-            let Some(directory) = locate(cache.as_deref(), device, &members) else {
+            let Some(directory) = locate(cache.as_ref(), device, &members) else {
                 tracing::debug!(
                     device,
                     "broker: no place for an inode pool on this filesystem; new entries in its \
@@ -248,26 +304,55 @@ fn open_directory(path: &Path) -> rustix::io::Result<OwnedFd> {
     )
 }
 
+/// Open a directory like [`open_directory`], making the missing components of
+/// it relative to the descriptor of the one above, so nothing is created
+/// behind a link.
+fn open_or_create_directory(path: &Path) -> rustix::io::Result<OwnedFd> {
+    match open_directory(path) {
+        Err(Errno::NOENT) => {}
+        result => return result,
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(Errno::NOENT);
+    };
+    let parent = open_or_create_directory(parent)?;
+    match rustix::fs::mkdirat(&parent, name, Mode::RWXU) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(errno) => return Err(errno),
+    }
+    rustix::fs::openat(
+        &parent,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
 /// Where the pool for filesystem `device` lives: the cache directory if that is
 /// on it, otherwise a hidden directory in the shallowest member that can be
 /// written to.
-fn locate(cache: Option<&Path>, device: u64, members: &[&Ancestor]) -> Option<Location> {
+fn locate(cache: Option<&Cache>, device: u64, members: &[&Ancestor]) -> Option<Location> {
     if let Some(cache) = cache
-        && std::fs::create_dir_all(cache).is_ok()
-        && let Ok(root) = open_directory(cache)
-        && rustix::fs::fstat(&root).is_ok_and(|stat| stat.st_dev == device)
-        && let Some(pool) = create_unique(root, cache, "pool-")
+        && rustix::fs::fstat(&cache.root).is_ok_and(|stat| stat.st_dev == device)
+        && let Some(pool) = create_unique(cache.root.as_fd(), &cache.path, "pool-")
     {
         return Some(pool);
     }
     let mut shallowest: Vec<&Ancestor> = members.to_vec();
     shallowest.sort_by_key(|ancestor| ancestor.path.components().count());
     for ancestor in shallowest {
-        remove_stale(&ancestor.path, ".heel-pool-");
-        if let Ok(root) = open_directory(&ancestor.path)
-            && let Some(pool) = create_unique(root, &ancestor.path, ".heel-pool-")
-        {
-            return Some(pool);
+        match open_directory(&ancestor.path) {
+            Ok(root) => {
+                remove_stale(root.as_fd(), ".heel-pool-");
+                if let Some(pool) = create_unique(root.as_fd(), &ancestor.path, ".heel-pool-") {
+                    return Some(pool);
+                }
+            }
+            Err(errno) => tracing::debug!(
+                path = %ancestor.path.display(),
+                %errno,
+                "broker: cannot open a protected path's directory for the inode pool"
+            ),
         }
     }
     None
@@ -280,14 +365,14 @@ fn locate(cache: Option<&Path>, device: u64, members: &[&Ancestor]) -> Option<Lo
 /// directory of its own, and one that exists is never taken over: its owner is
 /// alive, or its pid was reused and `remove_stale` clears it once that process
 /// is gone.
-fn create_unique(root: OwnedFd, path: &Path, prefix: &str) -> Option<Location> {
+fn create_unique(root: BorrowedFd<'_>, path: &Path, prefix: &str) -> Option<Location> {
     let pid = std::process::id();
     for number in 0u32.. {
         let name = format!("{prefix}{pid}-{number}");
-        match rustix::fs::mkdirat(&root, &name, Mode::RWXU) {
+        match rustix::fs::mkdirat(root, &name, Mode::RWXU) {
             Ok(()) => {
                 let held = rustix::fs::openat(
-                    &root,
+                    root,
                     &name,
                     OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::empty(),

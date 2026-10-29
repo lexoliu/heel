@@ -379,6 +379,8 @@ mod tests {
         (data, dir)
     }
 
+    use crate::platform::unresolved::resolved as grant_path;
+
     /// A temporary directory's path as a caller must pass it: resolved.
     fn resolved(dir: &tempfile::TempDir) -> PathBuf {
         std::fs::canonicalize(dir.path()).expect("the temporary directory resolves")
@@ -410,7 +412,7 @@ mod tests {
         let scratch = tempfile::tempdir().expect("tempdir");
         let (data, dir) = prepared_config(
             SandboxConfig::builder()
-                .writable(resolved(&scratch))
+                .writable(grant_path(resolved(&scratch)))
                 .build(),
         );
         let profile = generate_profile(&data, None).unwrap();
@@ -432,7 +434,7 @@ mod tests {
         let tools = tempfile::tempdir().expect("tempdir");
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .executable(resolved(&tools))
+                .executable(grant_path(resolved(&tools)))
                 .build(),
         );
         let profile = generate_profile(&data, None).unwrap();
@@ -457,7 +459,11 @@ mod tests {
         let binary = resolved(&tools).join("tool");
         std::fs::write(&binary, b"#!/bin/sh\n").expect("writes");
 
-        let (data, _dir) = prepared_config(SandboxConfig::builder().executable(&binary).build());
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .executable(grant_path(&binary))
+                .build(),
+        );
         let profile = generate_profile(&data, None).unwrap();
 
         let canonical = std::fs::canonicalize(&binary).expect("canonical");
@@ -482,7 +488,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("tempdir");
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .grant(resolved(&cache), Access::WRITE | Access::EXEC)
+                .grant(grant_path(resolved(&cache)), Access::WRITE | Access::EXEC)
                 .build(),
         );
         let profile = generate_profile(&data, None).unwrap();
@@ -520,7 +526,11 @@ mod tests {
         let tools = Path::new("/private/tmp").join(crate::workdir::generate_working_dir_name());
         std::fs::create_dir_all(&tools).expect("creates");
 
-        let (data, _dir) = prepared_config(SandboxConfig::builder().executable(&tools).build());
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .executable(grant_path(&tools))
+                .build(),
+        );
         let profile = generate_profile(&data, None).unwrap();
         let canonical = std::fs::canonicalize(&tools).expect("canonical");
         std::fs::remove_dir_all(&tools).ok();
@@ -544,8 +554,11 @@ mod tests {
     #[test]
     fn a_writable_grant_alone_is_still_denied_exec() {
         let cache = tempfile::tempdir().expect("tempdir");
-        let (data, _dir) =
-            prepared_config(SandboxConfig::builder().writable(resolved(&cache)).build());
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(resolved(&cache)))
+                .build(),
+        );
         let profile = generate_profile(&data, None).unwrap();
         let canonical = std::fs::canonicalize(cache.path()).expect("canonical");
 
@@ -564,7 +577,11 @@ mod tests {
         let scratch = Path::new("/private/tmp").join(crate::workdir::generate_working_dir_name());
         std::fs::create_dir_all(&scratch).expect("creates");
 
-        let (data, _dir) = prepared_config(SandboxConfig::builder().readable(&scratch).build());
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .readable(grant_path(&scratch))
+                .build(),
+        );
         let profile = generate_profile(&data, None).unwrap();
 
         assert!(
@@ -578,14 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unresolved_grant_is_refused_and_nothing_is_emitted() {
+    fn an_unresolved_grant_is_refused_before_it_can_be_configured() {
         // /tmp is a symlink to /private/tmp on macOS. Resolving it here would
         // let a swapped link redirect a grant, so the caller resolves it.
-        let (data, _dir) = prepared_config(SandboxConfig::builder().readable("/tmp").build());
-
-        let error = generate_profile(&data, None).unwrap_err();
+        let error = crate::resolve::ResolvedPath::new("/tmp").unwrap_err();
         assert!(
-            matches!(&error, Error::GrantRedirected { path } if path == Path::new("/tmp")),
+            matches!(&error, Error::GrantRedirected { path, .. } if path == Path::new("/tmp")),
             "expected the redirected grant to be named, got {error:?}"
         );
     }
@@ -602,8 +617,8 @@ mod tests {
 
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .writable(&granted)
-                .writable(&nested)
+                .writable(grant_path(&granted))
+                .writable(grant_path(&nested))
                 .build(),
         );
         generate_profile(&data, None).expect("an unchanged grant still builds");
@@ -616,7 +631,7 @@ mod tests {
 
             let error = generate_profile(&data, None).unwrap_err();
             assert!(
-                matches!(&error, Error::GrantRedirected { path } if path == replaced),
+                matches!(&error, Error::GrantRedirected { path, .. } if path == replaced),
                 "expected {} to be named, got {error:?}",
                 replaced.display()
             );
@@ -624,12 +639,25 @@ mod tests {
     }
 
     #[test]
-    fn missing_configured_paths_are_rejected() {
+    fn a_missing_path_cannot_be_a_grant() {
+        let error = crate::resolve::ResolvedPath::new("/definitely/not/a/real/path").unwrap_err();
+        assert!(
+            matches!(error, Error::Path { .. }),
+            "expected a path error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_grant_removed_since_it_was_configured_is_rejected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let granted = resolved(&root).join("granted");
+        std::fs::create_dir(&granted).expect("creates");
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .readable("/definitely/not/a/real/path")
+                .readable(grant_path(&granted))
                 .build(),
         );
+        std::fs::remove_dir(&granted).expect("removes");
 
         let error = generate_profile(&data, None).unwrap_err();
         assert!(
@@ -647,7 +675,10 @@ mod tests {
                 .identity(
                     crate::identity::Identity::named("macos-test")
                         .expect("the identity name is valid")
-                        .persistent_grant(crate::grant::Grant::new(&directory_path, Access::READ)),
+                        .persistent_grant(crate::grant::Grant::new(
+                            grant_path(&directory_path),
+                            Access::READ,
+                        )),
                 )
                 .build(),
         );
@@ -689,7 +720,7 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .writable(resolved(&dir))
+                .writable(grant_path(resolved(&dir)))
                 .read_denylist(crate::ReadDenylist::credentials().home(home.path()))
                 .write_denylist(crate::WriteDenylist::persistence().home(home.path()))
                 .build(),

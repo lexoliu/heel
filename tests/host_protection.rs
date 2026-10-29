@@ -155,9 +155,9 @@ mod enforced {
     #[tokio::test]
     async fn a_grant_does_not_reopen_a_credential_store() {
         let home = home_with(&[".ssh/id_ed25519"]);
-        let ssh = home.path().join(".ssh");
+        let ssh = std::fs::canonicalize(home.path().join(".ssh")).unwrap();
         let path = std::fs::canonicalize(&ssh).unwrap().join("id_ed25519");
-        let sandbox = start(reader(DenyAll, home.path()).readable(&ssh)).await;
+        let sandbox = start(reader(DenyAll, home.path()).readable(fixtures::resolved(&ssh))).await;
 
         let output = sh(&sandbox, &format!("cat '{}'", path.display())).await;
         assert!(!output.status.success(), "a grant reopened the store");
@@ -167,7 +167,7 @@ mod enforced {
     async fn a_credential_directory_cannot_be_moved_to_a_name_that_is_readable() {
         let home = home_with(&[".ssh/id_ed25519", ".config/other/x"]);
         let root = std::fs::canonicalize(home.path()).unwrap();
-        let sandbox = start(reader(DenyAll, home.path()).writable(&root)).await;
+        let sandbox = start(reader(DenyAll, home.path()).writable(fixtures::resolved(&root))).await;
 
         let moved = sh(
             &sandbox,
@@ -289,7 +289,7 @@ mod enforced {
             SandboxConfigBuilder::default()
                 .filesystem_strict(true)
                 .security(SecurityConfig::strict())
-                .readable(&directory),
+                .readable(fixtures::resolved(&directory)),
         )
         .await;
         let output = sh(&protected, &keychain.command()).await;
@@ -307,7 +307,7 @@ mod enforced {
                         .protect_keychain(false)
                         .build(),
                 )
-                .readable(&directory),
+                .readable(fixtures::resolved(&directory)),
         )
         .await;
         let output = sh(&unprotected, &keychain.command()).await;
@@ -524,7 +524,8 @@ mod enforced {
     async fn a_grant_does_not_reopen_a_persistence_location() {
         let home = home_with(&[".cargo/bin/cargo"]);
         let root = std::fs::canonicalize(home.path()).unwrap();
-        let sandbox = start(writer(home.path()).writable(root.join(".cargo/bin"))).await;
+        let sandbox =
+            start(writer(home.path()).writable(fixtures::resolved(root.join(".cargo/bin")))).await;
 
         let output = sh(
             &sandbox,

@@ -10,7 +10,7 @@
 use std::io;
 use std::path::Path;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Redirection, Result};
 
 /// Fail unless `path` is absolute, in normal form, and no component of it is a
 /// link.
@@ -32,6 +32,7 @@ pub(crate) fn verify(path: &Path) -> Result<()> {
         if metadata.file_type().is_symlink() {
             return Err(Error::GrantRedirected {
                 path: path.to_path_buf(),
+                reason: Redirection::SymbolicLink,
             });
         }
     }
@@ -83,6 +84,12 @@ pub(crate) fn resolved_tempdir() -> tempfile::TempDir {
         .expect("a temporary directory")
 }
 
+/// A path the test has just made, as the resolved path a grant takes.
+#[cfg(test)]
+pub(crate) fn resolved(path: impl AsRef<Path>) -> crate::resolve::ResolvedPath {
+    crate::resolve::ResolvedPath::new(path).expect("the path is resolved")
+}
+
 /// Make `link` a junction to `target`: what a sandboxed process can plant on
 /// Windows without any privilege.
 #[cfg(all(test, windows))]
@@ -125,8 +132,10 @@ mod tests {
 
     #[test]
     fn dot_and_dot_dot_components_are_refused() {
+        // Not a verbatim path: `PathBuf::push` onto a `\\?\` path normalises
+        // `.` and `..` away, and the spelling under test would never be built.
         let root = tempfile::tempdir().expect("tempdir");
-        let root = std::fs::canonicalize(root.path()).expect("resolves");
+        let root = dunce::canonicalize(root.path()).expect("resolves");
         std::fs::create_dir(root.join("b")).expect("creates");
 
         for spelling in ["a/../b", "./b", "b/.", "b/.."] {

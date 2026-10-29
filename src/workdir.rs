@@ -24,6 +24,44 @@ const WORDS: &[&str] = &[
     "wave", "azure", "breeze",
 ];
 
+/// Create the missing tail of `path` without creating anything behind a link.
+///
+/// `create_dir_all` follows a link in an intermediate component, so a link
+/// where the tail starts would fill its target with empty directories before
+/// any check refused it. The deepest component that exists is verified first,
+/// and the rest is made one directory at a time.
+fn create_missing(path: &Path) -> Result<()> {
+    let working_dir_error = |path: &Path, source| Error::WorkingDir {
+        path: path.to_path_buf(),
+        source,
+    };
+
+    let mut missing = Vec::new();
+    let mut existing = None;
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                existing = Some(ancestor);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(ancestor),
+            Err(error) => return Err(working_dir_error(ancestor, error)),
+        }
+    }
+    if let Some(existing) = existing {
+        crate::platform::unresolved::verify(existing)?;
+    }
+    for directory in missing.into_iter().rev() {
+        match std::fs::create_dir(directory) {
+            Ok(()) => {}
+            // Another sandbox made it first; the final check judges what is there.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(working_dir_error(directory, error)),
+        }
+    }
+    Ok(())
+}
+
 /// Generate a directory name of four words and a random suffix.
 ///
 /// The suffix makes collisions between concurrent sandboxes effectively
@@ -100,7 +138,7 @@ impl WorkingDir {
             match std::fs::symlink_metadata(path) {
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir_all(path).map_err(working_dir_error(path))?;
+                    create_missing(path)?;
                     tracing::debug!(path = %path.display(), "created working directory");
                 }
                 Err(error) => return Err(working_dir_error(path)(error)),
@@ -328,7 +366,7 @@ mod tests {
 
         let error = WorkingDir::create(&wanted, false).expect_err("must not follow the link");
         assert!(
-            matches!(&error, Error::GrantRedirected { path } if *path == wanted),
+            matches!(&error, Error::GrantRedirected { path, .. } if *path == wanted),
             "{error:?}"
         );
     }

@@ -13,6 +13,7 @@ use crate::ipc::IpcRouter;
 use crate::network::{DenyAll, NetworkPolicy};
 use crate::policy::{ReadDenylist, WriteDenylist};
 use crate::priority::ProcessPriority;
+use crate::resolve::ResolvedPath;
 use crate::security::SecurityConfig;
 use crate::workdir::generate_working_dir_name;
 
@@ -390,13 +391,20 @@ impl SandboxConfigData {
     }
 
     /// Every path this configuration lets the sandbox write: the writable
-    /// grants, the working directory and a virtual environment that accepts
-    /// installs.
-    pub(crate) fn writable_paths(&self) -> Vec<&Path> {
+    /// grants, the writable persistent grants of an identity, the working
+    /// directory and a virtual environment that accepts installs.
+    pub(crate) fn writable_paths(&self) -> Vec<PathBuf> {
         self.grants
             .iter()
             .filter(|grant| grant.access().can_write())
             .map(Grant::path)
+            .chain(
+                self.identity
+                    .iter()
+                    .flat_map(|identity| identity.persistent_grants())
+                    .filter(|grant| grant.access().can_write())
+                    .map(Grant::path),
+            )
             .chain(std::iter::once(self.working_dir()))
             .chain(
                 self.python
@@ -404,6 +412,7 @@ impl SandboxConfigData {
                     .filter(|python| python.allow_pip_install())
                     .map(|python| python.venv().path()),
             )
+            .map(Path::to_path_buf)
             .collect()
     }
 
@@ -501,7 +510,7 @@ impl SandboxConfigData {
     /// A path granted twice keeps the union of both grants, so a directory that
     /// is listed as writable and as executable ends up both rather than
     /// whichever list a backend happened to read last.
-    pub(crate) fn push_grant(&mut self, path: PathBuf, access: Access) {
+    pub(crate) fn push_grant(&mut self, path: ResolvedPath, access: Access) {
         match self
             .grants
             .iter_mut()
@@ -520,7 +529,7 @@ impl SandboxConfigData {
             .map(|identity| identity.persistent_grants().to_vec())
             .unwrap_or_default();
         for grant in grants {
-            self.push_grant(grant.path().to_path_buf(), grant.access());
+            self.push_grant(grant.resolved_path().clone(), grant.access());
         }
     }
 }
@@ -657,17 +666,15 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Granting the same path twice keeps the union: `.writable(p).executable(p)`
     /// and `.grant(p, Access::WRITE | Access::EXEC)` configure the same sandbox.
     ///
-    /// The path must be absolute, already resolved and spelled without `.` or
-    /// `..` components: the sandbox never follows a symbolic link to honour a
-    /// grant. Building a sandbox checks each component of the path without
-    /// following links and fails with
+    /// The path is already resolved ([`ResolvedPath`]): the sandbox never
+    /// follows a symbolic link to honour a grant. Building a sandbox checks each
+    /// component of the path again, without following links, and fails with
     /// [`Error::GrantRedirected`](crate::Error::GrantRedirected) if one has
     /// become a link (on Windows, a symbolic link or junction), so a process
     /// that can replace a granted directory with a link cannot move the grant to
-    /// the link's target. A path that does not exist is an error too. Resolve
-    /// the paths a user wrote with [`resolve_paths`](crate::resolve_paths).
-    pub fn grant(mut self, path: impl AsRef<Path>, access: Access) -> Self {
-        self.data.push_grant(path.as_ref().to_path_buf(), access);
+    /// the link's target. A path that does not exist is an error too.
+    pub fn grant(mut self, path: ResolvedPath, access: Access) -> Self {
+        self.data.push_grant(path, access);
         self
     }
 
@@ -675,13 +682,13 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     pub fn grants(mut self, grants: impl IntoIterator<Item = Grant>) -> Self {
         for grant in grants {
             self.data
-                .push_grant(grant.path().to_path_buf(), grant.access());
+                .push_grant(grant.resolved_path().clone(), grant.access());
         }
         self
     }
 
     /// Allow reading one path: `.grant(path, Access::READ)`.
-    pub fn readable(self, path: impl AsRef<Path>) -> Self {
+    pub fn readable(self, path: ResolvedPath) -> Self {
         self.grant(path, Access::READ)
     }
 
@@ -689,7 +696,7 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     ///
     /// A path that is writable and not executable is denied execute, so nothing
     /// written there can be run.
-    pub fn writable(self, path: impl AsRef<Path>) -> Self {
+    pub fn writable(self, path: ResolvedPath) -> Self {
         self.grant(path, Access::WRITE)
     }
 
@@ -700,7 +707,7 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// that keep writable locations non-executable, so a path granted both ends
     /// up executable. That is what a build cache needs, and it gives up the
     /// write-then-execute guarantee for that path alone.
-    pub fn executable(self, path: impl AsRef<Path>) -> Self {
+    pub fn executable(self, path: ResolvedPath) -> Self {
         self.grant(path, Access::EXEC)
     }
 
@@ -915,8 +922,13 @@ pub fn python_dev_preset() -> SandboxConfig<DenyAll> {
 }
 
 /// A sandbox for Python data science, with the usual toolchain preinstalled.
-pub fn python_data_science_preset() -> SandboxConfig<DenyAll> {
-    SandboxConfigBuilder::default()
+///
+/// # Errors
+///
+/// [`Error::Path`](crate::Error::Path) when `/usr/share`, which it makes
+/// readable, does not exist on this host.
+pub fn python_data_science_preset() -> crate::Result<SandboxConfig<DenyAll>> {
+    Ok(SandboxConfigBuilder::default()
         .python(
             PythonConfig::builder()
                 .venv(
@@ -928,8 +940,8 @@ pub fn python_data_science_preset() -> SandboxConfig<DenyAll> {
                 .allow_pip_install(true)
                 .build(),
         )
-        .readable("/usr/share")
-        .build()
+        .readable(ResolvedPath::new("/usr/share")?)
+        .build())
 }
 
 #[cfg(test)]

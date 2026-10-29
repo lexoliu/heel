@@ -68,7 +68,7 @@ fn protected<N: NetworkPolicy>(network: N, home: &Path, probe: &Probe) -> Sandbo
         .filesystem_strict(false)
         .security(open_security())
         .writable_file_system(true)
-        .executable(&probe.binary)
+        .executable(fixtures::resolved(&probe.binary))
         .read_denylist(ReadDenylist::credentials().home(home))
         .write_denylist(WriteDenylist::persistence().home(home))
 }
@@ -504,7 +504,7 @@ async fn credential_agents_and_foreign_endpoints_cannot_be_connected_to() {
             .network(AllowAll)
             .filesystem_strict(false)
             .security(open_security())
-            .executable(&probe.binary)
+            .executable(fixtures::resolved(&probe.binary))
             .read_denylist(ReadDenylist::credentials().home(&root).socket(&agent)),
     )
     .await;
@@ -674,7 +674,7 @@ async fn x32_system_calls_are_refused_in_every_filter() {
         SandboxConfigBuilder::default()
             .filesystem_strict(false)
             .security(open_security())
-            .executable(&probe.binary),
+            .executable(fixtures::resolved(&probe.binary)),
     )
     .await;
     for (sandbox, what) in [(&broker, "with the broker"), (&plain, "without it")] {
@@ -691,7 +691,7 @@ async fn terminal_injection_ioctls_are_refused() {
         SandboxConfigBuilder::default()
             .filesystem_strict(false)
             .security(open_security())
-            .executable(&probe.binary),
+            .executable(fixtures::resolved(&probe.binary)),
     )
     .await;
     // Not a terminal, so an ioctl that reached the kernel would say ENOTTY.
@@ -716,7 +716,7 @@ async fn outbound_tcp_reaches_only_the_proxy_address_and_port() {
             .network(AllowAll)
             .filesystem_strict(false)
             .security(open_security())
-            .executable(&probe.binary),
+            .executable(fixtures::resolved(&probe.binary)),
     )
     .await;
     let proxy_port: u16 = sandbox

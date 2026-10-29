@@ -320,7 +320,7 @@ async fn a_heel_binary_link_the_sandbox_could_plant_is_refused() {
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_heel"), &link).expect("links");
     let config = SandboxConfigBuilder::default()
         .ipc(IpcRouter::new().register(Structured))
-        .writable(dir.path())
+        .writable(fixtures::resolved(dir.path()))
         .heel_binary(&link)
         .build();
 
@@ -330,7 +330,7 @@ async fn a_heel_binary_link_the_sandbox_could_plant_is_refused() {
         .expect("a link below a writable path is refused");
 
     assert!(
-        matches!(&error, heel::Error::GrantRedirected { path } if *path == link),
+        matches!(&error, heel::Error::GrantRedirected { path, .. } if *path == link),
         "{error:?}"
     );
 }

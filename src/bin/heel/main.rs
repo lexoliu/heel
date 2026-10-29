@@ -72,14 +72,14 @@ async fn run(cli: Cli) -> CliResult<i32> {
 
     match cli.command {
         Commands::Run(args) => {
-            let mut config = configure(&args.common)?;
-            config.resolve_paths()?;
-            commands::run::execute(args, config).await
+            let config = configure(&args.common)?;
+            let paths = config.resolve_paths().await?;
+            commands::run::execute(args, config, paths).await
         }
         Commands::Shell(args) => {
-            let mut config = configure(&args.common)?;
-            config.resolve_paths()?;
-            commands::shell::execute(args, config).await
+            let config = configure(&args.common)?;
+            let paths = config.resolve_paths().await?;
+            commands::shell::execute(args, config, paths).await
         }
         Commands::Python(args) => {
             let config = configure(&args.common)?;

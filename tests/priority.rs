@@ -65,7 +65,10 @@ async fn observe(priority: ProcessPriority) -> Observed {
     let probe = compile_probe(tools.path());
 
     let config = SandboxConfigBuilder::default()
-        .grant(tools.path(), Access::READ | Access::EXEC)
+        .grant(
+            fixtures::resolved(tools.path()),
+            Access::READ | Access::EXEC,
+        )
         .priority(priority)
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)

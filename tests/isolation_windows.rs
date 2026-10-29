@@ -137,11 +137,11 @@ async fn named_sandbox_reads_ordinary_and_persistent_grants() {
     let mut identity = IdentityCleanup::new(
         Identity::named(format!("t-{:016x}", rand::random::<u64>()))
             .expect("the identity name is valid")
-            .persistent_grant(Grant::new(&persistent, Access::READ)),
+            .persistent_grant(Grant::new(fixtures::resolved(&persistent), Access::READ)),
     );
     let config = SandboxConfigBuilder::default()
         .identity(identity.identity().clone())
-        .grant(&ordinary, Access::READ)
+        .grant(fixtures::resolved(&ordinary), Access::READ)
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -176,7 +176,7 @@ async fn dropping_one_named_sandbox_preserves_the_other_ordinary_grant() {
     let config = || {
         SandboxConfigBuilder::default()
             .identity(identity.identity().clone())
-            .grant(directory.path(), Access::READ)
+            .grant(fixtures::resolved(directory.path()), Access::READ)
             .build()
     };
     let first = Sandbox::with_config_and_executor(config(), executor_core::tokio::TokioGlobal)
@@ -315,7 +315,7 @@ async fn an_explicit_path_spelled_path_resolves_a_program_found_only_there() {
     ))
     .expect("the staged directory joins the host search path");
     let config = SandboxConfigBuilder::default()
-        .grant(dir.path(), Access::READ | Access::EXEC)
+        .grant(fixtures::resolved(dir.path()), Access::READ | Access::EXEC)
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -364,8 +364,11 @@ async fn a_writable_grant_lets_the_container_rename_and_remove_what_it_wrote() {
     let tools = fixtures::tempdir();
     let probe = compile_fixture(tools.path(), "fs_probe", "fs-probe.exe");
     let config = SandboxConfigBuilder::default()
-        .grant(dir.path(), Access::WRITE)
-        .grant(tools.path(), Access::READ | Access::EXEC)
+        .grant(fixtures::resolved(dir.path()), Access::WRITE)
+        .grant(
+            fixtures::resolved(tools.path()),
+            Access::READ | Access::EXEC,
+        )
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -403,7 +406,9 @@ async fn a_granted_directory_opens_children_deeper_than_max_path() {
     let staged = deep.join("staged.txt");
     std::fs::write(&staged, "deep-value").expect("the host stages a file");
 
-    let config = SandboxConfigBuilder::default().readable(dir.path()).build();
+    let config = SandboxConfigBuilder::default()
+        .readable(fixtures::resolved(dir.path()))
+        .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
         .expect("sandbox starts");
@@ -432,7 +437,7 @@ fn stage_program(dir: &Path) -> (PathBuf, PathBuf) {
 /// A sandbox that grants `dir` read-and-execute.
 async fn exec_granted_sandbox(dir: &Path) -> Sandbox {
     let config = SandboxConfigBuilder::default()
-        .grant(dir, Access::READ | Access::EXEC)
+        .grant(fixtures::resolved(dir), Access::READ | Access::EXEC)
         .build();
     Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -630,7 +635,9 @@ async fn read_inside(
 
 /// A sandbox with `path` granted `access`.
 async fn sandbox_granting(path: &Path, access: Access) -> heel::Result<Sandbox> {
-    let config = SandboxConfigBuilder::default().grant(path, access).build();
+    let config = SandboxConfigBuilder::default()
+        .grant(fixtures::resolved(path), access)
+        .build();
     Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await
 }
 
@@ -677,10 +684,8 @@ async fn a_grant_writes_the_acl_only_where_the_container_lacks_access() {
         PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles is set"));
     let child = program_files.join(format!("heel-grant-{}", std::process::id()));
     if let Err(source) = std::fs::create_dir(&child) {
-        let error = sandbox_granting(&child, Access::READ | Access::EXEC)
-            .await
-            .err()
-            .expect("a grant that cannot be written fails");
+        let error = heel::ResolvedPath::new(&child)
+            .expect_err("a directory that cannot be made cannot be granted");
         assert!(
             error.to_string().contains(child.to_string_lossy().as_ref()),
             "the error must name the path it could not grant ({source}): {error}"
@@ -964,7 +969,7 @@ async fn a_junction_inside_a_granted_directory_does_not_open_its_target() {
     );
 
     let config = SandboxConfigBuilder::default()
-        .readable(granted.path())
+        .readable(fixtures::resolved(granted.path()))
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -1128,7 +1133,7 @@ async fn a_deny_all_sandbox_does_not_inherit_its_identitys_loopback_exemption() 
         SandboxConfigBuilder::default()
             .network(heel::AllowAll)
             .identity(identity.identity().clone())
-            .executable(&probe)
+            .executable(fixtures::resolved(&probe))
             .build(),
         executor_core::tokio::TokioGlobal,
     )
@@ -1144,7 +1149,7 @@ async fn a_deny_all_sandbox_does_not_inherit_its_identitys_loopback_exemption() 
     let deny_all = Sandbox::with_config_and_executor(
         SandboxConfigBuilder::default()
             .identity(identity.identity().clone())
-            .executable(&probe)
+            .executable(fixtures::resolved(&probe))
             .build(),
         executor_core::tokio::TokioGlobal,
     )

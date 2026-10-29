@@ -41,12 +41,13 @@ use windows::Win32::Security::{
 #[cfg(test)]
 use windows::Win32::Storage::FileSystem::FILE_TRAVERSE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandleEx,
-    GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC,
+    CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FileAttributeTagInfo, FileIdInfo, GETFINALPATHNAMEBYHANDLE_FLAGS,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
+    VOLUME_NAME_DOS, WRITE_DAC,
 };
 use windows::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
@@ -54,6 +55,7 @@ use windows::Win32::System::SystemServices::{
 use windows::core::{PCWSTR, PWSTR};
 
 use super::{LocalBuffer, machine_lock};
+use crate::error::Redirection;
 
 /// A machine-wide name because heel processes in different sessions can grant
 /// the same shared directory and must serialize its ACL update.
@@ -276,27 +278,31 @@ fn write_dacl_handle(
 
 /// A path that is not the object it names: a link or junction sits in it.
 #[derive(Debug)]
-struct Redirected;
+struct Redirected(Redirection);
 
 impl std::fmt::Display for Redirected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the path passes through a symbolic link or junction")
+        self.0.fmt(f)
     }
 }
 
 impl std::error::Error for Redirected {}
 
-/// Whether `error` says a path was not the object it names.
-pub(crate) fn is_redirected(error: &io::Error) -> bool {
+/// Why `error` says a path was not the object it names, if it says so.
+pub(crate) fn redirection(error: &io::Error) -> Option<Redirection> {
     error
         .get_ref()
-        .is_some_and(|inner| inner.is::<Redirected>())
+        .and_then(|inner| inner.downcast_ref::<Redirected>())
+        .map(|redirected| redirected.0)
 }
 
 /// The bit that marks a reparse tag as redirecting a name to another path:
 /// symbolic links, junctions and the like. Placeholders and other reparse
 /// points (cloud files, deduplication) redirect nothing and do not carry it.
 const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
+/// The tag of a mount point, which is how a junction is stored.
+const REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 
 /// The `\\?\` spelling of `path`, with `/` separators turned into `\`.
 fn verbatim(path: &Path) -> String {
@@ -321,23 +327,21 @@ fn comparable(name: &str) -> String {
     name.trim_end_matches('\\').to_lowercase()
 }
 
-/// Open `path` once, and fail unless the handle is the object `path` names.
+/// A path opened once and proven to be the object it names.
 ///
-/// A name is resolved on every use, so checking it and then handing it to a
-/// call that opens it again leaves a window in which a process that can write
-/// a parent swaps the object for a junction. The check here is made on the
-/// handle instead: the open does not follow a link in the last component, and
-/// the handle's own final path must be the path asked for, which it is not when
-/// any component, a parent included, redirected the open. Whatever is then
-/// done with the handle lands on that object and no other.
+/// Everything done with it lands on that object and no other: the DACL is read
+/// and written through the handle, never by name again.
+pub(crate) struct Opened {
+    handle: OwnedHandle,
+    name: String,
+    directory: bool,
+}
+
+/// Open `path` without following a reparse point in its last component.
 ///
-/// Only a redirecting reparse point (a symbolic link or junction) is refused:
-/// a placeholder or deduplicated file is the object it names. `path` must be
-/// the resolved path, long names and all, as `std::fs::canonicalize` spells it.
-/// The name the handle reports is returned, for recording.
-///
-/// `access` is added to the rights the check itself needs.
-fn open_unredirected(path: &Path, access: u32) -> io::Result<(OwnedHandle, String)> {
+/// `path` must already be in normal form. The handle carries `access` and the
+/// right to read attributes.
+fn open_no_reparse(path: &Path, access: u32) -> io::Result<OwnedHandle> {
     crate::platform::unresolved::require_normal(path)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let expected = verbatim(path);
@@ -357,34 +361,19 @@ fn open_unredirected(path: &Path, access: u32) -> io::Result<(OwnedHandle, Strin
             None,
         )
     }
-    .map_err(|source| io::Error::other(format!("cannot open {}: {source}", path.display())))?;
-    // SAFETY: the handle came from the call above and is closed exactly once.
-    let owned = unsafe { OwnedHandle::from_raw_handle(handle.0.cast()) };
-
-    let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
-    // SAFETY: `tag` is the structure this information class fills, and the size
-    // passed is its size.
-    unsafe {
-        GetFileInformationByHandleEx(
-            handle,
-            FileAttributeTagInfo,
-            (&raw mut tag).cast(),
-            u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>())
-                .expect("the structure is a few bytes"),
-        )
-    }
     .map_err(|source| {
-        io::Error::other(format!(
-            "cannot read the attributes of {}: {source}",
-            path.display()
-        ))
+        let source = io::Error::from(source);
+        io::Error::new(
+            source.kind(),
+            format!("cannot open {}: {source}", path.display()),
+        )
     })?;
-    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
-        && tag.ReparseTag & REPARSE_TAG_NAME_SURROGATE != 0
-    {
-        return Err(io::Error::other(Redirected));
-    }
+    // SAFETY: the handle came from the call above and is closed exactly once.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0.cast()) })
+}
 
+/// The final path of the object `handle` refers to, as the system spells it.
+fn final_path_of(handle: HANDLE, path: &Path) -> io::Result<String> {
     let mut buffer = vec![0u16; 512];
     let length = loop {
         // SAFETY: `buffer` is a valid destination of the length passed.
@@ -407,17 +396,172 @@ fn open_unredirected(path: &Path, access: u32) -> io::Result<(OwnedHandle, Strin
         }
         buffer.resize(length + 1, 0);
     };
-    let actual = String::from_utf16_lossy(&buffer[..length]);
-    if comparable(&actual) != comparable(&expected) {
-        return Err(io::Error::other(Redirected));
+    Ok(String::from_utf16_lossy(&buffer[..length]))
+}
+
+/// The final path of the object `path` names, with the verbatim prefix dropped
+/// where the path allows it, read from a handle that did not follow a reparse
+/// point in the last component. Long names and case are the system's.
+pub(crate) fn final_path(path: &Path) -> io::Result<std::path::PathBuf> {
+    let handle = open_no_reparse(path, 0)?;
+    let name = final_path_of(raw(&handle), path)?;
+    Ok(dunce::simplified(Path::new(&name)).to_path_buf())
+}
+
+/// The identity of the object `path` names: the volume serial number and the
+/// 128-bit file id, read from a handle that did not follow a reparse point in
+/// the last component. Two spellings of one object give the same pair.
+pub(crate) fn file_id(path: &Path) -> io::Result<(u64, u128)> {
+    let handle = open_no_reparse(path, 0)?;
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `info` is the structure this information class fills, and the
+    // size passed is its size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            raw(&handle),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
+                .expect("the structure is a few bytes"),
+        )
+    }
+    .map_err(|source| {
+        io::Error::other(format!(
+            "cannot read the file id of {}: {source}",
+            path.display()
+        ))
+    })?;
+    Ok((
+        info.VolumeSerialNumber,
+        u128::from_le_bytes(info.FileId.Identifier),
+    ))
+}
+
+/// Open `path` once, and fail unless the handle is the object `path` names.
+///
+/// A name is resolved on every use, so checking it and then handing it to a
+/// call that opens it again leaves a window in which a process that can write
+/// a parent swaps the object for a junction. The check here is made on the
+/// handle instead: the open does not follow a link in the last component, and
+/// the handle's own final path must be the path asked for, which it is not when
+/// any component, a parent included, redirected the open. Whatever is then
+/// done with the handle lands on that object and no other.
+///
+/// Only a redirecting reparse point (a symbolic link or junction) is refused:
+/// a placeholder or deduplicated file is the object it names. `path` must be
+/// the resolved path, long names and all, as `dunce::canonicalize` spells it.
+///
+/// `access` is added to the rights the check itself needs.
+fn open_unredirected(path: &Path, access: u32) -> io::Result<Opened> {
+    let handle = open_no_reparse(path, access)?;
+    let expected = verbatim(path);
+
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: `tag` is the structure this information class fills, and the size
+    // passed is its size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            raw(&handle),
+            FileAttributeTagInfo,
+            (&raw mut tag).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>())
+                .expect("the structure is a few bytes"),
+        )
+    }
+    .map_err(|source| {
+        io::Error::other(format!(
+            "cannot read the attributes of {}: {source}",
+            path.display()
+        ))
+    })?;
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        && tag.ReparseTag & REPARSE_TAG_NAME_SURROGATE != 0
+    {
+        return Err(io::Error::other(Redirected(
+            if tag.ReparseTag == REPARSE_TAG_MOUNT_POINT {
+                Redirection::Junction
+            } else {
+                Redirection::SymbolicLink
+            },
+        )));
     }
 
-    Ok((owned, actual))
+    let actual = final_path_of(raw(&handle), path)?;
+    if comparable(&actual) != comparable(&expected) {
+        return Err(io::Error::other(Redirected(
+            Redirection::DifferentFinalPath,
+        )));
+    }
+
+    Ok(Opened {
+        handle,
+        name: actual,
+        directory: tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
+    })
+}
+
+/// Open `path` as the object it names, asking for the right to rewrite its
+/// access control list when the caller holds it.
+///
+/// A directory the caller cannot rewrite (a system directory whose list is not
+/// ours to change) opens for reading its list only; granting through that handle
+/// fails, which is the failure a grant there has always been.
+pub(crate) fn open(path: &Path) -> io::Result<Opened> {
+    match open_unredirected(path, READ_CONTROL.0 | WRITE_DAC.0) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            open_unredirected(path, READ_CONTROL.0)
+        }
+        result => result,
+    }
+}
+
+impl Opened {
+    /// Whether the object is a directory.
+    pub(crate) fn is_directory(&self) -> bool {
+        self.directory
+    }
+
+    /// The rights the named `trustees` receive from the object's own list; see
+    /// [`effective_rights`].
+    pub(crate) fn rights(&self, trustees: &[&str]) -> io::Result<u32> {
+        let (_descriptor, current) =
+            read_dacl_handle(raw(&self.handle), SE_FILE_OBJECT, &self.name)?;
+        rights_in(current, trustees, &self.name)
+    }
+
+    /// Add `entries` for `sid` to the object's list, as [`grant`] does. The
+    /// name the handle reports is returned, for the matching revoke.
+    pub(crate) fn grant(&self, sid: &str, entries: &[Entry]) -> io::Result<String> {
+        let _guard = lock()?;
+        let (_descriptor, current) =
+            read_dacl_handle(raw(&self.handle), SE_FILE_OBJECT, &self.name)?;
+        let updated = merge(sid, current, entries, &self.name)?;
+        write_dacl_handle(raw(&self.handle), SE_FILE_OBJECT, updated, &self.name)?;
+        Ok(self.name.clone())
+    }
+
+    /// Add `access` for `sid` to the object alone, as [`grant_this_only`] does.
+    pub(crate) fn grant_this_only(&self, sid: &str, access: u32) -> io::Result<String> {
+        let _guard = lock()?;
+        let (descriptor, current) =
+            read_dacl_handle(raw(&self.handle), SE_FILE_OBJECT, &self.name)?;
+        let updated = merge(
+            sid,
+            current,
+            &[Entry {
+                access,
+                applies_to: Scope::ThisOnly,
+            }],
+            &self.name,
+        )?;
+        write_file_dacl_handle(raw(&self.handle), &self.name, &descriptor, updated)?;
+        Ok(self.name.clone())
+    }
 }
 
 /// The verbatim name of `path`, after proving no link or junction is in it.
 pub(crate) fn unredirected_name(path: &Path) -> io::Result<String> {
-    open_unredirected(path, READ_CONTROL.0).map(|(_, name)| name)
+    open_unredirected(path, READ_CONTROL.0).map(|opened| opened.name)
 }
 
 /// The raw handle of an owned one, for the Win32 calls.
@@ -437,12 +581,7 @@ fn raw(handle: &OwnedHandle) -> HANDLE {
 /// [`open_unredirected`]). The name the handle reports is returned so the
 /// caller can hand the same name to `revoke` when the sandbox is dropped.
 pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<String> {
-    let _guard = lock()?;
-    let (handle, name) = open_unredirected(path, READ_CONTROL.0 | WRITE_DAC.0)?;
-    let (_descriptor, current) = read_dacl_handle(raw(&handle), SE_FILE_OBJECT, &name)?;
-    let updated = merge(sid, current, entries, &name)?;
-    write_dacl_handle(raw(&handle), SE_FILE_OBJECT, updated, &name)?;
-    Ok(name)
+    open(path)?.grant(sid, entries)
 }
 
 /// Add `access` for `sid` to the object at `path` alone, without touching
@@ -462,20 +601,7 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<Str
 /// `grant` does. The name the handle reports is returned, as `grant` returns
 /// it, for the matching `revoke_this_only` call.
 pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result<String> {
-    let _guard = lock()?;
-    let (handle, name) = open_unredirected(path, READ_CONTROL.0 | WRITE_DAC.0)?;
-    let (descriptor, current) = read_dacl_handle(raw(&handle), SE_FILE_OBJECT, &name)?;
-    let updated = merge(
-        sid,
-        current,
-        &[Entry {
-            access,
-            applies_to: Scope::ThisOnly,
-        }],
-        &name,
-    )?;
-    write_file_dacl_handle(raw(&handle), &name, &descriptor, updated)?;
-    Ok(name)
+    open(path)?.grant_this_only(sid, access)
 }
 
 /// Add inheritable entries to `path` without propagating them to its children.
@@ -522,7 +648,12 @@ pub(crate) fn revoke_this_only(name: &str, sddl: &str) -> io::Result<()> {
 pub(crate) fn effective_rights(path: &Path, trustees: &[&str]) -> io::Result<u32> {
     let name = resolve(path)?;
     let (_descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
+    rights_in(current, trustees, &name)
+}
 
+/// The rights `trustees` receive from the list `current`, which belongs to the
+/// object `name` and is kept alive by the caller's descriptor.
+fn rights_in(current: *mut ACL, trustees: &[&str], name: &str) -> io::Result<u32> {
     // SetSecurityDescriptorDacl documents that a NULL DACL allows all access;
     // an absent list therefore cannot be treated like an empty, deny-all DACL.
     if current.is_null() {
@@ -1069,10 +1200,10 @@ mod tests {
         // The last component, and a parent of it.
         for through in [link.clone(), link.join("inner")] {
             let error = grant(&through, marker, &entries).expect_err("a junction is refused");
-            assert!(is_redirected(&error), "{through:?}: {error}");
+            assert!(redirection(&error).is_some(), "{through:?}: {error}");
             let error = grant_this_only(&through, marker, FILE_TRAVERSE.0)
                 .expect_err("a junction is refused");
-            assert!(is_redirected(&error), "{through:?}: {error}");
+            assert!(redirection(&error).is_some(), "{through:?}: {error}");
         }
         for target in [&real, &inner] {
             let name = resolve(target).expect("the target resolves");
