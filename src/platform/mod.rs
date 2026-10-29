@@ -115,13 +115,7 @@ pub(crate) fn create_native_backend(
     config: &SandboxConfigData,
     proxy_port: Option<u16>,
 ) -> Result<NativeBackend> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    return NativeBackend::new(config, proxy_port);
-    #[cfg(target_os = "windows")]
-    {
-        let _ = proxy_port;
-        NativeBackend::new(config)
-    }
+    NativeBackend::new(config, proxy_port)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
