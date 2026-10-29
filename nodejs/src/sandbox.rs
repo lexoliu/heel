@@ -73,13 +73,14 @@ impl Sandbox {
         let mut config = config.unwrap_or_else(crate::config::preset_strict);
         let policy = PolicySelection::from_config(config.network.take())?;
         let builder = heel::SandboxConfig::builder();
+        let paths = config.resolve_paths().await?;
 
         // The policy type is resolved here so that a deny-all sandbox gets the
         // kernel-level denial its type selects, rather than a proxy that says no.
         let inner = match policy {
             PolicySelection::DenyAll => SandboxInner::DenyAll(
                 RustSandbox::with_config_and_executor(
-                    config.apply(builder)?,
+                    config.apply(builder, paths)?,
                     executor_core::tokio::TokioGlobal,
                 )
                 .await
@@ -87,7 +88,7 @@ impl Sandbox {
             ),
             PolicySelection::AllowAll => SandboxInner::AllowAll(
                 RustSandbox::with_config_and_executor(
-                    config.apply(builder.network(AllowAll))?,
+                    config.apply(builder.network(AllowAll), paths)?,
                     executor_core::tokio::TokioGlobal,
                 )
                 .await
@@ -95,7 +96,7 @@ impl Sandbox {
             ),
             PolicySelection::AllowList(domains) => SandboxInner::AllowList(
                 RustSandbox::with_config_and_executor(
-                    config.apply(builder.network(AllowList::new(domains)))?,
+                    config.apply(builder.network(AllowList::new(domains)), paths)?,
                     executor_core::tokio::TokioGlobal,
                 )
                 .await

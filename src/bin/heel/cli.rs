@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use heel::{Access, Grant, SecurityOverrides};
+use heel::{Access, SecurityOverrides};
 use serde::Deserialize;
 
 use crate::error::CliError;
@@ -23,6 +23,8 @@ impl Cli {
             Commands::Shell(args) => args.common.verbose,
             Commands::Python(args) => args.common.verbose,
             Commands::Ipc(args) => args.verbose,
+            #[cfg(target_os = "linux")]
+            Commands::Supervise(_) => false,
         }
     }
 }
@@ -40,6 +42,36 @@ pub enum Commands {
 
     /// Invoke a host IPC command from inside a sandbox.
     Ipc(IpcArgs),
+
+    /// Run a command as the root of its process tree and own that tree.
+    ///
+    /// Started by the library inside the sandbox for a supervised command; it
+    /// reads and writes a socket the library passed down, and is not meant to
+    /// be run by hand.
+    #[cfg(target_os = "linux")]
+    Supervise(SuperviseArgs),
+}
+
+/// Run a command under a supervisor.
+#[cfg(target_os = "linux")]
+#[derive(Args)]
+pub struct SuperviseArgs {
+    /// Whether to tear the tree down when the command exits, or to live as
+    /// long as any descendant does.
+    #[arg(long)]
+    pub mode: heel::supervisor::Mode,
+
+    /// The inherited socket to the host.
+    #[arg(long)]
+    pub control_fd: std::os::fd::RawFd,
+
+    /// How long a teardown waits for the processes it killed to exit.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    pub reap_timeout: std::time::Duration,
+
+    /// The command to run, followed by its own arguments.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<String>,
 }
 
 #[derive(Args)]
@@ -368,12 +400,6 @@ impl FromStr for GrantArg {
                 source,
             })?,
         })
-    }
-}
-
-impl From<&GrantArg> for Grant {
-    fn from(arg: &GrantArg) -> Self {
-        Self::new(&arg.path, arg.access)
     }
 }
 

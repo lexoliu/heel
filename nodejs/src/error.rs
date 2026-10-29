@@ -15,6 +15,7 @@ pub fn convert_error(err: heel::Error) -> Error {
         heel::Error::NotEnforced(_) => "ERR_NOT_ENFORCED",
         heel::Error::InvalidProfile(_) => "ERR_INVALID_PROFILE",
         heel::Error::Path { .. } => "ERR_PATH",
+        heel::Error::GrantRedirected { .. } => "ERR_GRANT_REDIRECTED",
         heel::Error::WorkingDir { .. } => "ERR_WORKING_DIR",
         heel::Error::PythonNotFound => "ERR_PYTHON_NOT_FOUND",
         heel::Error::VenvNotFound(_) => "ERR_VENV_NOT_FOUND",

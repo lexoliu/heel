@@ -83,6 +83,20 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// A path the sandbox is configured with is not the object it names.
+    ///
+    /// A grant names a path the caller has already resolved, and the sandbox
+    /// never follows a link to honour it: a component that has become a link
+    /// since the caller resolved the path would redirect the grant to the
+    /// link's target, so the build is refused and nothing is granted.
+    #[error("{path} is not the object it names: {reason}")]
+    GrantRedirected {
+        /// The path, as the caller configured it.
+        path: PathBuf,
+        /// What redirects it.
+        reason: Redirection,
+    },
+
     /// The working directory could not be prepared or removed.
     #[error("cannot prepare working directory {path}: {source}")]
     WorkingDir {
@@ -128,6 +142,38 @@ pub enum Error {
     #[error("IPC error: {0}")]
     Ipc(#[from] IpcError),
 
+    /// A supervised spawn was requested from a sandbox built without
+    /// [`supervised_spawn`](crate::SandboxConfigBuilder::supervised_spawn).
+    #[cfg(target_os = "linux")]
+    #[error("the sandbox was not built with supervised_spawn(true)")]
+    SupervisorNotConfigured,
+
+    /// The supervisor could not start the command (it does not exist, is not
+    /// executable inside the sandbox, ...). Nothing ran.
+    #[cfg(target_os = "linux")]
+    #[error("the supervisor could not start the command: {0}")]
+    SupervisedSpawnFailed(crate::supervisor::SpawnFailure),
+
+    /// The supervised command had not exited when the teardown budget ran out.
+    /// The report names the processes still alive.
+    #[cfg(target_os = "linux")]
+    #[error("the supervised command had not exited when the teardown budget ran out")]
+    SupervisedCommandUnreaped(crate::supervisor::TreeReport),
+
+    /// The supervisor failed. It killed what it had frozen first, but
+    /// processes it had not reached may still be running.
+    #[cfg(target_os = "linux")]
+    #[error("the command's supervisor failed: {0}")]
+    SupervisorFailed(String),
+
+    /// The supervisor of a command ended without reporting how.
+    ///
+    /// It was killed from outside, or crashed; the processes it supervised may
+    /// still be running.
+    #[cfg(target_os = "linux")]
+    #[error("the command's supervisor ended without a final report")]
+    SupervisorLost,
+
     /// A pseudo-terminal operation failed.
     #[error("PTY error: {0}")]
     Pty(String),
@@ -141,4 +187,24 @@ impl Error {
             source,
         }
     }
+}
+
+/// What stands between a configured path and the object it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Redirection {
+    /// A component is a symbolic link. On Windows this covers any
+    /// name-surrogate reparse point that is not recognised as a junction.
+    #[error("a component is a symbolic link")]
+    SymbolicLink,
+
+    /// A component is a Windows junction (a mount-point reparse point).
+    #[error("a component is a junction")]
+    Junction,
+
+    /// The object opened lives at a different final path than the one asked
+    /// for: a component redirected the open without being reported as a link,
+    /// or the path spells a short name or a different case than the resolved
+    /// path.
+    #[error("its final path differs from the path asked for")]
+    DifferentFinalPath,
 }

@@ -11,7 +11,7 @@
 //! handles rather than `std::process` streams — and that is why
 //! [`crate::platform::child::Child`] is generic over its handle.
 
-mod acl;
+pub(crate) mod acl;
 mod capability;
 mod child;
 mod container;
@@ -93,6 +93,22 @@ impl Win32Failure {
         move |source| Self::Io {
             call,
             source: io::Error::other(format!("{}: {source}", path.display())),
+        }
+    }
+
+    /// Like [`Self::io_at`] for a call that opens `path` as the object it names:
+    /// a path that turns out to pass through a link or junction is the typed
+    /// [`Error::GrantRedirected`], not a message.
+    fn grant_at<'a>(call: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> Self + 'a {
+        move |source| {
+            if let Some(reason) = acl::redirection(&source) {
+                Self::Internal(Error::GrantRedirected {
+                    path: path.to_path_buf(),
+                    reason,
+                })
+            } else {
+                Self::io_at(call, path)(source)
+            }
         }
     }
 }
@@ -229,7 +245,13 @@ impl WindowsBackend {
             "a launch must agree with the proxy decision its container was created for"
         );
         let capabilities = self.container.capabilities(self.proxied)?;
-        self.container.grant_program(&program, &capabilities)?;
+        // The program is the host's choice and is often reached through a link
+        // (a shim), so the grant goes to what it resolves to, unless a sandbox
+        // could have planted the link: the launch itself still names the program
+        // as it was found.
+        let granted = crate::resolve::resolve_outside(&program, &request.config.writable_paths())?;
+        self.container
+            .grant_program(granted.as_path(), &capabilities)?;
 
         // A proxy port means a filtering policy, which only works if the
         // container may reach the proxy on loopback.

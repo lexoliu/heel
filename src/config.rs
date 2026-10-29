@@ -13,6 +13,7 @@ use crate::ipc::IpcRouter;
 use crate::network::{DenyAll, NetworkPolicy};
 use crate::policy::{ReadDenylist, WriteDenylist};
 use crate::priority::ProcessPriority;
+use crate::resolve::ResolvedPath;
 use crate::security::SecurityConfig;
 use crate::workdir::generate_working_dir_name;
 
@@ -345,6 +346,13 @@ pub struct SandboxConfigData {
     heel_binary: Option<PathBuf>,
     external_ipc: Option<crate::ipc::TcpIpcEndpoint>,
     allow_tty_write: bool,
+    /// Whether commands may be spawned under a per-command supervisor.
+    #[cfg(target_os = "linux")]
+    supervised_spawn: bool,
+    /// The `heel` binary the supervisor runs as, resolved when the sandbox is
+    /// created and executable inside it. `None` unless `supervised_spawn`.
+    #[cfg(target_os = "linux")]
+    supervisor_binary: Option<PathBuf>,
 }
 
 impl SandboxConfigData {
@@ -387,6 +395,32 @@ impl SandboxConfigData {
     /// The sandbox working directory.
     pub fn working_dir(&self) -> &Path {
         &self.working_dir
+    }
+
+    /// Every path this configuration lets the sandbox write: the writable
+    /// grants, the writable persistent grants of an identity, the working
+    /// directory and a virtual environment that accepts installs.
+    pub(crate) fn writable_paths(&self) -> Vec<PathBuf> {
+        self.grants
+            .iter()
+            .filter(|grant| grant.access().can_write())
+            .map(Grant::path)
+            .chain(
+                self.identity
+                    .iter()
+                    .flat_map(|identity| identity.persistent_grants())
+                    .filter(|grant| grant.access().can_write())
+                    .map(Grant::path),
+            )
+            .chain(std::iter::once(self.working_dir()))
+            .chain(
+                self.python
+                    .as_ref()
+                    .filter(|python| python.allow_pip_install())
+                    .map(|python| python.venv().path()),
+            )
+            .map(Path::to_path_buf)
+            .collect()
     }
 
     /// Whether the working directory path was generated rather than supplied.
@@ -468,6 +502,25 @@ impl SandboxConfigData {
         self.allow_tty_write
     }
 
+    /// Whether commands may be spawned under a per-command supervisor.
+    #[cfg(target_os = "linux")]
+    pub fn supervised_spawn(&self) -> bool {
+        self.supervised_spawn
+    }
+
+    /// The `heel` binary a supervised command runs under, once the sandbox
+    /// has resolved it.
+    #[cfg(target_os = "linux")]
+    pub fn supervisor_binary(&self) -> Option<&Path> {
+        self.supervisor_binary.as_deref()
+    }
+
+    /// Record the `heel` binary the supervisor runs as.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_supervisor_binary(&mut self, path: PathBuf) {
+        self.supervisor_binary = Some(path);
+    }
+
     /// Replace the working directory with its canonical, created form.
     pub(crate) fn set_working_dir(&mut self, path: PathBuf) {
         self.working_dir = path;
@@ -483,7 +536,7 @@ impl SandboxConfigData {
     /// A path granted twice keeps the union of both grants, so a directory that
     /// is listed as writable and as executable ends up both rather than
     /// whichever list a backend happened to read last.
-    pub(crate) fn push_grant(&mut self, path: PathBuf, access: Access) {
+    pub(crate) fn push_grant(&mut self, path: ResolvedPath, access: Access) {
         match self
             .grants
             .iter_mut()
@@ -502,7 +555,7 @@ impl SandboxConfigData {
             .map(|identity| identity.persistent_grants().to_vec())
             .unwrap_or_default();
         for grant in grants {
-            self.push_grant(grant.path().to_path_buf(), grant.access());
+            self.push_grant(grant.resolved_path().clone(), grant.access());
         }
     }
 }
@@ -597,6 +650,10 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 external_ipc: None,
                 // Deny /dev/tty writes by default so all output is captured.
                 allow_tty_write: false,
+                #[cfg(target_os = "linux")]
+                supervised_spawn: false,
+                #[cfg(target_os = "linux")]
+                supervisor_binary: None,
             },
             ipc: None,
             ipc_state: std::marker::PhantomData,
@@ -638,8 +695,16 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     ///
     /// Granting the same path twice keeps the union: `.writable(p).executable(p)`
     /// and `.grant(p, Access::WRITE | Access::EXEC)` configure the same sandbox.
-    pub fn grant(mut self, path: impl AsRef<Path>, access: Access) -> Self {
-        self.data.push_grant(path.as_ref().to_path_buf(), access);
+    ///
+    /// The path is already resolved ([`ResolvedPath`]): the sandbox never
+    /// follows a symbolic link to honour a grant. Building a sandbox checks each
+    /// component of the path again, without following links, and fails with
+    /// [`Error::GrantRedirected`](crate::Error::GrantRedirected) if one has
+    /// become a link (on Windows, a symbolic link or junction), so a process
+    /// that can replace a granted directory with a link cannot move the grant to
+    /// the link's target. A path that does not exist is an error too.
+    pub fn grant(mut self, path: ResolvedPath, access: Access) -> Self {
+        self.data.push_grant(path, access);
         self
     }
 
@@ -647,13 +712,13 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     pub fn grants(mut self, grants: impl IntoIterator<Item = Grant>) -> Self {
         for grant in grants {
             self.data
-                .push_grant(grant.path().to_path_buf(), grant.access());
+                .push_grant(grant.resolved_path().clone(), grant.access());
         }
         self
     }
 
     /// Allow reading one path: `.grant(path, Access::READ)`.
-    pub fn readable(self, path: impl AsRef<Path>) -> Self {
+    pub fn readable(self, path: ResolvedPath) -> Self {
         self.grant(path, Access::READ)
     }
 
@@ -661,7 +726,7 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     ///
     /// A path that is writable and not executable is denied execute, so nothing
     /// written there can be run.
-    pub fn writable(self, path: impl AsRef<Path>) -> Self {
+    pub fn writable(self, path: ResolvedPath) -> Self {
         self.grant(path, Access::WRITE)
     }
 
@@ -672,7 +737,7 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// that keep writable locations non-executable, so a path granted both ends
     /// up executable. That is what a build cache needs, and it gives up the
     /// write-then-execute guarantee for that path alone.
-    pub fn executable(self, path: impl AsRef<Path>) -> Self {
+    pub fn executable(self, path: ResolvedPath) -> Self {
         self.grant(path, Access::EXEC)
     }
 
@@ -750,6 +815,11 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     ///
     /// The directory is created when the sandbox starts if it does not exist.
     /// A directory supplied here is never deleted when the sandbox is dropped.
+    ///
+    /// Like a grant, the path must be absolute, already resolved and spelled
+    /// without `.` or `..` components, and it is never resolved again: if a
+    /// sandbox of an earlier run replaced it with a link, starting a sandbox
+    /// fails with [`Error::GrantRedirected`](crate::Error::GrantRedirected).
     pub fn working_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.data.working_dir = path.as_ref().to_path_buf();
         self.data.working_dir_auto = false;
@@ -840,6 +910,18 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
         self
     }
 
+    /// Allow [`Command::spawn_supervised`](crate::Command::spawn_supervised).
+    ///
+    /// A supervised command runs under `heel supervise` inside the sandbox, so
+    /// the sandbox has to be able to execute the `heel` binary (found as for
+    /// [`heel_binary`](Self::heel_binary)). Creating the sandbox fails if that
+    /// binary cannot be found.
+    #[cfg(target_os = "linux")]
+    pub fn supervised_spawn(mut self, enabled: bool) -> Self {
+        self.data.supervised_spawn = enabled;
+        self
+    }
+
     /// Let the sandboxed process write to the controlling terminal.
     ///
     /// When `false` (the default), output must go through the captured
@@ -882,8 +964,13 @@ pub fn python_dev_preset() -> SandboxConfig<DenyAll> {
 }
 
 /// A sandbox for Python data science, with the usual toolchain preinstalled.
-pub fn python_data_science_preset() -> SandboxConfig<DenyAll> {
-    SandboxConfigBuilder::default()
+///
+/// # Errors
+///
+/// [`Error::Path`](crate::Error::Path) when `/usr/share`, which it makes
+/// readable, does not exist on this host.
+pub fn python_data_science_preset() -> crate::Result<SandboxConfig<DenyAll>> {
+    Ok(SandboxConfigBuilder::default()
         .python(
             PythonConfig::builder()
                 .venv(
@@ -895,8 +982,8 @@ pub fn python_data_science_preset() -> SandboxConfig<DenyAll> {
                 .allow_pip_install(true)
                 .build(),
         )
-        .readable("/usr/share")
-        .build()
+        .readable(ResolvedPath::new("/usr/share")?)
+        .build())
 }
 
 #[cfg(test)]

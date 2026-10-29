@@ -49,6 +49,14 @@ fn main() -> ExitCode {
         )
         .init();
 
+    // The supervisor must be the process's only thread: the `SIGCHLD` it waits
+    // on is process-directed, so it runs before the executor below exists.
+    #[cfg(target_os = "linux")]
+    let cli = match cli.command {
+        Commands::Supervise(args) => return commands::supervise::execute(args),
+        command => Cli { command },
+    };
+
     // `block_on` below drives only this future; the sandbox's proxy and IPC
     // server are spawned onto the global executor, so that one has to run its
     // own tasks. smol's does, on threads it owns.
@@ -73,17 +81,21 @@ async fn run(cli: Cli) -> CliResult<i32> {
     match cli.command {
         Commands::Run(args) => {
             let config = configure(&args.common)?;
-            commands::run::execute(args, config).await
+            let paths = config.resolve_paths().await?;
+            commands::run::execute(args, config, paths).await
         }
         Commands::Shell(args) => {
             let config = configure(&args.common)?;
-            commands::shell::execute(args, config).await
+            let paths = config.resolve_paths().await?;
+            commands::shell::execute(args, config, paths).await
         }
         Commands::Python(args) => {
             let config = configure(&args.common)?;
             commands::python::execute(args, config).await
         }
         Commands::Ipc(_) => unreachable!("handled above"),
+        #[cfg(target_os = "linux")]
+        Commands::Supervise(_) => unreachable!("handled in main"),
     }
 }
 

@@ -23,7 +23,7 @@ struct LaunchFixture {
 
 impl LaunchFixture {
     fn new() -> Self {
-        let directory = tempfile::tempdir().expect("native launch directory");
+        let directory = crate::platform::unresolved::resolved_tempdir();
         let config = crate::SandboxConfig::builder()
             .working_dir(directory.path())
             .build();

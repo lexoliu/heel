@@ -235,9 +235,9 @@
 ; PASS 3: USER-CONFIGURED PATHS
 ;
 ; These come last so that an explicitly configured path always wins over the
-; protections above. Every path here has been canonicalized by the profile
-; generator: SBPL matches resolved paths, so "/tmp/x" would never match the
-; kernel's "/private/tmp/x".
+; protections above. Every path here is absolute, already resolved and verified
+; by the profile generator to contain no link: SBPL matches resolved paths, so
+; "/tmp/x" would never match the kernel's "/private/tmp/x".
 ; =============================================================================
 
 ; Ancestors of every granted path, so that resolving into an allowed directory
@@ -256,7 +256,7 @@
 ;
 ; A grant naming a directory is rendered with `subpath` and covers its whole
 ; tree; one naming a file is rendered with `literal`. The profile generator
-; decides which from the canonicalized path.
+; decides which from the path itself.
 {% for grant in grants %}
 (allow file-read* ({{ grant.filter }} "{{ grant.path }}"))
 {% if grant.writable %}

@@ -756,11 +756,13 @@ dependencies = [
 name = "heel-nodejs"
 version = "0.1.0"
 dependencies = [
+ "blocking",
  "executor-core",
  "heel",
  "napi",
  "napi-build",
  "napi-derive",
+ "tempfile",
  "tokio",
 ]
 
