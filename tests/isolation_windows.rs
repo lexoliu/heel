@@ -980,3 +980,95 @@ async fn a_junction_inside_a_granted_directory_does_not_open_its_target() {
         );
     }
 }
+
+/// A file in the host's shared temp directory, which no container reaches
+/// unless the configuration opens it.
+fn shared_temp_file(content: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir_in(std::env::temp_dir()).expect("a directory in shared temp");
+    let file = dir.path().join("shared.txt");
+    fs::write(&file, content).expect("writes");
+    (dir, file)
+}
+
+async fn sandbox_with(config: SandboxConfig) -> Sandbox {
+    Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts")
+}
+
+#[tokio::test]
+async fn strict_mode_keeps_shared_temp_closed() {
+    let (_dir, file) = shared_temp_file("shared-needle");
+    let sandbox = sandbox_with(
+        SandboxConfigBuilder::default()
+            .filesystem_strict(true)
+            .build(),
+    )
+    .await;
+
+    let output = read_inside(&sandbox, &file, "shared-needle").await;
+
+    assert!(
+        !output.status.success(),
+        "strict mode must not read shared temp: {}",
+        stdout(&output)
+    );
+}
+
+#[tokio::test]
+async fn relaxed_mode_reads_shared_temp() {
+    let (_dir, file) = shared_temp_file("shared-needle");
+    let sandbox = sandbox_with(
+        SandboxConfigBuilder::default()
+            .filesystem_strict(false)
+            .build(),
+    )
+    .await;
+
+    let output = read_inside(&sandbox, &file, "shared-needle").await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("shared-needle"));
+}
+
+#[tokio::test]
+async fn relaxed_mode_does_not_make_shared_temp_writable() {
+    let (dir, _file) = shared_temp_file("shared-needle");
+    let sandbox = sandbox_with(
+        SandboxConfigBuilder::default()
+            .filesystem_strict(false)
+            .build(),
+    )
+    .await;
+
+    let probe = dir.path().join("probe.txt");
+    let output = cmd(&sandbox, &format!("echo x> \"{}\"", probe.display())).await;
+
+    assert!(!output.status.success(), "shared temp must not be writable");
+    assert!(!probe.exists());
+}
+
+#[tokio::test]
+async fn a_writable_file_system_is_refused_rather_than_run_as_strict() {
+    let config = SandboxConfigBuilder::default()
+        .filesystem_strict(false)
+        .writable_file_system(true)
+        .build();
+
+    let Err(error) =
+        Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal).await
+    else {
+        panic!("the setting has no AppContainer equivalent and must be refused");
+    };
+
+    assert!(
+        matches!(
+            error,
+            heel::Error::UnsupportedSetting {
+                setting: "writable_file_system",
+                platform: "windows"
+            }
+        ),
+        "unexpected error: {error}"
+    );
+}

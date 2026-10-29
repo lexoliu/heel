@@ -119,9 +119,56 @@ pub(crate) fn create_native_backend(
     Err(crate::error::Error::UnsupportedPlatform)
 }
 
+/// Reject the settings the Windows backend cannot enforce.
+///
+/// An AppContainer token is default-deny and only ACL entries naming its SID
+/// open anything, so "the whole filesystem is writable" would mean rewriting
+/// the ACL of every drive root and everything beneath it. That is neither
+/// possible without administrator rights nor something a sandbox may do to the
+/// host, so the setting is refused rather than run as if it were strict.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn require_windows_support(config: &SandboxConfigData) -> Result<()> {
+    if config.writable_file_system() {
+        return Err(crate::error::Error::UnsupportedSetting {
+            setting: "writable_file_system",
+            platform: "windows",
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_refuses_a_writable_file_system() {
+        let config = crate::SandboxConfig::builder()
+            .writable_file_system(true)
+            .build();
+        let error = require_windows_support(config.data()).expect_err("must be refused");
+        assert!(matches!(
+            error,
+            crate::error::Error::UnsupportedSetting {
+                setting: "writable_file_system",
+                platform: "windows"
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "writable_file_system is not supported on windows"
+        );
+    }
+
+    #[test]
+    fn windows_accepts_every_other_filesystem_configuration() {
+        for strict in [true, false] {
+            let config = crate::SandboxConfig::builder()
+                .filesystem_strict(strict)
+                .build();
+            require_windows_support(config.data()).expect("supported");
+        }
+    }
 
     #[test]
     fn environment_names_match_under_host_rules() {

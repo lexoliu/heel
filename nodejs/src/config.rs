@@ -69,7 +69,7 @@ pub enum IsolationJs {
     Strict,
     /// The working directory is writable; the rest of the system is readable.
     Default,
-    /// The whole filesystem is readable and writable.
+    /// The whole filesystem is readable and writable. Not supported on Windows.
     Permissive,
 }
 

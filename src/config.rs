@@ -613,6 +613,9 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     }
 
     /// Make the whole filesystem writable (permissive mode).
+    ///
+    /// Not supported on Windows: building a sandbox fails with
+    /// [`Error::UnsupportedSetting`](crate::Error::UnsupportedSetting).
     pub fn writable_file_system(mut self, enabled: bool) -> Self {
         self.data.writable_file_system = enabled;
         self
