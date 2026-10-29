@@ -9,18 +9,24 @@
 //! its parent is reparented to it, and a process that has exited stays a zombie
 //! holding its pid until its parent waits for it. The supervisor waits only
 //! outside a teardown's freeze, and a teardown signals only pids that no one
-//! can have reaped. That is the property every signal below relies on: a pid
-//! the supervisor signals is held by a live process or by a zombie nobody has
-//! reaped, so it has not been handed to an unrelated process, and membership
-//! needs no identity check. A signalled pid is either a child of the supervisor
-//! (reaped only by the supervisor, later) or a child of a member that is already
-//! stopped (a stopped parent reaps nothing).
+//! can have reaped. A pid the supervisor lists is held by a live process or by
+//! a zombie nobody has reaped, so it has not been handed to an unrelated
+//! process. A listed pid is either a child of the supervisor (reaped only by the
+//! supervisor, later) or a child of a member that is already stopped (a stopped
+//! parent reaps nothing).
 //!
-//! The one case outside this argument is a stopped member that ignores
+//! Signals do not travel by pid. Right after a member is listed, the supervisor
+//! opens a pidfd for it (`pidfd_open`, Linux 5.3+), checks through `/proc` that
+//! the process behind the pid is still a child of the tree, and sends every
+//! later signal through that descriptor (`pidfd_send_signal`). A pidfd names the
+//! process it was opened for, so a signal can never reach a process that took
+//! the pid after the member died. The only window left is the instant between
+//! listing and opening, which the argument above covers.
+//!
+//! The one case outside that argument is a stopped member that ignores
 //! `SIGCHLD`: the kernel reaps its children at exit, so such a child can vanish
-//! between being listed and being signalled. The answer is then `ESRCH`, which
-//! is treated as success because the process is gone, unless the pid space
-//! wraps inside that one pass.
+//! between being listed and being opened. The answer is then `ESRCH`, which is
+//! treated as success because the process is gone.
 //!
 //! Reaping waits for *any* child (`wait4(-1)`, rustix's `wait`), never
 //! `waitpid(None)`: that one is `wait4(0)` and sees only children in the
@@ -34,12 +40,13 @@
 //! the host's control socket. Nothing here sleeps or polls on a timer: the
 //! only timeout is the budget a teardown gets to see its processes die.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
@@ -47,8 +54,8 @@ use std::time::{Duration, Instant};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
 use rustix::process::{
-    Pid, Resource, Rlimit, Signal, WaitOptions, getpid, kill_process, set_child_subreaper,
-    setrlimit, wait,
+    Pid, PidfdFlags, Resource, Rlimit, Signal, WaitOptions, getpid, pidfd_open, pidfd_send_signal,
+    set_child_subreaper, setrlimit, wait,
 };
 
 use super::procfs;
@@ -108,7 +115,42 @@ pub fn run(config: Config) -> io::Result<i32> {
     // Before the first child exists, so no orphan can slip past to init.
     set_child_subreaper(Some(getpid()))?;
 
-    let command = match std::process::Command::new(&program).args(&args).spawn() {
+    // Before the command exists, so a failure here has nothing to clean up: a
+    // command spawned first and orphaned by a failing `signalfd` would run
+    // unsupervised.
+    let (signals, original_mask) = match child_signals() {
+        Ok(signals) => signals,
+        Err(error) => {
+            send(
+                &control,
+                &Event::Failed(format!("cannot watch for children: {error}")),
+            )?;
+            send(&control, &Event::Done)?;
+            return Err(error);
+        }
+    };
+
+    let mut command = std::process::Command::new(&program);
+    command.args(&args);
+    // SAFETY: the closure runs between `fork` and `exec` and only calls
+    // `pthread_sigmask`, which is async-signal-safe, on a set captured by copy.
+    unsafe {
+        command.pre_exec(move || {
+            // The mask is inherited across `exec`, and the command must not
+            // start with `SIGCHLD` blocked.
+            let result = libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const original_mask,
+                std::ptr::null_mut(),
+            );
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(result))
+            }
+        });
+    }
+    let command = match command.spawn() {
         Ok(command) => command,
         Err(error) => {
             // Nothing was started, so there is nothing left to account for.
@@ -118,21 +160,17 @@ pub fn run(config: Config) -> io::Result<i32> {
         }
     };
 
-    // After the command was spawned: the signal mask is inherited across
-    // `exec`, and the command must not start with `SIGCHLD` blocked. A child
-    // that exits before the mask is set is found by the first `reap`, which
-    // runs before anything waits.
     let mut supervisor = Supervisor {
         mode,
         own: pid_number(getpid()),
         control,
         host_gone: false,
         requests: Vec::new(),
-        signals: child_signals()?,
+        signals,
         reap_timeout,
         command: command.id(),
         command_status: None,
-        frozen: BTreeSet::new(),
+        frozen: BTreeMap::new(),
         killed: BTreeSet::new(),
     };
     let report = match supervisor.serve() {
@@ -235,8 +273,9 @@ struct Supervisor {
     reap_timeout: Duration,
     command: u32,
     command_status: Option<ExitStatus>,
-    /// Members stopped by the current teardown and not yet reaped.
-    frozen: BTreeSet<u32>,
+    /// Members stopped by the current teardown and not yet reaped, each with
+    /// the pidfd every signal to it goes through.
+    frozen: BTreeMap<u32, OwnedFd>,
     /// The members of `frozen` that have been sent `SIGKILL`.
     killed: BTreeSet<u32>,
 }
@@ -372,8 +411,8 @@ impl Supervisor {
     /// Kill and reap what a failed teardown had frozen, within `deadline`. A
     /// failure here is logged: the caller returns the error that led here.
     fn abort_freeze(&mut self, deadline: Instant) {
-        for &pid in &self.frozen {
-            if let Err(error) = signal(pid, Signal::KILL) {
+        for (&pid, fd) in &self.frozen {
+            if let Err(error) = signal(fd, Signal::KILL) {
                 tracing::warn!(pid, %error, "could not kill a frozen member");
             }
         }
@@ -401,10 +440,17 @@ impl Supervisor {
         loop {
             self.freeze(deadline)?;
 
-            let fresh: Vec<u32> = self.frozen.difference(&self.killed).copied().collect();
+            let fresh: Vec<u32> = self
+                .frozen
+                .keys()
+                .filter(|pid| !self.killed.contains(pid))
+                .copied()
+                .collect();
             killed.extend(describe(fresh.iter().copied())?);
-            for &pid in &fresh {
-                signal(pid, Signal::KILL)?;
+            for pid in &fresh {
+                if let Some(fd) = self.frozen.get(pid) {
+                    signal(fd, Signal::KILL)?;
+                }
             }
             self.killed.extend(fresh);
 
@@ -448,8 +494,7 @@ impl Supervisor {
             let fresh: Vec<u32> = procfs::snapshot()?
                 .into_iter()
                 .filter(|entry| {
-                    !self.frozen.contains(&entry.pid)
-                        && (entry.ppid == self.own || self.frozen.contains(&entry.ppid))
+                    !self.frozen.contains_key(&entry.pid) && self.is_member_parent(entry.ppid)
                 })
                 .map(|entry| entry.pid)
                 .collect();
@@ -457,13 +502,43 @@ impl Supervisor {
                 return Ok(());
             }
             for pid in fresh {
-                signal(pid, Signal::STOP)?;
-                self.frozen.insert(pid);
+                let Some(fd) = self.open_member(pid)? else {
+                    continue;
+                };
+                signal(&fd, Signal::STOP)?;
+                self.frozen.insert(pid, fd);
             }
             if Instant::now() >= deadline {
                 return Ok(());
             }
         }
+    }
+
+    /// Whether a process with parent `ppid` belongs to the tree: its parent is
+    /// this process or a stopped member.
+    fn is_member_parent(&self, ppid: u32) -> bool {
+        ppid == self.own || self.frozen.contains_key(&ppid)
+    }
+
+    /// Open a pidfd for the member `pid` that was just listed, or `None` when
+    /// it is gone or is no longer a child of the tree.
+    ///
+    /// The check after the open is what ties the descriptor to a member: the
+    /// descriptor pins one process, and `/proc` read after it was opened still
+    /// shows that process unless it has been reaped, in which case the entry is
+    /// missing or its parent is not ours.
+    fn open_member(&self, pid: u32) -> io::Result<Option<OwnedFd>> {
+        let Some(raw) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+            return Err(io::Error::other(format!("{pid} is not a process id")));
+        };
+        let fd = match pidfd_open(raw, PidfdFlags::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::SRCH) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(procfs::read(pid)?
+            .is_some_and(|entry| self.is_member_parent(entry.ppid))
+            .then_some(fd))
     }
 
     /// Every running process whose chain of parents leads to this one.
@@ -496,7 +571,7 @@ impl Supervisor {
     fn has_unfrozen_child(&self) -> io::Result<bool> {
         Ok(procfs::snapshot()?
             .iter()
-            .any(|entry| entry.ppid == self.own && !self.frozen.contains(&entry.pid)))
+            .any(|entry| entry.ppid == self.own && !self.frozen.contains_key(&entry.pid)))
     }
 
     /// Block for up to `remaining` until a child changes state.
@@ -541,36 +616,35 @@ fn drain_signals(signals: &File) -> io::Result<()> {
 }
 
 /// Block `SIGCHLD` and return a descriptor that becomes readable when one is
-/// pending.
-fn child_signals() -> io::Result<File> {
+/// pending, with the signal mask as it was before.
+fn child_signals() -> io::Result<(File, libc::sigset_t)> {
     let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+    let mut original = MaybeUninit::<libc::sigset_t>::uninit();
     // SAFETY: `set` is initialised by `sigemptyset` before anything reads it,
-    // and every call below is given a valid pointer to it.
+    // `original` is filled in by `pthread_sigmask` before it is read, and every
+    // call below is given a valid pointer.
     unsafe {
         libc::sigemptyset(set.as_mut_ptr());
         libc::sigaddset(set.as_mut_ptr(), libc::SIGCHLD);
         let set = set.assume_init();
-        let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+        let blocked = libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, original.as_mut_ptr());
         if blocked != 0 {
             return Err(io::Error::from_raw_os_error(blocked));
         }
+        let original = original.assume_init();
         let fd = libc::signalfd(-1, &raw const set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `signalfd` returned a new descriptor that nothing else owns.
-        Ok(File::from_raw_fd(fd))
+        Ok((File::from_raw_fd(fd), original))
     }
 }
 
-/// Send `signal` to a member. A member that is already gone is not an error:
-/// that is what the signal was for.
-fn signal(pid: u32, signal: Signal) -> io::Result<()> {
-    let pid = i32::try_from(pid)
-        .ok()
-        .and_then(Pid::from_raw)
-        .ok_or_else(|| io::Error::other(format!("{pid} is not a process id")))?;
-    match kill_process(pid, signal) {
+/// Send `signal` to the member behind `pidfd`. A member that is already gone
+/// is not an error: that is what the signal was for.
+fn signal(pidfd: &OwnedFd, signal: Signal) -> io::Result<()> {
+    match pidfd_send_signal(pidfd, signal) {
         Ok(()) | Err(Errno::SRCH) => Ok(()),
         Err(error) => Err(error.into()),
     }

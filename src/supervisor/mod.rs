@@ -33,6 +33,8 @@ pub use host::{
     Background, Foreground, ForegroundExit, SupervisedChild, Supervision, TreeControl,
     TreeKillError,
 };
-pub(crate) use host::{Shared, arguments};
+pub(crate) use host::{Shared, arguments, reap_child};
 pub use protocol::{LeftoverProcess, Mode, SpawnFailure, TreeReport};
+// For `heel supervise`, the binary of this package, which is outside this crate.
+#[doc(hidden)]
 pub use run::{Config, run};

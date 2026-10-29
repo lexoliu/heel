@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::marker::PhantomData;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -251,6 +252,9 @@ pub(crate) struct Shared {
     to_supervisor: UnixStream,
     mailbox: Arc<Mailbox>,
     reap_timeout: Duration,
+    /// The supervisor's exit status once it has been reaped. The one place the
+    /// supervisor is waited for, whoever asks first.
+    exit: Mutex<Option<ExitStatus>>,
 }
 
 impl Drop for Shared {
@@ -279,7 +283,27 @@ impl Shared {
             to_supervisor,
             mailbox,
             reap_timeout,
+            exit: Mutex::new(None),
         }))
+    }
+
+    /// Wait for the supervisor `pid` to exit and reap it, returning its status.
+    ///
+    /// Every wait for a supervised process goes through here: the waiter that
+    /// gets the lock first reaps, and the others receive the status it kept,
+    /// so none is left with `ECHILD`. The lock is held across the wait on
+    /// purpose; the only contenders are other waits for the same process.
+    pub(crate) fn reap(&self, pid: u32) -> std::io::Result<ExitStatus> {
+        let mut exit = self
+            .exit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(status) = *exit {
+            return Ok(status);
+        }
+        let status = reap_child(pid)?;
+        *exit = Some(status);
+        Ok(status)
     }
 
     fn send(&self, request: &Request) -> std::io::Result<()> {
@@ -339,6 +363,22 @@ impl Shared {
             Some(Ending::Failed(message)) => Err(Error::SupervisorFailed(message.clone())),
             None if state.done => Ok(state.report.clone()),
             None => Err(Error::SupervisorLost),
+        }
+    }
+}
+
+/// Wait for the child `pid` and reap it.
+pub(crate) fn reap_child(pid: u32) -> std::io::Result<ExitStatus> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| std::io::Error::other(format!("{pid} is not a process id")))?;
+    loop {
+        match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()) {
+            Ok(Some((_, status))) => return Ok(ExitStatus::from_raw(status.as_raw())),
+            Ok(None) => unreachable!("a blocking wait returns a status"),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -403,13 +443,26 @@ impl TreeControl {
 /// command's exit status is the supervisor's.
 ///
 /// The tree is ended through the supervisor only: [`kill_tree`](Self::kill_tree),
-/// dropping this handle, or dropping the sandbox. Dropping the handle closes
-/// the supervisor's control socket, which makes it tear the tree down.
+/// dropping this handle, or dropping the sandbox.
+///
+/// Dropping this handle asks the supervisor to tear the tree down, whatever
+/// [`TreeControl`] clones are still alive: this handle owns the command, and a
+/// clone exists to kill it, never to keep it running. That is sound because the
+/// request is idempotent (a supervisor that has already finished ignores it)
+/// and nothing can wait on the command through a clone. The supervisor process
+/// itself is reaped by [`wait`](Self::wait) or, if that never happens, when the
+/// sandbox is dropped.
 #[derive(Debug)]
 pub struct SupervisedChild<M: Supervision> {
     child: Child,
     control: TreeControl,
     mode: PhantomData<M>,
+}
+
+impl<M: Supervision> Drop for SupervisedChild<M> {
+    fn drop(&mut self) {
+        self.control.shared.request_teardown();
+    }
 }
 
 impl<M: Supervision> SupervisedChild<M> {
@@ -483,12 +536,20 @@ impl<M: Supervision> SupervisedChild<M> {
     /// - [`Error::SupervisorLost`] when the supervisor ended without its last
     ///   report (it was killed from outside, so the tree may still be running).
     pub async fn wait(&mut self) -> Result<M::Exit> {
+        let pid = self.child.id();
+        let reaper = Arc::clone(&self.control.shared);
         let shared = Arc::clone(&self.control.shared);
         // Both at once: the supervisor's messages are read by their own
-        // thread, so neither side waits on the other.
-        let (status, report) =
-            futures_lite::future::zip(self.child.wait(), unblock(move || shared.finish())).await;
+        // thread, so neither side waits on the other. The supervisor is reaped
+        // through `Shared`, the same path dropping the sandbox takes, so the
+        // two never compete for its status.
+        let (status, report) = futures_lite::future::zip(
+            unblock(move || reaper.reap(pid)),
+            unblock(move || shared.finish()),
+        )
+        .await;
         let status = status?;
+        self.child.forget_reaped();
         M::finish(status, report?)
     }
 
@@ -585,6 +646,30 @@ mod tests {
         supervisor_side.join().unwrap();
         // A later kill sees the same teardown, not an empty tree.
         assert_eq!(shared.kill().unwrap(), answer);
+    }
+
+    #[test]
+    fn concurrent_waits_for_the_supervisor_all_get_its_status() {
+        let (host, _supervisor) = UnixStream::pair().unwrap();
+        let shared = Shared::new(host, Duration::from_secs(1)).unwrap();
+        #[expect(
+            clippy::zombie_processes,
+            reason = "reaped by `Shared::reap`, which is what is under test"
+        )]
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || shared.reap(pid).unwrap())
+            })
+            .collect();
+        for waiter in waiters {
+            assert_eq!(waiter.join().unwrap().code(), Some(3));
+        }
     }
 
     #[test]
