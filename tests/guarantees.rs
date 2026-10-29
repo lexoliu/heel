@@ -400,9 +400,11 @@ async fn writing_to(granted: &[heel::ResolvedPath]) -> heel::Result<Sandbox> {
 /// directory inside it that is the thing swapped, and a directory elsewhere
 /// that must stay out of reach.
 ///
-/// The swapped directory's parent is writable too: removing a directory needs
-/// the right to change its parent on Linux and Windows, and a grant nested in
-/// another is how a sandbox ends up able to do it.
+/// The swapped directory's parent is readable and writable too: removing a
+/// directory needs the right to change its parent on Linux and Windows, and a
+/// grant nested in another is how a sandbox ends up able to do it. A write-only
+/// grant is not enough on Windows, where entering the parent and removing the
+/// directory's contents both list a directory.
 struct Swap {
     _guard: tempfile::TempDir,
     parent: std::path::PathBuf,
@@ -495,17 +497,20 @@ async fn a_grant_the_sandbox_replaced_with_a_link_fails_the_next_build() {
     // write through the link, and the next sandbox must not follow it: the
     // link's target would become writable.
     let swap = Swap::new();
-    let grants = [
-        fixtures::resolved(&swap.parent),
-        fixtures::resolved(&swap.swapped),
-    ];
-    let sandbox = writing_to(&grants)
-        .await
-        .expect("the unchanged grant builds");
+    let parent = fixtures::resolved(&swap.parent);
+    let swapped = fixtures::resolved(&swap.swapped);
+    let build = || {
+        let config = SandboxConfigBuilder::default()
+            .grant(parent.clone(), heel::Access::READ | heel::Access::WRITE)
+            .writable(swapped.clone())
+            .build();
+        Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+    };
+    let sandbox = build().await.expect("the unchanged grant builds");
 
     swap.plant_and_write_through(&sandbox).await;
 
-    let error = writing_to(&grants)
+    let error = build()
         .await
         .err()
         .expect("a granted path behind a link must refuse the build");
@@ -524,7 +529,7 @@ async fn a_working_directory_the_sandbox_replaced_with_a_link_fails_the_next_bui
     let parent = fixtures::resolved(&swap.parent);
     let config = |swap: &Swap| {
         SandboxConfigBuilder::default()
-            .writable(parent.clone())
+            .grant(parent.clone(), heel::Access::READ | heel::Access::WRITE)
             .working_dir(&swap.swapped)
             .build()
     };
