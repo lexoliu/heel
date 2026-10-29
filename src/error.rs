@@ -25,6 +25,15 @@ pub enum Error {
         current: String,
     },
 
+    /// The configuration asks for a setting this platform's backend cannot enforce.
+    #[error("{setting} is not supported on {platform}")]
+    UnsupportedSetting {
+        /// The configuration setting.
+        setting: &'static str,
+        /// Platform name.
+        platform: &'static str,
+    },
+
     /// The backend could not be initialized.
     #[error("sandbox initialization failed: {0}")]
     InitFailed(String),

@@ -39,6 +39,10 @@ The CLI exposes three levels through `--isolation`:
 | `default` | System files, unprotected user files, shared temp | Working directory only | Not from writable locations |
 | `permissive` | Everything | Everything | Unrestricted apart from shared temp |
 
+`permissive` is not available on Windows: an AppContainer cannot make the whole
+filesystem writable, so a sandbox with `writable_file_system` set fails to start
+with an `UnsupportedSetting` error instead of running more restricted than asked.
+
 The shared temp directories are never writable outside `permissive`: the sandbox
 has its own writable directory and exports it as `TMPDIR`, so nothing needs to
 write there. `permissive` gives up the write-then-execute guarantee by
