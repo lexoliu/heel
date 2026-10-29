@@ -242,6 +242,15 @@ impl<N: NetworkPolicy> Sandbox<N> {
             Some(NetworkProxy::new(policy, executor.clone()).await?)
         };
 
+        #[cfg(target_os = "linux")]
+        if config_data.supervised_spawn() {
+            // The supervisor is `heel supervise`, started inside the sandbox, so
+            // the binary must be executable under the sandbox's own ruleset.
+            let heel_binary = resolve_heel_binary(config_data.heel_binary())?;
+            config_data.push_grant(heel_binary.clone(), Access::EXEC);
+            config_data.set_supervisor_binary(heel_binary);
+        }
+
         let (ipc_server, ipc_socket_dir) = match (router, config_data.external_ipc()) {
             (Some(router), None) => {
                 let (server, socket_dir) =

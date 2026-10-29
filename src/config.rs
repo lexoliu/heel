@@ -345,6 +345,13 @@ pub struct SandboxConfigData {
     heel_binary: Option<PathBuf>,
     external_ipc: Option<crate::ipc::TcpIpcEndpoint>,
     allow_tty_write: bool,
+    /// Whether commands may be spawned under a per-command supervisor.
+    #[cfg(target_os = "linux")]
+    supervised_spawn: bool,
+    /// The `heel` binary the supervisor runs as, resolved when the sandbox is
+    /// created and executable inside it. `None` unless `supervised_spawn`.
+    #[cfg(target_os = "linux")]
+    supervisor_binary: Option<PathBuf>,
 }
 
 impl SandboxConfigData {
@@ -466,6 +473,25 @@ impl SandboxConfigData {
     /// Whether the sandboxed process may write to the controlling terminal.
     pub fn allow_tty_write(&self) -> bool {
         self.allow_tty_write
+    }
+
+    /// Whether commands may be spawned under a per-command supervisor.
+    #[cfg(target_os = "linux")]
+    pub fn supervised_spawn(&self) -> bool {
+        self.supervised_spawn
+    }
+
+    /// The `heel` binary a supervised command runs under, once the sandbox
+    /// has resolved it.
+    #[cfg(target_os = "linux")]
+    pub fn supervisor_binary(&self) -> Option<&Path> {
+        self.supervisor_binary.as_deref()
+    }
+
+    /// Record the `heel` binary the supervisor runs as.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_supervisor_binary(&mut self, path: PathBuf) {
+        self.supervisor_binary = Some(path);
     }
 
     /// Replace the working directory with its canonical, created form.
@@ -597,6 +623,10 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 external_ipc: None,
                 // Deny /dev/tty writes by default so all output is captured.
                 allow_tty_write: false,
+                #[cfg(target_os = "linux")]
+                supervised_spawn: false,
+                #[cfg(target_os = "linux")]
+                supervisor_binary: None,
             },
             ipc: None,
             ipc_state: std::marker::PhantomData,
@@ -837,6 +867,18 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// ships its own copy.
     pub fn heel_binary(mut self, path: impl AsRef<Path>) -> Self {
         self.data.heel_binary = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Allow [`Command::spawn_supervised`](crate::Command::spawn_supervised).
+    ///
+    /// A supervised command runs under `heel supervise` inside the sandbox, so
+    /// the sandbox has to be able to execute the `heel` binary (found as for
+    /// [`heel_binary`](Self::heel_binary)). Creating the sandbox fails if that
+    /// binary cannot be found.
+    #[cfg(target_os = "linux")]
+    pub fn supervised_spawn(mut self, enabled: bool) -> Self {
+        self.data.supervised_spawn = enabled;
         self
     }
 

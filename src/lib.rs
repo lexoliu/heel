@@ -117,6 +117,8 @@ pub(crate) mod pty;
 mod python;
 mod sandbox;
 mod security;
+#[cfg(target_os = "linux")]
+pub mod supervisor;
 mod workdir;
 
 #[cfg(unix)]

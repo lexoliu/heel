@@ -128,6 +128,20 @@ pub enum Error {
     #[error("IPC error: {0}")]
     Ipc(#[from] IpcError),
 
+    /// A supervised spawn was requested from a sandbox built without
+    /// [`supervised_spawn`](crate::SandboxConfigBuilder::supervised_spawn).
+    #[cfg(target_os = "linux")]
+    #[error("the sandbox was not built with supervised_spawn(true)")]
+    SupervisorNotConfigured,
+
+    /// The supervisor of a command ended without reporting how.
+    ///
+    /// It was killed from outside, or crashed; the processes it supervised may
+    /// still be running.
+    #[cfg(target_os = "linux")]
+    #[error("the command's supervisor ended without a final report")]
+    SupervisorLost,
+
     /// A pseudo-terminal operation failed.
     #[error("PTY error: {0}")]
     Pty(String),
