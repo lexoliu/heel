@@ -5,8 +5,13 @@ use crate::grant::Grant;
 
 /// A stable identity for sandboxes that share persistent path grants.
 ///
-/// On Windows, the name selects the `heel-id-<name>` AppContainer profile.
-/// Persistent grants are written for its package SID and remain until
+/// On Windows, the name selects two AppContainer profiles, and so two package
+/// SIDs: `heel-id-<name>` for sandboxes whose network policy runs the filtering
+/// proxy, and `heel-no-<name>` for deny-all sandboxes. A proxied sandbox's
+/// package SID receives a machine-wide loopback exemption that persists until
+/// [`Identity::remove`]; a deny-all sandbox never runs under that SID, so it
+/// cannot inherit the exemption and reach listeners on the host. Persistent
+/// grants are written for both package SIDs and remain until
 /// [`Identity::remove`]; ordinary grants use a distinct capability SID for
 /// each sandbox. On macOS and Linux, persistent grants become ordinary
 /// sandbox policy grants, while [`Identity::prepare`] and
@@ -116,9 +121,48 @@ impl Identity {
         Ok(())
     }
 
+    /// The AppContainer profile `kind` of sandbox runs under.
     #[cfg(windows)]
-    pub(crate) fn profile_name(&self) -> String {
-        format!("heel-id-{}", self.name)
+    pub(crate) fn profile_name(&self, kind: NamedProfile) -> String {
+        format!("{}{}", kind.prefix(), self.name)
+    }
+}
+
+/// Which of an identity's two AppContainer profiles a sandbox runs under.
+///
+/// The prefixes have the same length and differ in their last letters, so no
+/// identity name can make one kind's profile name equal the other's, and a name
+/// valid for one is valid for both.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamedProfile {
+    /// The network policy runs the filtering proxy, so the package SID is
+    /// exempt from the loopback restriction.
+    Proxied,
+    /// The network policy denies everything, so the package SID is never
+    /// exempt from the loopback restriction.
+    DenyAll,
+}
+
+#[cfg(windows)]
+impl NamedProfile {
+    /// Both kinds.
+    pub(crate) const ALL: [Self; 2] = [Self::Proxied, Self::DenyAll];
+
+    /// The kind a sandbox runs under, given whether it runs the proxy.
+    pub(crate) const fn for_proxy(proxied: bool) -> Self {
+        if proxied {
+            Self::Proxied
+        } else {
+            Self::DenyAll
+        }
+    }
+
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Proxied => "heel-id-",
+            Self::DenyAll => "heel-no-",
+        }
     }
 }
 

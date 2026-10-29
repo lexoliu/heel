@@ -40,6 +40,7 @@ use sid::Sid;
 
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
+use crate::identity::NamedProfile;
 use crate::platform::{Backend, Child, SpawnRequest, env_name_eq};
 
 /// A launch-prep failure that names the call which produced it.
@@ -143,11 +144,19 @@ const USER_DIRECTORIES: &[&str] = &["USERPROFILE", "APPDATA", "ALLUSERSPROFILE"]
 #[derive(Debug)]
 pub struct WindowsBackend {
     container: Container,
+    /// Whether the sandbox runs the filtering proxy, which decides the
+    /// container's loopback exemption for its whole life.
+    proxied: bool,
 }
 
 impl WindowsBackend {
     /// Open or create the AppContainer this sandbox's processes will run in,
     /// and open the configured paths to it.
+    ///
+    /// `proxy_port` is the filtering proxy's port, or `None` under a deny-all
+    /// policy. A named identity's deny-all sandboxes run under a profile of
+    /// their own, whose package SID is never given the loopback exemption a
+    /// proxied sandbox's SID holds.
     ///
     /// The paths are granted here rather than at the first launch because
     /// Windows grants by inheritance: setting the entries propagates them to
@@ -161,14 +170,15 @@ impl WindowsBackend {
     /// carries a host protection policy, which this backend does not enforce.
     /// Returns an error if the AppContainer profile cannot be opened or
     /// created, or if a configured path cannot be opened to it.
-    pub fn new(config: &SandboxConfigData) -> Result<Self> {
+    pub fn new(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<Self> {
         crate::platform::require_windows_support(config)?;
+        let proxied = proxy_port.is_some();
         let container = match config.identity() {
-            Some(identity) => Container::named(identity)?.0,
+            Some(identity) => Container::named(identity, NamedProfile::for_proxy(proxied))?.0,
             None => Container::create()?,
         };
         container.grant_configured_paths(config)?;
-        Ok(Self { container })
+        Ok(Self { container, proxied })
     }
 
     /// Open the sandbox's IPC endpoint to the container.
@@ -211,7 +221,14 @@ impl WindowsBackend {
                     )),
                 )
             })?;
-        let capabilities = self.container.capabilities(request.proxy_port.is_some())?;
+        // The container was chosen for the sandbox's proxy decision, which a
+        // launch cannot change.
+        assert_eq!(
+            request.proxy_port.is_some(),
+            self.proxied,
+            "a launch must agree with the proxy decision its container was created for"
+        );
+        let capabilities = self.container.capabilities(self.proxied)?;
         self.container.grant_program(&program, &capabilities)?;
 
         // A proxy port means a filtering policy, which only works if the

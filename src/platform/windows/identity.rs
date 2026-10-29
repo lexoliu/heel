@@ -28,7 +28,7 @@ use super::container;
 use super::loopback::LoopbackExemption;
 use super::profile::Profile;
 use crate::grant::Access;
-use crate::identity::Identity;
+use crate::identity::{Identity, NamedProfile};
 
 /// JSON record of persistent grants and traverse ancestors in the profile folder.
 pub(super) const RECORD_NAME: &str = "heel-persistent-grants";
@@ -64,11 +64,12 @@ pub(super) struct RecordedGrant {
     pub(super) complete: bool,
 }
 
-/// Create the named profile and apply its persistent grants.
+/// Create both named profiles and apply the persistent grants to each.
 pub(crate) fn prepare(identity: &Identity) -> Result<(), Win32Failure> {
-    let profile_name = identity.profile_name();
-    let profile = Profile::open_named(&profile_name)?;
-    let _ = ensure_persistent_grants(&profile, identity)?;
+    for kind in NamedProfile::ALL {
+        let profile = Profile::open_named(&identity.profile_name(kind))?;
+        let _ = ensure_persistent_grants(&profile, identity)?;
+    }
     Ok(())
 }
 
@@ -247,10 +248,25 @@ pub(crate) fn ensure_persistent_grants(
     Ok(outcomes)
 }
 
-/// Revoke the grants listed in the profile record and remove the profile.
+/// Revoke the grants listed in each profile record and remove both profiles.
+///
+/// Every profile is attempted; the first failure is returned afterwards.
 pub(crate) fn remove(identity: &Identity) -> Result<(), Win32Failure> {
-    let profile_name = identity.profile_name();
-    let package = Profile::derive_sid(&profile_name)?;
+    let mut first = Ok(());
+    for kind in NamedProfile::ALL {
+        let removed = remove_profile(&identity.profile_name(kind), kind);
+        if first.is_ok() {
+            first = removed;
+        }
+    }
+    first
+}
+
+/// Revoke the grants listed in one profile's record and delete the profile.
+///
+/// Only the proxied profile can hold a loopback exemption.
+fn remove_profile(profile_name: &str, kind: NamedProfile) -> Result<(), Win32Failure> {
+    let package = Profile::derive_sid(profile_name)?;
     let _guard = acl::lock().map_err(Win32Failure::io("lock persistent grant removal"))?;
     let folder = match Profile::folder_for_sid(&package) {
         Ok(folder) => Some(folder),
@@ -296,9 +312,11 @@ pub(crate) fn remove(identity: &Identity) -> Result<(), Win32Failure> {
         }
     }
 
-    LoopbackExemption::remove_persistent(&package)
-        .map_err(Win32Failure::io("remove persistent loopback exemption"))?;
-    Profile::delete_named(&profile_name)?;
+    if kind == NamedProfile::Proxied {
+        LoopbackExemption::remove_persistent(&package)
+            .map_err(Win32Failure::io("remove persistent loopback exemption"))?;
+    }
+    Profile::delete_named(profile_name)?;
     Ok(())
 }
 

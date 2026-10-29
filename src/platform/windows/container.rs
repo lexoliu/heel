@@ -29,6 +29,7 @@ use super::sid::Sid;
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::grant::Access;
+use crate::identity::NamedProfile;
 
 /// Read a file, or list a directory.
 const READ: u32 = FILE_GENERIC_READ.0;
@@ -109,8 +110,11 @@ pub(crate) struct Container {
 struct NamedState {
     /// The capability SID used for this sandbox's ordinary grants.
     capability: Sid,
-    /// The named AppContainer profile shared by the identity.
+    /// The named AppContainer profile shared by the identity's sandboxes of
+    /// this kind.
     profile_name: String,
+    /// Which of the identity's two profiles this is.
+    kind: NamedProfile,
 }
 
 /// One access-control list the container added entries to.
@@ -152,11 +156,13 @@ impl Container {
         })
     }
 
-    /// Open a persistent profile and prepare its retained path grants.
+    /// Open the identity's persistent profile of `kind` and prepare its
+    /// retained path grants.
     pub(crate) fn named(
         identity: &crate::identity::Identity,
+        kind: NamedProfile,
     ) -> Result<(Self, Vec<super::identity::Persisted>)> {
-        let profile_name = identity.profile_name();
+        let profile_name = identity.profile_name(kind);
         let profile = Profile::open_named(&profile_name).map_err(|source| {
             Error::InitFailed(format!(
                 "cannot open AppContainer profile {profile_name}: {}",
@@ -190,6 +196,7 @@ impl Container {
                 identity: Some(NamedState {
                     capability,
                     profile_name,
+                    kind,
                 }),
                 granted: Mutex::new(Vec::new()),
             },
@@ -507,13 +514,21 @@ impl Container {
     /// the proxy is a loopback listener, so every filtering policy depends on
     /// this. The exemption is machine-wide and keyed on the container SID.
     /// Ephemeral containers return a guard that removes it on drop; a named
-    /// identity retains it until `Identity::remove`.
+    /// identity retains it until `Identity::remove`. Only a container opened
+    /// as [`NamedProfile::Proxied`] may call this: the deny-all profile's SID
+    /// is never exempted.
     ///
     /// Registering one requires administrator rights. Failing here is an error
     /// rather than a downgrade: a sandbox whose traffic cannot reach the proxy
     /// is a sandbox whose network policy is not enforced.
     pub(crate) fn exempt_loopback(&self) -> Result<Option<LoopbackExemption>> {
         let result = if let Some(identity) = &self.identity {
+            assert_eq!(
+                identity.kind,
+                NamedProfile::Proxied,
+                "the deny-all profile {} must never be exempted from the loopback restriction",
+                identity.profile_name
+            );
             tracing::debug!(profile = %identity.profile_name, "ensuring persistent loopback exemption");
             LoopbackExemption::ensure(self.sid()).map(|()| None)
         } else {
@@ -963,8 +978,8 @@ mod tests {
         let (_outer, root, probe) = auto_inherited_grant_tree();
         let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
 
-        let (container, outcomes) =
-            Container::named(identity.identity()).expect("the named container");
+        let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the named container");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
         let package = container.sid().as_string().to_owned();
         assert!(
@@ -990,8 +1005,8 @@ mod tests {
             "the root retains the package ACE: {root_dacl}"
         );
 
-        let (container, outcomes) =
-            Container::named(identity.identity()).expect("the named container reopens");
+        let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the named container reopens");
         assert_eq!(
             outcomes,
             [super::super::identity::Persisted::AlreadyComplete]
@@ -1016,7 +1031,7 @@ mod tests {
         let root = directory.path().join("granted");
         std::fs::create_dir(&root).expect("the granted directory");
         let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
-        let name = identity.identity().profile_name();
+        let name = identity.identity().profile_name(NamedProfile::Proxied);
 
         identity
             .identity()
@@ -1050,7 +1065,7 @@ mod tests {
         let (_outer, root, probe) = auto_inherited_grant_tree();
         let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
 
-        let package = Profile::derive_sid(&identity.identity().profile_name())
+        let package = Profile::derive_sid(&identity.identity().profile_name(NamedProfile::Proxied))
             .expect("the package SID derives")
             .as_string()
             .to_owned();
@@ -1065,8 +1080,8 @@ mod tests {
         );
         assert_probe_keeps_inherited_aces(&probe, &inherited, &package);
 
-        let (container, outcomes) =
-            Container::named(identity.identity()).expect("the named container reapplies grants");
+        let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the named container reapplies grants");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
         assert!(
             dacl(&probe).contains(&package),
@@ -1100,15 +1115,16 @@ mod tests {
             .persistent_grant(crate::grant::Grant::new(&root, Access::WRITE));
         let mut identity = IdentityCleanup::new(widened);
 
-        let (container, outcomes) = Container::named(&narrow).expect("the first named container");
+        let (container, outcomes) =
+            Container::named(&narrow, NamedProfile::Proxied).expect("the first named container");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
         let record_path = container
             .profile_folder()
             .join(super::super::identity::RECORD_NAME);
         drop(container);
 
-        let (container, outcomes) =
-            Container::named(identity.identity()).expect("the widened grant is applied");
+        let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the widened grant is applied");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
         let record = super::super::identity::read_records(&record_path)
             .expect("the widened record is valid");
@@ -1130,8 +1146,8 @@ mod tests {
         std::fs::write(&probe, "probe").expect("the probe file");
         let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
 
-        let (container, outcomes) =
-            Container::named(identity.identity()).expect("the named container");
+        let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the named container");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
         let package = container.sid().as_string().to_owned();
         let recorded_ancestors = read_record(&container).ancestors;
@@ -1140,8 +1156,8 @@ mod tests {
         let without_grants =
             crate::identity::Identity::named(identity.identity().name().to_owned())
                 .expect("the identity name is valid");
-        let (container, outcomes) =
-            Container::named(&without_grants).expect("the empty identity reopens");
+        let (container, outcomes) = Container::named(&without_grants, NamedProfile::Proxied)
+            .expect("the empty identity reopens");
         assert!(outcomes.is_empty());
         assert!(
             !dacl(&root).contains(&package),
@@ -1174,8 +1190,8 @@ mod tests {
         let mut identity = test_identity([crate::grant::Grant::new(&root, Access::WRITE)]);
         let name = identity.identity().name().to_owned();
 
-        let (container, outcomes) =
-            Container::named(identity.identity()).expect("the writable grant is applied");
+        let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the writable grant is applied");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
         let package = container.sid().as_string().to_owned();
         drop(container);
@@ -1183,7 +1199,8 @@ mod tests {
         let narrowed = crate::identity::Identity::named(name)
             .expect("the identity name is valid")
             .persistent_grant(crate::grant::Grant::new(&root, Access::READ));
-        let (container, outcomes) = Container::named(&narrowed).expect("the grant is narrowed");
+        let (container, outcomes) =
+            Container::named(&narrowed, NamedProfile::Proxied).expect("the grant is narrowed");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
         let held = acl::effective_rights(&root, &[&package]).expect("the root rights are readable");
         let read_rights = super::persistent_path_rights(&root, Access::READ);
@@ -1215,8 +1232,8 @@ mod tests {
                 .persistent_grant(crate::grant::Grant::new(&second_root, Access::READ)),
         );
 
-        let (container, outcomes) =
-            Container::named(identity.identity()).expect("both grants are applied");
+        let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("both grants are applied");
         assert_eq!(
             outcomes,
             [
@@ -1244,8 +1261,8 @@ mod tests {
         let only_second = crate::identity::Identity::named(name.clone())
             .expect("the identity name is valid")
             .persistent_grant(crate::grant::Grant::new(&second_root, Access::READ));
-        let (container, outcomes) =
-            Container::named(&only_second).expect("the remaining grant is reconciled");
+        let (container, outcomes) = Container::named(&only_second, NamedProfile::Proxied)
+            .expect("the remaining grant is reconciled");
         assert_eq!(
             outcomes,
             [super::super::identity::Persisted::AlreadyComplete]
@@ -1278,8 +1295,8 @@ mod tests {
 
         let without_grants =
             crate::identity::Identity::named(name).expect("the identity name is valid");
-        let (container, outcomes) =
-            Container::named(&without_grants).expect("the empty identity is reconciled");
+        let (container, outcomes) = Container::named(&without_grants, NamedProfile::Proxied)
+            .expect("the empty identity is reconciled");
         assert!(outcomes.is_empty());
         assert!(
             !acl::names_trustee(&shared, &package).expect("the shared DACL is readable"),
@@ -1304,7 +1321,7 @@ mod tests {
         let granted = crate::identity::Identity::named(name)
             .expect("the identity name is valid")
             .persistent_grant(crate::grant::Grant::new(&root, Access::READ));
-        let profile_name = granted.profile_name();
+        let profile_name = granted.profile_name(NamedProfile::Proxied);
 
         granted.prepare().expect("the persistent grant is prepared");
         let package = Profile::derive_sid(&profile_name)
@@ -1345,10 +1362,10 @@ mod tests {
         let probe = root.join("probe.txt");
         std::fs::write(&probe, "probe").expect("the probe file");
         let mut identity = test_identity([crate::grant::Grant::new(&root, Access::READ)]);
-        let profile_name = identity.identity().profile_name();
+        let profile_name = identity.identity().profile_name(NamedProfile::Proxied);
 
-        let (container, outcomes) =
-            Container::named(identity.identity()).expect("the named container");
+        let (container, outcomes) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the named container");
         assert_eq!(outcomes, [super::super::identity::Persisted::Written]);
         let package = container.sid().as_string().to_owned();
         drop(container);
@@ -1379,7 +1396,8 @@ mod tests {
     fn named_ordinary_grants_use_only_the_sandbox_capability() {
         let directory = tempfile::tempdir().expect("a temp directory");
         let mut identity = test_identity(std::iter::empty::<crate::grant::Grant>());
-        let (container, _) = Container::named(identity.identity()).expect("the named container");
+        let (container, _) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the named container");
         let package = container.sid().as_string().to_owned();
         let capability = container.grantee().as_string().to_owned();
         container
@@ -1400,7 +1418,8 @@ mod tests {
     fn dropping_one_named_container_preserves_another_capability_ace() {
         let directory = tempfile::tempdir().expect("a temp directory");
         let mut identity = test_identity(std::iter::empty::<crate::grant::Grant>());
-        let (first, _) = Container::named(identity.identity()).expect("the first container");
+        let (first, _) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the first container");
         let first_capability = first.grantee().as_string().to_owned();
         first
             .grant_ancestors(directory.path())
@@ -1409,7 +1428,8 @@ mod tests {
             .grant_path(directory.path(), Access::READ)
             .expect("the first directory grant");
 
-        let (second, _) = Container::named(identity.identity()).expect("the second container");
+        let (second, _) = Container::named(identity.identity(), NamedProfile::Proxied)
+            .expect("the second container");
         let second_capability = second.grantee().as_string().to_owned();
         assert_ne!(first_capability, second_capability);
         second
