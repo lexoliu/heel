@@ -142,6 +142,38 @@ pub enum Error {
     #[error("IPC error: {0}")]
     Ipc(#[from] IpcError),
 
+    /// A supervised spawn was requested from a sandbox built without
+    /// [`supervised_spawn`](crate::SandboxConfigBuilder::supervised_spawn).
+    #[cfg(target_os = "linux")]
+    #[error("the sandbox was not built with supervised_spawn(true)")]
+    SupervisorNotConfigured,
+
+    /// The supervisor could not start the command (it does not exist, is not
+    /// executable inside the sandbox, ...). Nothing ran.
+    #[cfg(target_os = "linux")]
+    #[error("the supervisor could not start the command: {0}")]
+    SupervisedSpawnFailed(crate::supervisor::SpawnFailure),
+
+    /// The supervised command had not exited when the teardown budget ran out.
+    /// The report names the processes still alive.
+    #[cfg(target_os = "linux")]
+    #[error("the supervised command had not exited when the teardown budget ran out")]
+    SupervisedCommandUnreaped(crate::supervisor::TreeReport),
+
+    /// The supervisor failed. It killed what it had frozen first, but
+    /// processes it had not reached may still be running.
+    #[cfg(target_os = "linux")]
+    #[error("the command's supervisor failed: {0}")]
+    SupervisorFailed(String),
+
+    /// The supervisor of a command ended without reporting how.
+    ///
+    /// It was killed from outside, or crashed; the processes it supervised may
+    /// still be running.
+    #[cfg(target_os = "linux")]
+    #[error("the command's supervisor ended without a final report")]
+    SupervisorLost,
+
     /// A pseudo-terminal operation failed.
     #[error("PTY error: {0}")]
     Pty(String),

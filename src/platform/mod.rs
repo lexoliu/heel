@@ -80,6 +80,10 @@ pub(crate) struct SpawnRequest<'a> {
     pub stdout: StdioConfig,
     /// Standard error configuration.
     pub stderr: StdioConfig,
+    /// A descriptor the process inherits across `exec`, which `std` otherwise
+    /// closes. The caller keeps it open until the spawn returns.
+    #[cfg(target_os = "linux")]
+    pub inherit_fd: Option<std::os::fd::RawFd>,
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]

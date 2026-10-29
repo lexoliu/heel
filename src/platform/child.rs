@@ -98,6 +98,12 @@ impl Child {
         }
     }
 
+    /// Release the sandbox's claim on a child that was reaped elsewhere.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn forget_reaped(&mut self) {
+        self.unregister();
+    }
+
     /// Access the child's standard input.
     pub fn stdin(&mut self) -> Option<&mut File> {
         self.inner.as_mut().and_then(|c| c.stdin().as_mut())

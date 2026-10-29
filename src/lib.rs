@@ -124,6 +124,8 @@ mod python;
 mod resolve;
 mod sandbox;
 mod security;
+#[cfg(target_os = "linux")]
+pub mod supervisor;
 mod workdir;
 
 #[cfg(unix)]

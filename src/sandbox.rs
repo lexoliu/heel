@@ -101,7 +101,17 @@ fn search_path_for_binary(name: &str) -> Option<PathBuf> {
 /// Tracks the processes spawned inside a sandbox so they can be killed on drop.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProcessTracker {
-    pids: Arc<Mutex<Vec<u32>>>,
+    pids: Arc<Mutex<Vec<Tracked>>>,
+}
+
+/// One process the sandbox spawned.
+#[derive(Debug)]
+struct Tracked {
+    pid: u32,
+    /// The control socket of the supervisor this process is, if it is one.
+    /// Weak, so that the host dropping its handles still closes the socket.
+    #[cfg(target_os = "linux")]
+    supervisor: Option<std::sync::Weak<crate::supervisor::Shared>>,
 }
 
 impl ProcessTracker {
@@ -115,7 +125,7 @@ impl ProcessTracker {
     /// sandboxed processes alive is worse than reading a list that a panicking
     /// thread may have left mid-update, which for a `Vec<u32>` is still a valid
     /// list of PIDs.
-    fn lock(&self) -> MutexGuard<'_, Vec<u32>> {
+    fn lock(&self) -> MutexGuard<'_, Vec<Tracked>> {
         self.pids.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("process tracker lock was poisoned; recovering");
             poisoned.into_inner()
@@ -124,57 +134,112 @@ impl ProcessTracker {
 
     /// Register a spawned process.
     pub(crate) fn register(&self, pid: u32) {
-        self.lock().push(pid);
+        self.lock().push(Tracked {
+            pid,
+            #[cfg(target_os = "linux")]
+            supervisor: None,
+        });
         tracing::debug!(pid, "registered child process");
+    }
+
+    /// Register a process that is a per-command supervisor, which ends its
+    /// tree itself when asked.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn register_supervisor(
+        &self,
+        pid: u32,
+        control: std::sync::Weak<crate::supervisor::Shared>,
+    ) {
+        self.lock().push(Tracked {
+            pid,
+            supervisor: Some(control),
+        });
+        tracing::debug!(pid, "registered supervisor process");
     }
 
     /// Forget a process that has already been reaped.
     pub(crate) fn unregister(&self, pid: u32) {
-        self.lock().retain(|&tracked| tracked != pid);
+        self.lock().retain(|tracked| tracked.pid != pid);
         tracing::debug!(pid, "unregistered child process");
     }
 
     /// Kill every tracked process group.
+    ///
+    /// Every supervisor is asked to tear its tree down before any is waited
+    /// for, so supervisors tear down together and dropping takes about one
+    /// budget however many there are.
     pub(crate) fn kill_all(&self) {
-        let pids = std::mem::take(&mut *self.lock());
+        let tracked = std::mem::take(&mut *self.lock());
 
-        for pid in pids {
-            tracing::debug!(pid, "killing child process");
-
-            #[cfg(unix)]
-            {
-                // Only signal PIDs that are still our unreaped children, so a
-                // recycled PID belonging to an unrelated process is never hit.
-                let mut status: libc::c_int = 0;
-                // SAFETY: `status` is a valid destination and the call only
-                // inspects a process this sandbox spawned.
-                let waited = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
-                if waited == pid as i32 {
-                    tracing::debug!(pid, "child already exited");
-                    continue;
+        #[cfg(target_os = "linux")]
+        let mut supervisors = Vec::new();
+        for tracked in tracked {
+            #[cfg(target_os = "linux")]
+            if let Some(control) = &tracked.supervisor {
+                // The supervisor ends its tree itself: freeze, kill, reap.
+                // Signalling its process group instead would hand every member
+                // that left the group to init. A handle that is already gone
+                // has closed the socket, which makes the supervisor do the
+                // same, so it is only awaited.
+                let shared = control.upgrade();
+                if let Some(shared) = &shared {
+                    shared.request_teardown();
                 }
-                if waited == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
-                {
-                    tracing::debug!(pid, "skipping non-child PID");
-                    continue;
-                }
-
-                // SAFETY: a negative PID signals the process group created at
-                // spawn; the `waitpid` above established that it is still ours.
-                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-                // SAFETY: reaps the process just signalled, so the killed child
-                // does not linger as a zombie.
-                unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+                supervisors.push((tracked.pid, shared));
+                continue;
             }
+            kill_group(tracked.pid);
+        }
 
-            #[cfg(windows)]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .output();
+        #[cfg(target_os = "linux")]
+        for (pid, shared) in supervisors {
+            // Through the owner of the supervisor's status when there is one,
+            // so a concurrent `wait` and this reap cannot compete.
+            let reaped = match &shared {
+                Some(shared) => shared.reap(pid),
+                None => crate::supervisor::reap_child(pid),
+            };
+            if let Err(error) = reaped {
+                tracing::debug!(pid, %error, "supervisor was already reaped");
             }
         }
+    }
+}
+
+/// Kill a process group this sandbox spawned, and reap its leader.
+fn kill_group(pid: u32) {
+    tracing::debug!(pid, "killing child process");
+
+    #[cfg(unix)]
+    {
+        // Only signal PIDs that are still our unreaped children, so a
+        // recycled PID belonging to an unrelated process is never hit.
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid destination and the call only
+        // inspects a process this sandbox spawned.
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        if waited == pid as i32 {
+            tracing::debug!(pid, "child already exited");
+            return;
+        }
+        if waited == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            tracing::debug!(pid, "skipping non-child PID");
+            return;
+        }
+
+        // SAFETY: a negative PID signals the process group created at
+        // spawn; the `waitpid` above established that it is still ours.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        // SAFETY: reaps the process just signalled, so the killed child
+        // does not linger as a zombie.
+        unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
     }
 }
 
@@ -257,6 +322,19 @@ impl<N: NetworkPolicy> Sandbox<N> {
         } else {
             Some(NetworkProxy::new(policy, executor.clone()).await?)
         };
+
+        #[cfg(target_os = "linux")]
+        if config_data.supervised_spawn() {
+            // The supervisor is `heel supervise`, started inside the sandbox, so
+            // the binary must be executable under the sandbox's own ruleset.
+            let heel_binary = resolve_heel_binary(
+                config_data.heel_binary().map(Path::to_path_buf),
+                config_data.writable_paths(),
+            )
+            .await?;
+            config_data.set_supervisor_binary(heel_binary.as_path().to_path_buf());
+            config_data.push_grant(heel_binary, Access::EXEC);
+        }
 
         let (ipc_server, ipc_socket_dir) = match (router, config_data.external_ipc()) {
             (Some(router), None) => {
@@ -499,6 +577,56 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A stand-in for a supervisor whose teardown takes `seconds`: it starts
+    /// the teardown when the host's request arrives on the control socket.
+    #[cfg(target_os = "linux")]
+    fn slow_supervisor(
+        seconds: u32,
+    ) -> (
+        std::process::Child,
+        std::sync::Arc<crate::supervisor::Shared>,
+    ) {
+        use std::os::fd::OwnedFd;
+        use std::process::{Command, Stdio};
+
+        let (host, supervisor_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let shared = crate::supervisor::Shared::new(host, Duration::from_secs(1)).unwrap();
+        let child = Command::new("sh")
+            .args(["-c", &format!("read request; sleep {seconds}")])
+            .stdin(Stdio::from(OwnedFd::from(supervisor_end)))
+            .spawn()
+            .unwrap();
+        (child, shared)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_tears_supervisors_down_together_not_one_after_another() {
+        const TEARDOWN: u64 = 2;
+        let tracker = ProcessTracker::new();
+        let supervisors: Vec<_> = (0..2)
+            .map(|_| {
+                let (child, shared) = slow_supervisor(TEARDOWN as u32);
+                tracker.register_supervisor(child.id(), std::sync::Arc::downgrade(&shared));
+                (child, shared)
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        tracker.kill_all();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_secs(TEARDOWN),
+            "kill_all returned before the teardowns finished: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(TEARDOWN * 2 - 1) + Duration::from_millis(500),
+            "two teardowns of {TEARDOWN}s took {elapsed:?}, which is one after another"
+        );
+        drop(supervisors);
+    }
 
     #[test]
     fn the_fallback_global_executor_runs_the_tasks_it_is_given() {
