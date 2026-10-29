@@ -1072,3 +1072,93 @@ async fn a_writable_file_system_is_refused_rather_than_run_as_strict() {
         "unexpected error: {error}"
     );
 }
+
+/// The host's own non-loopback address, learned the way a client picks its
+/// source address: "connecting" a UDP socket to a public address selects the
+/// route without sending a packet.
+fn host_address() -> std::net::IpAddr {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("a UDP socket binds");
+    socket
+        .connect("8.8.8.8:80")
+        .expect("the route to a public address resolves");
+    socket.local_addr().expect("the socket has an address").ip()
+}
+
+/// Run the TCP probe in `sandbox` against `address` and return its exit code:
+/// 0 connected, 2 refused by the sandbox, 3 any other failure.
+async fn probe_connect(
+    sandbox: &Sandbox<impl heel::NetworkPolicy>,
+    probe: &Path,
+    address: std::net::SocketAddr,
+) -> Option<i32> {
+    sandbox
+        .command(probe.to_str().expect("the probe path is UTF-8"))
+        .arg(address.to_string())
+        .output()
+        .await
+        .expect("the probe runs")
+        .status
+        .code()
+}
+
+#[tokio::test]
+async fn a_deny_all_sandbox_does_not_inherit_its_identitys_loopback_exemption() {
+    let directory = tempfile::tempdir().expect("the test directory exists");
+    let probe = fixtures::compile(
+        directory.path(),
+        include_str!("fixtures/tcp_probe.rs"),
+        "tcp-probe",
+    );
+    let mut identity = IdentityCleanup::new(
+        Identity::named(format!("t-{:016x}", rand::random::<u64>()))
+            .expect("the identity name is valid"),
+    );
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("the listener binds");
+    let port = listener
+        .local_addr()
+        .expect("the listener has an address")
+        .port();
+    let host = std::net::SocketAddr::new(host_address(), port);
+    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+
+    // A proxied sandbox under the identity gives its package SID the
+    // loopback exemption. It reaches the listener, which shows the listener
+    // is reachable from a container that holds the exemption.
+    let proxied = Sandbox::with_config_and_executor(
+        SandboxConfigBuilder::default()
+            .network(heel::AllowAll)
+            .identity(identity.identity().clone())
+            .executable(&probe)
+            .build(),
+        executor_core::tokio::TokioGlobal,
+    )
+    .await
+    .expect("the proxied named sandbox starts");
+    assert_eq!(
+        probe_connect(&proxied, &probe, host).await,
+        Some(0),
+        "the exempted proxied sandbox must reach the host's own address"
+    );
+    drop(proxied);
+
+    let deny_all = Sandbox::with_config_and_executor(
+        SandboxConfigBuilder::default()
+            .identity(identity.identity().clone())
+            .executable(&probe)
+            .build(),
+        executor_core::tokio::TokioGlobal,
+    )
+    .await
+    .expect("the deny-all named sandbox starts");
+    for address in [host, loopback] {
+        assert_eq!(
+            probe_connect(&deny_all, &probe, address).await,
+            Some(2),
+            "the deny-all sandbox must not reach {address}"
+        );
+    }
+
+    drop(deny_all);
+    drop(listener);
+    identity.remove();
+}
