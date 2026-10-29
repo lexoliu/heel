@@ -33,7 +33,11 @@ extern "C" {
 extern "C" fn on_alarm(_: i32) {}
 
 const AT_FDCWD: i32 = -100;
+// `__O_TMPFILE | O_DIRECTORY`; arm64 numbers `O_DIRECTORY` differently.
+#[cfg(target_arch = "x86_64")]
 const O_TMPFILE: i32 = 0o20_200_000;
+#[cfg(target_arch = "aarch64")]
+const O_TMPFILE: i32 = 0o20_040_000;
 const AT_SYMLINK_FOLLOW: i32 = 0x400;
 const RENAME_EXCHANGE: u32 = 2;
 const TIOCSTI: u64 = 0x5412;
