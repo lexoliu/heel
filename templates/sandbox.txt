@@ -1,5 +1,7 @@
 (version 1)
-(deny default)
+; Every denial carries this sandbox's tag, which is how the denials of one sandbox
+; are told apart from every other sandboxed process's in the system log.
+(deny default {{ audit }})
 
 ; =============================================================================
 ; RULE ORDER MATTERS
@@ -26,7 +28,14 @@
 (allow mach-lookup (global-name "com.apple.system.notification_center"))      ; Notifications
 
 ; Security and code signing
-(allow mach-lookup (global-name "com.apple.SecurityServer"))                  ; Code signing verification
+{% if !deny_keychain_services %}
+; Code signing verification. It is also the service that opens keychain items,
+; so a sandbox that protects the keychain does not get it: the keychain files
+; being unreadable is not enough, since the service reads them on the caller's
+; behalf. Certificate trust evaluation goes through trustd below and is
+; unaffected.
+(allow mach-lookup (global-name "com.apple.SecurityServer"))
+{% endif %}
 (allow mach-lookup (global-name "com.apple.trustd"))                          ; Certificate validation
 (allow mach-lookup (global-name "com.apple.trustd.agent"))                    ; Trust agent
 
@@ -158,68 +167,68 @@
 ; System files stay readable because the macOS runtime layout is not stably
 ; enumerable, but everything owned by a user is denied unless explicitly
 ; allowed in pass 3.
-(deny file-read* (subpath "/Users") (with no-log))
-(deny file-read* (subpath "/home") (with no-log))
-(deny file-read* (subpath "/Volumes") (with no-log))
-(deny file-read* (subpath "/Network") (with no-log))
-(deny file-read* (subpath "/private/var/root") (with no-log))
-(deny file-read* (subpath "/private/tmp") (with no-log))
-(deny file-read* (subpath "/private/var/folders") (with no-log))
+(deny file-read* (subpath "/Users") {{ audit }})
+(deny file-read* (subpath "/home") {{ audit }})
+(deny file-read* (subpath "/Volumes") {{ audit }})
+(deny file-read* (subpath "/Network") {{ audit }})
+(deny file-read* (subpath "/private/var/root") {{ audit }})
+(deny file-read* (subpath "/private/tmp") {{ audit }})
+(deny file-read* (subpath "/private/var/folders") {{ audit }})
 {% endif %}
 {% if protect_user_home %}
 {% if allow_tcc_prompts %}
 ; TCC prompts enabled: only ~/Library is blocked here. The TCC-protected
 ; folders (Desktop, Documents, Downloads, Pictures, Movies, Music) are left to
 ; macOS, which prompts the user for access.
-(deny file-read* (regex #"/Users/[^/]+/Library(/|$)") (with no-log))
+(deny file-read* (regex #"/Users/[^/]+/Library(/|$)") {{ audit }})
 {% else %}
 ; TCC prompts disabled: block the sensitive home subdirectories outright.
-(deny file-read* (regex #"/Users/[^/]+/Documents(/|$)") (with no-log))
-(deny file-read* (regex #"/Users/[^/]+/Desktop(/|$)") (with no-log))
-(deny file-read* (regex #"/Users/[^/]+/Downloads(/|$)") (with no-log))
-(deny file-read* (regex #"/Users/[^/]+/Library(/|$)") (with no-log))
-(deny file-read* (regex #"/Users/[^/]+/Pictures(/|$)") (with no-log))
-(deny file-read* (regex #"/Users/[^/]+/Movies(/|$)") (with no-log))
-(deny file-read* (regex #"/Users/[^/]+/Music(/|$)") (with no-log))
+(deny file-read* (regex #"/Users/[^/]+/Documents(/|$)") {{ audit }})
+(deny file-read* (regex #"/Users/[^/]+/Desktop(/|$)") {{ audit }})
+(deny file-read* (regex #"/Users/[^/]+/Downloads(/|$)") {{ audit }})
+(deny file-read* (regex #"/Users/[^/]+/Library(/|$)") {{ audit }})
+(deny file-read* (regex #"/Users/[^/]+/Pictures(/|$)") {{ audit }})
+(deny file-read* (regex #"/Users/[^/]+/Movies(/|$)") {{ audit }})
+(deny file-read* (regex #"/Users/[^/]+/Music(/|$)") {{ audit }})
 {% endif %}
 {% endif %}
 {% if protect_credentials %}
 ; SSH/GPG credentials
-(deny file-read* (regex #"/\.ssh(/|$)") (with no-log))
-(deny file-read* (regex #"/\.gnupg(/|$)") (with no-log))
+(deny file-read* (regex #"/\.ssh(/|$)") {{ audit }})
+(deny file-read* (regex #"/\.gnupg(/|$)") {{ audit }})
 {% endif %}
 {% if protect_cloud_config %}
 ; Cloud provider configuration
-(deny file-read* (regex #"/\.aws(/|$)") (with no-log))
-(deny file-read* (regex #"/\.kube(/|$)") (with no-log))
-(deny file-read* (regex #"/\.docker(/|$)") (with no-log))
-(deny file-read* (regex #"/\.gcloud(/|$)") (with no-log))
-(deny file-read* (regex #"/\.azure(/|$)") (with no-log))
+(deny file-read* (regex #"/\.aws(/|$)") {{ audit }})
+(deny file-read* (regex #"/\.kube(/|$)") {{ audit }})
+(deny file-read* (regex #"/\.docker(/|$)") {{ audit }})
+(deny file-read* (regex #"/\.gcloud(/|$)") {{ audit }})
+(deny file-read* (regex #"/\.azure(/|$)") {{ audit }})
 {% endif %}
 {% if protect_browser_data %}
 ; Browser cookies, history and passwords
-(deny file-read* (regex #"/Library/Application Support/Google/Chrome(/|$)") (with no-log))
-(deny file-read* (regex #"/Library/Application Support/Firefox(/|$)") (with no-log))
-(deny file-read* (regex #"/Library/Application Support/Microsoft Edge(/|$)") (with no-log))
-(deny file-read* (regex #"/Library/Safari(/|$)") (with no-log))
-(deny file-read* (regex #"/Library/Cookies(/|$)") (with no-log))
+(deny file-read* (regex #"/Library/Application Support/Google/Chrome(/|$)") {{ audit }})
+(deny file-read* (regex #"/Library/Application Support/Firefox(/|$)") {{ audit }})
+(deny file-read* (regex #"/Library/Application Support/Microsoft Edge(/|$)") {{ audit }})
+(deny file-read* (regex #"/Library/Safari(/|$)") {{ audit }})
+(deny file-read* (regex #"/Library/Cookies(/|$)") {{ audit }})
 {% endif %}
 {% if protect_keychain %}
 ; System keychain
-(deny file-read* (regex #"/Library/Keychains(/|$)") (with no-log))
+(deny file-read* (regex #"/Library/Keychains(/|$)") {{ audit }})
 {% endif %}
 {% if protect_shell_history %}
 ; Shell history files
-(deny file-read* (regex #"/\.(bash_history|zsh_history|fish_history)$") (with no-log))
-(deny file-read* (regex #"/\.local/share/fish/fish_history$") (with no-log))
+(deny file-read* (regex #"/\.(bash_history|zsh_history|fish_history)$") {{ audit }})
+(deny file-read* (regex #"/\.local/share/fish/fish_history$") {{ audit }})
 {% endif %}
 {% if protect_package_credentials %}
 ; Package manager credentials
-(deny file-read* (regex #"/\.netrc$") (with no-log))
-(deny file-read* (regex #"/\.npmrc$") (with no-log))
-(deny file-read* (regex #"/\.pypirc$") (with no-log))
-(deny file-read* (regex #"/\.cargo/credentials(\.toml)?$") (with no-log))
-(deny file-read* (regex #"/\.gem/credentials$") (with no-log))
+(deny file-read* (regex #"/\.netrc$") {{ audit }})
+(deny file-read* (regex #"/\.npmrc$") {{ audit }})
+(deny file-read* (regex #"/\.pypirc$") {{ audit }})
+(deny file-read* (regex #"/\.cargo/credentials(\.toml)?$") {{ audit }})
+(deny file-read* (regex #"/\.gem/credentials$") {{ audit }})
 {% endif %}
 
 ; =============================================================================
@@ -298,6 +307,46 @@
 (allow file-write-create (subpath "{{ venv.path }}"))
 (allow file-write-unlink (subpath "{{ venv.path }}"))
 {% endif %}
+{% endif %}
+
+; =============================================================================
+; PASS 4: HOST PROTECTION
+;
+; These come after every grant, so nothing a caller grants can reopen them, and
+; the denials are the tagged kind so that they are reported.
+; =============================================================================
+{% if let Some(read) = read_rules %}
+; Credential stores and keys: not readable, and not movable out of the way, since
+; a directory renamed to a new name would be readable again under it.
+{% for tree in read.trees %}
+(deny file-read* (subpath "{{ tree }}") {{ audit }})
+(deny file-write-unlink (subpath "{{ tree }}") {{ audit }})
+{% endfor %}
+{% for parent in read.guarded_parents %}
+(deny file-write-unlink (literal "{{ parent }}") {{ audit }})
+{% endfor %}
+; Agent sockets: not readable and not connectable, whatever the network policy.
+(deny file-read* (regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$") {{ audit }})
+(deny network-outbound (remote unix-socket (path-regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$")) {{ audit }})
+{% for socket in read.sockets %}
+(deny network-outbound (remote unix-socket (path-literal "{{ socket }}")) {{ audit }})
+{% endfor %}
+{% endif %}
+{% if let Some(write) = write_rules %}
+; Persistence locations: not writable, and the directories above them not
+; removable, since a prepared lookalike moved into their name would stand in.
+{% for tree in write.trees %}
+(deny file-write* (subpath "{{ tree }}") {{ audit }})
+{% endfor %}
+{% for filter in write.anywhere %}
+(deny file-write* {{ filter }} {{ audit }})
+{% endfor %}
+{% for parent in write.guarded_parents %}
+(deny file-write-unlink (literal "{{ parent }}") {{ audit }})
+{% endfor %}
+{% for filter in write.anywhere_parents %}
+(deny file-write-unlink {{ filter }} {{ audit }})
+{% endfor %}
 {% endif %}
 
 ; =============================================================================

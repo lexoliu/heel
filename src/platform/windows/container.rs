@@ -229,6 +229,19 @@ impl Container {
         // it, and the working directory sits under a user profile no container
         // can enter by default. Each ancestor gets traverse and nothing else,
         // and the grant does not inherit, so their other children stay closed.
+        //
+        // Outside strict mode the host's shared temp directory is readable, as
+        // `/tmp` and `/private/var/folders` are on the other backends. It is
+        // granted before the working directory, which usually lives beneath
+        // it, so the working directory's own write entry lands on top. It is
+        // read-only and its files carry no execute bit: writable-then-
+        // executable stays closed, and writing there stays the working
+        // directory's privilege.
+        if !config.filesystem_strict() {
+            let temp = std::env::temp_dir();
+            self.grant_ancestors(&temp)?;
+            self.grant_path(&temp, Access::READ)?;
+        }
         self.grant_ancestors(config.working_dir())?;
         self.grant_path(config.working_dir(), Access::WRITE)?;
 
@@ -820,6 +833,52 @@ mod tests {
                 .expect("the grants lock")
                 .is_empty(),
             "a directory the container cannot reach must be written to its DACL"
+        );
+    }
+
+    #[test]
+    fn shared_temp_is_granted_only_outside_strict_mode() {
+        let work = tempfile::tempdir().expect("a working directory");
+        let shared = std::env::temp_dir();
+
+        let strict = crate::SandboxConfig::builder()
+            .working_dir(work.path())
+            .filesystem_strict(true)
+            .build();
+        let container = Container::create().expect("a container");
+        container
+            .grant_configured_paths(strict.data())
+            .expect("strict grants");
+        let held = |container: &Container| {
+            acl::effective_rights(&shared, &[container.sid().as_string()])
+                .expect("rights on shared temp")
+        };
+        assert_eq!(
+            held(&container) & READ,
+            0,
+            "strict mode must leave shared temp closed; its DACL is {}",
+            dacl(&shared)
+        );
+        drop(container);
+
+        let relaxed = crate::SandboxConfig::builder()
+            .working_dir(work.path())
+            .filesystem_strict(false)
+            .build();
+        let container = Container::create().expect("a container");
+        container
+            .grant_configured_paths(relaxed.data())
+            .expect("relaxed grants");
+        let rights = held(&container);
+        assert_eq!(
+            rights & READ,
+            READ,
+            "relaxed mode must open shared temp to reads"
+        );
+        assert_eq!(
+            rights & FILE_GENERIC_WRITE.0 & !READ,
+            0,
+            "shared temp must stay read-only"
         );
     }
 

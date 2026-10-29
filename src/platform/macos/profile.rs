@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use askama::Template;
 
 use crate::config::SandboxConfigData;
+use crate::denial::denial_tag;
 use crate::error::{Error, Result};
 use crate::grant::Grant;
+use crate::policy::{Pattern, Resolved};
 
 /// A Python virtual environment as the template sees it.
 struct VenvRules {
@@ -62,6 +64,80 @@ struct GrantRules {
     executable: bool,
 }
 
+/// A host protection policy as the template sees it: every path already
+/// resolved and escaped, every filter already written.
+struct HostRules {
+    trees: Vec<String>,
+    /// Complete filters for the entries found beneath any directory.
+    anywhere: Vec<String>,
+    /// Complete filters for the directories that contain those entries.
+    anywhere_parents: Vec<String>,
+    sockets: Vec<String>,
+    guarded_parents: Vec<String>,
+}
+
+impl HostRules {
+    /// Render `resolved`, leaving the any-directory entries alone beneath each
+    /// of its exemptions.
+    fn new(resolved: &Resolved) -> Result<Self> {
+        let exemptions = resolved
+            .exempt
+            .iter()
+            .map(|path| -> Result<String> {
+                Ok(format!(
+                    "(require-not (subpath \"{}\"))",
+                    escape_path(path)?
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(" ");
+        let guard = |pattern: &Pattern, filter: String| {
+            if exemptions.is_empty() || !pattern.is_anywhere() {
+                filter
+            } else {
+                format!("(require-all {filter} {exemptions})")
+            }
+        };
+
+        let mut anywhere = Vec::new();
+        let mut anywhere_parents = Vec::new();
+        for pattern in &resolved.patterns {
+            anywhere.push(guard(
+                pattern,
+                format!("(regex #\"{}\")", quote_regex(&pattern.regex(true))),
+            ));
+            // `.git/hooks` is held in place by `.git`, and `.git` by nothing a
+            // table can name, so every proper prefix is guarded too.
+            for parent in pattern.guarded_parents() {
+                anywhere_parents.push(guard(
+                    pattern,
+                    format!("(regex #\"{}\")", quote_regex(&parent.regex(false))),
+                ));
+            }
+        }
+
+        Ok(Self {
+            trees: resolved
+                .trees
+                .iter()
+                .map(|path| escape_path(path))
+                .collect::<Result<_>>()?,
+            anywhere,
+            anywhere_parents,
+            sockets: resolved
+                .sockets
+                .iter()
+                .map(|path| escape_path(path))
+                .collect::<Result<_>>()?,
+            guarded_parents: resolved
+                .guarded_parents
+                .iter()
+                .map(|path| escape_path(path))
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
 /// SBPL profile template.
 #[derive(Template)]
 #[template(path = "sandbox.txt", escape = "none")]
@@ -92,6 +168,11 @@ struct SandboxProfile {
     proxy_port: Option<u16>,
     // Terminal access
     allow_tty_write: bool,
+    // Host protection
+    audit: String,
+    deny_keychain_services: bool,
+    read_rules: Option<HostRules>,
+    write_rules: Option<HostRules>,
 }
 
 /// Generate an SBPL profile from a sandbox configuration.
@@ -149,6 +230,19 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
         allow_hardware: security.allow_hardware(),
         proxy_port,
         allow_tty_write: config.allow_tty_write(),
+        audit: format!(
+            "(with message \"{}\")",
+            escape_str(&denial_tag(config.working_dir()))
+        ),
+        deny_keychain_services: security.protect_keychain() || config.read_denylist().is_some(),
+        read_rules: config
+            .read_denylist()
+            .map(|denylist| HostRules::new(&denylist.resolve()?))
+            .transpose()?,
+        write_rules: config
+            .write_denylist()
+            .map(|denylist| HostRules::new(&denylist.resolve()?))
+            .transpose()?,
         traversal_paths: Vec::new(),
     };
     template.traversal_paths = traversal_paths(&template);
@@ -235,6 +329,17 @@ fn grant_rules(grants: &[Grant]) -> Result<Vec<GrantRules>> {
         .collect()
 }
 
+/// Make a regex safe inside an SBPL `#"..."` string, where a backslash is the
+/// regex's own escape and only the quote needs one.
+fn quote_regex(regex: &str) -> String {
+    regex.replace('"', "\\\"")
+}
+
+/// Escape text with no null byte for use inside an SBPL double-quoted string.
+fn escape_str(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Escape a path for use inside an SBPL double-quoted string.
 fn escape_path(path: &Path) -> Result<String> {
     let path_str = path.to_string_lossy();
@@ -288,7 +393,7 @@ mod tests {
         let profile = generate_profile(&data, None).unwrap();
 
         assert!(profile.contains("(version 1)"));
-        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(deny default (with message"));
         assert!(profile.contains("(deny network*)"));
         assert!(profile.contains("(allow network-inbound (local tcp \"localhost:*\"))"));
         assert!(!profile.contains("network-outbound"));
@@ -527,6 +632,111 @@ mod tests {
         assert!(
             !profile.contains("(allow file-write* (subpath \"/private/tmp\"))"),
             "the sandbox has its own writable directory; shared temp is not one"
+        );
+    }
+
+    #[test]
+    fn host_protection_follows_every_grant_so_nothing_granted_reopens_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(dir.path())
+                .read_denylist(crate::ReadDenylist::credentials().home(home.path()))
+                .write_denylist(crate::WriteDenylist::persistence().home(home.path()))
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+
+        let grant = profile
+            .rfind("(allow file-write* (subpath")
+            .expect("the grant is written");
+        let ssh = profile
+            .find(&format!(
+                "(deny file-read* (subpath \"{}/.ssh\")",
+                std::fs::canonicalize(home.path()).unwrap().display()
+            ))
+            .expect("the credential store is denied");
+        let zshrc = profile
+            .find(&format!(
+                "(deny file-write* (subpath \"{}/.zshrc\")",
+                std::fs::canonicalize(home.path()).unwrap().display()
+            ))
+            .expect("the shell startup file is denied");
+        assert!(
+            grant < ssh,
+            "the read denial must follow the grants:\n{profile}"
+        );
+        assert!(
+            grant < zshrc,
+            "the write denial must follow the grants:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn every_denial_is_tagged_so_it_can_be_attributed_to_the_sandbox() {
+        let (data, dir) = prepared_config(SandboxConfig::new());
+        let profile = generate_profile(&data, None).unwrap();
+        let tag = crate::denial::denial_tag(dir.path());
+
+        assert!(profile.contains(&format!("(deny default (with message \"{tag}\"))")));
+        assert!(
+            !profile.contains("no-log"),
+            "a denial that is not logged cannot be recorded"
+        );
+    }
+
+    #[test]
+    fn the_security_services_are_closed_exactly_when_the_keychain_is_protected() {
+        let (strict, _dir) = prepared_config(SandboxConfig::new());
+        assert!(
+            !generate_profile(&strict, None)
+                .unwrap()
+                .contains("(allow mach-lookup (global-name \"com.apple.SecurityServer\"))")
+        );
+
+        let (open, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .security(crate::SecurityConfigBuilder::from_permissive().build())
+                .build(),
+        );
+        assert!(
+            generate_profile(&open, None)
+                .unwrap()
+                .contains("(allow mach-lookup (global-name \"com.apple.SecurityServer\"))")
+        );
+
+        // Certificate trust evaluation keeps its own service in both.
+        assert!(
+            generate_profile(&strict, None)
+                .unwrap()
+                .contains("(allow mach-lookup (global-name \"com.apple.trustd\"))")
+        );
+    }
+
+    #[test]
+    fn the_hooks_rule_is_narrowed_by_an_exemption_and_nothing_else_is() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let clones = tempfile::tempdir().expect("tempdir");
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .write_denylist(
+                    crate::WriteDenylist::persistence()
+                        .home(home.path())
+                        .except(clones.path()),
+                )
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        let clones = std::fs::canonicalize(clones.path()).unwrap();
+
+        assert!(profile.contains(&format!(
+            "(deny file-write* (require-all (regex #\"/\\.git/hooks(/|$)\") (require-not (subpath \"{}\")))",
+            clones.display()
+        )));
+        assert!(
+            !profile.contains(&format!("(subpath \"{}\") (with message", clones.display())),
+            "an exemption must not turn into a rule of its own"
         );
     }
 

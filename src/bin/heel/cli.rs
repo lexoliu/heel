@@ -386,7 +386,7 @@ pub enum Isolation {
     /// The working directory is writable; the rest of the system is readable.
     #[default]
     Default,
-    /// The whole filesystem is readable and writable.
+    /// The whole filesystem is readable and writable. Not supported on Windows.
     Permissive,
 }
 

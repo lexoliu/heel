@@ -6,7 +6,7 @@
 //! granted back one path or port at a time.
 
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 
 // The `Access` trait supplies `AccessFs::from_all` and friends and is only
@@ -41,6 +41,32 @@ impl std::fmt::Debug for PreparedRuleset {
 }
 
 impl PreparedRuleset {
+    /// Add a rule for an inode held by `fd`, narrowed to what the inode can take.
+    ///
+    /// The ruleset keeps its own reference to the inode, so `fd` can be closed
+    /// afterwards and the rule still follows the inode through a rename.
+    pub(crate) fn add_inode(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        access: BitFlags<AccessFs>,
+        abi: ABI,
+    ) -> Result<()> {
+        let access = effective_path_access(&fd, "an inode held open", access, abi)?;
+        add_rule_fd(&mut self.inner, fd, access)
+    }
+
+    /// A handle on the same ruleset, for one process to enforce.
+    ///
+    /// The kernel lets any number of processes enforce one ruleset, so a sandbox
+    /// builds its ruleset once and every command it starts gets a duplicate of
+    /// the descriptor. Duplicating is a syscall and so is done on the host, never
+    /// after the fork.
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: self.inner.try_clone()?,
+        })
+    }
+
     /// Apply the ruleset to the current process. Called from `pre_exec`.
     ///
     /// Anything short of full enforcement is an error: a partially applied
@@ -85,6 +111,21 @@ pub(crate) fn probe_support() -> Result<()> {
         })
 }
 
+/// One rule of a ruleset before it is built: what a path is granted.
+///
+/// The rules are planned first and turned into a ruleset second so that the
+/// sandbox's layer of a protecting sandbox can be derived from the same plan as
+/// the broker's: the same grants without the write rights, with the credential
+/// stores carved out.
+#[derive(Debug, Clone)]
+pub(crate) struct Planned {
+    pub(crate) path: PathBuf,
+    pub(crate) access: BitFlags<AccessFs>,
+    /// Whether a missing path is an error. A system path that a distribution
+    /// lacks is skipped; a path the caller configured is not.
+    pub(crate) required: bool,
+}
+
 /// Build the ruleset for a sandbox configuration.
 ///
 /// `proxy_port` is `Some` only when the network policy permits traffic.
@@ -92,8 +133,45 @@ pub(crate) fn build_ruleset(
     config: &SandboxConfigData,
     proxy_port: Option<u16>,
 ) -> Result<PreparedRuleset> {
-    let abi = REQUIRED_ABI;
+    let ruleset = instantiate(&plan(config), proxy_port, REQUIRED_ABI)?;
 
+    tracing::debug!(
+        proxy_port,
+        working_dir = %config.working_dir().display(),
+        strict = config.filesystem_strict(),
+        "landlock: ruleset built"
+    );
+
+    Ok(ruleset)
+}
+
+/// Every rule a configuration asks for.
+pub(crate) fn plan(config: &SandboxConfigData) -> Vec<Planned> {
+    let abi = REQUIRED_ABI;
+    let mut rules = Vec::new();
+    plan_system_rules(&mut rules, config, abi);
+    plan_device_rules(&mut rules, config, abi);
+    rules.extend(
+        configured_rules(config, abi)
+            .into_iter()
+            .map(|rule| Planned {
+                path: rule.path,
+                access: rule.access,
+                required: true,
+            }),
+    );
+    rules
+}
+
+/// Turn a plan into a ruleset.
+///
+/// `proxy_port` is the one TCP port the ruleset lets its holder connect to; a
+/// ruleset with none handles TCP and so refuses every connection.
+pub(crate) fn instantiate(
+    rules: &[Planned],
+    proxy_port: Option<u16>,
+    abi: ABI,
+) -> Result<PreparedRuleset> {
     // Both filesystem access and TCP connections are always handled. Handling
     // TCP unconditionally is what makes a deny-all policy actually deny: an
     // unhandled right is not restricted at all.
@@ -104,9 +182,13 @@ pub(crate) fn build_ruleset(
         .and_then(|ruleset| ruleset.create())
         .map_err(|error| Error::InvalidProfile(format!("Landlock ruleset error: {error}")))?;
 
-    add_system_rules(&mut ruleset, config, abi)?;
-    add_device_rules(&mut ruleset, config, abi)?;
-    add_configured_rules(&mut ruleset, config, abi)?;
+    for rule in rules {
+        if rule.required {
+            add_required_path(&mut ruleset, &rule.path, rule.access, abi)?;
+        } else {
+            add_system_path(&mut ruleset, &rule.path, rule.access, abi)?;
+        }
+    }
 
     // Outbound TCP is denied except to the proxy, which applies the policy.
     if let Some(port) = proxy_port {
@@ -115,22 +197,158 @@ pub(crate) fn build_ruleset(
             .map_err(|e| Error::InvalidProfile(format!("Landlock proxy rule error: {e}")))?;
     }
 
-    tracing::debug!(
-        proxy_port,
-        working_dir = %config.working_dir().display(),
-        strict = config.filesystem_strict(),
-        "landlock: ruleset built"
-    );
-
     Ok(PreparedRuleset { inner: ruleset })
 }
 
-/// Grant access to the system paths any process needs to start.
-fn add_system_rules(
-    ruleset: &mut RulesetCreated,
-    config: &SandboxConfigData,
-    abi: ABI,
+/// The rights that read or execute a file or list a directory.
+pub(crate) fn read_rights(abi: ABI) -> BitFlags<AccessFs> {
+    AccessFs::from_read(abi)
+}
+
+/// A plan with every right that changes the filesystem taken out.
+///
+/// What is left is what the sandbox itself may do. Everything that creates,
+/// changes or removes goes through the broker, which acts under the full plan.
+pub(crate) fn without_writes(rules: &[Planned], abi: ABI) -> Vec<Planned> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let access = rule.access & read_rights(abi);
+            (!access.is_empty()).then(|| Planned {
+                access,
+                ..rule.clone()
+            })
+        })
+        .collect()
+}
+
+/// A directory on the way to a denied path.
+#[derive(Debug, Clone)]
+pub(crate) struct Ancestor {
+    pub(crate) path: PathBuf,
+    /// The rights an entry created in it needs to be as usable as its siblings.
+    pub(crate) rights: BitFlags<AccessFs>,
+}
+
+/// A plan with the denied paths carved out of it.
+#[derive(Debug)]
+pub(crate) struct Carved {
+    pub(crate) rules: Vec<Planned>,
+    pub(crate) ancestors: Vec<Ancestor>,
+}
+
+/// Remove the right to read, list and execute below each of `denied`.
+///
+/// Landlock grants and never denies, and a path has the union of the rights of
+/// every rule above it, so a rule on a directory above a denied path cannot be
+/// kept as it is. It is replaced by rules for the entries of that directory that
+/// are not on the way to the denied path, and so on down to it. The directories
+/// on the way keep nothing: the entries created in them later have no rule, which
+/// is what the broker's inode pool makes up for.
+///
+/// Symbolic links get no rule of their own, because a rule on one grants its
+/// target. A denied path that does not exist is not carved: nothing can be read
+/// from it, and creating it is the broker's to refuse.
+pub(crate) fn carve(rules: Vec<Planned>, denied: &[PathBuf], abi: ABI) -> Result<Carved> {
+    let withheld = read_rights(abi);
+    let denied: Vec<&PathBuf> = denied
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .collect();
+    let mut carved = Carved {
+        rules: Vec::new(),
+        ancestors: Vec::new(),
+    };
+    for rule in rules {
+        if denied.iter().any(|path| rule.path.starts_with(path)) {
+            let access = rule.access & !withheld;
+            if !access.is_empty() {
+                carved.rules.push(Planned { access, ..rule });
+            }
+            continue;
+        }
+        let below: Vec<&PathBuf> = denied
+            .iter()
+            .copied()
+            .filter(|path| path.starts_with(&rule.path))
+            .collect();
+        if below.is_empty() {
+            carved.rules.push(rule);
+            continue;
+        }
+        let kept = rule.access & !withheld;
+        if !kept.is_empty() {
+            carved.rules.push(Planned {
+                access: kept,
+                ..rule.clone()
+            });
+        }
+        carve_directory(&rule.path, rule.access, &below, &mut carved)?;
+    }
+    Ok(carved)
+}
+
+fn carve_directory(
+    directory: &Path,
+    access: BitFlags<AccessFs>,
+    below: &[&PathBuf],
+    carved: &mut Carved,
 ) -> Result<()> {
+    match carved
+        .ancestors
+        .iter_mut()
+        .find(|ancestor| ancestor.path == directory)
+    {
+        Some(ancestor) => ancestor.rights |= access,
+        None => carved.ancestors.push(Ancestor {
+            path: directory.to_path_buf(),
+            rights: access,
+        }),
+    }
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        Error::path(
+            directory,
+            std::io::Error::other(format!(
+                "cannot list a directory above a denied path to grant its other entries: {error}"
+            )),
+        )
+    })?;
+    for entry in entries {
+        let path = entry.map_err(|error| Error::path(directory, error))?.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || below.iter().any(|denied| **denied == path) {
+            continue;
+        }
+        let inside: Vec<&PathBuf> = below
+            .iter()
+            .copied()
+            .filter(|denied| denied.starts_with(&path))
+            .collect();
+        if inside.is_empty() {
+            carved.rules.push(Planned {
+                path,
+                access,
+                required: false,
+            });
+        } else {
+            carve_directory(&path, access, &inside, carved)?;
+        }
+    }
+    Ok(())
+}
+
+/// Plan the access to the system paths any process needs to start.
+fn plan_system_rules(rules: &mut Vec<Planned>, config: &SandboxConfigData, abi: ABI) {
+    let mut system = |path: &str, access: BitFlags<AccessFs>| {
+        rules.push(Planned {
+            path: PathBuf::from(path),
+            access,
+            required: false,
+        });
+    };
+
     // Executables and shared libraries.
     let exec_paths: &[&str] = if config.filesystem_strict() {
         &[
@@ -159,13 +377,13 @@ fn add_system_rules(
         make_bitflags!(AccessFs::{ ReadFile | ReadDir | Execute })
     };
     for path in exec_paths {
-        add_system_path(ruleset, path, exec_access, abi)?;
+        system(path, exec_access);
     }
 
     // Read-only system state. Required even in strict mode: the dynamic loader
     // and libc consult /etc, and many tools read process metadata from /proc.
     for path in ["/etc", "/proc", "/sys", "/run"] {
-        add_system_path(ruleset, path, AccessFs::from_read(abi), abi)?;
+        system(path, AccessFs::from_read(abi));
     }
 
     // Shared temp directories are readable outside strict mode, and writable
@@ -179,7 +397,7 @@ fn add_system_rules(
             AccessFs::from_read(abi)
         };
         for path in ["/tmp", "/var/tmp"] {
-            add_system_path(ruleset, path, access, abi)?;
+            system(path, access);
         }
     }
 
@@ -188,7 +406,7 @@ fn add_system_rules(
         // hierarchy, so granting execute on `/` here would silently re-grant it
         // to shared temp and to the working directory. Execute is granted above,
         // to the system directories that need it, and nowhere else.
-        add_system_path(ruleset, "/", writable_access(abi), abi)?;
+        system("/", writable_access(abi));
     }
 
     // Landlock is default-deny, so the protections that macOS expresses as
@@ -196,23 +414,33 @@ fn add_system_rules(
     // one case that needs a rule, to grant access when protection is off.
     if !config.security().protect_user_home() {
         if let Some(home) = std::env::var_os("HOME") {
-            add_system_path(ruleset, Path::new(&home), AccessFs::from_all(abi), abi)?;
+            rules.push(Planned {
+                path: PathBuf::from(home),
+                access: AccessFs::from_all(abi),
+                required: false,
+            });
         }
-        add_system_path(ruleset, "/home", AccessFs::from_all(abi), abi)?;
+        rules.push(Planned {
+            path: PathBuf::from("/home"),
+            access: AccessFs::from_all(abi),
+            required: false,
+        });
     }
-
-    Ok(())
 }
 
-/// Grant access to device nodes.
-fn add_device_rules(
-    ruleset: &mut RulesetCreated,
-    config: &SandboxConfigData,
-    abi: ABI,
-) -> Result<()> {
+/// Plan the access to device nodes.
+fn plan_device_rules(rules: &mut Vec<Planned>, config: &SandboxConfigData, abi: ABI) {
+    let mut device = |path: &str, access: BitFlags<AccessFs>| {
+        rules.push(Planned {
+            path: PathBuf::from(path),
+            access,
+            required: false,
+        });
+    };
+
     // /dev/stdin and friends are symlinks into /proc/self/fd and work through
     // inherited descriptors rather than through a rule.
-    for device in [
+    for path in [
         "/dev/null",
         "/dev/zero",
         "/dev/full",
@@ -220,7 +448,7 @@ fn add_device_rules(
         "/dev/urandom",
         "/dev/fd",
     ] {
-        add_system_path(ruleset, device, AccessFs::from_all(abi), abi)?;
+        device(path, AccessFs::from_all(abi));
     }
 
     // Terminals are readable so interactive programs can query them, and
@@ -230,45 +458,43 @@ fn add_device_rules(
     } else {
         AccessFs::from_read(abi)
     };
-    for device in ["/dev/tty", "/dev/ptmx", "/dev/pts"] {
-        add_system_path(ruleset, device, tty_access, abi)?;
+    for path in ["/dev/tty", "/dev/ptmx", "/dev/pts"] {
+        device(path, tty_access);
     }
 
     let security = config.security();
     if security.allow_gpu() {
-        for device in [
+        for path in [
             "/dev/dri",
             "/dev/nvidia0",
             "/dev/nvidiactl",
             "/dev/nvidia-modeset",
             "/dev/nvidia-uvm",
         ] {
-            add_system_path(ruleset, device, AccessFs::from_all(abi), abi)?;
+            device(path, AccessFs::from_all(abi));
         }
         tracing::debug!("landlock: GPU access enabled");
     }
 
     if security.allow_npu() {
-        for device in ["/dev/accel", "/dev/accel0"] {
-            add_system_path(ruleset, device, AccessFs::from_all(abi), abi)?;
+        for path in ["/dev/accel", "/dev/accel0"] {
+            device(path, AccessFs::from_all(abi));
         }
         tracing::debug!("landlock: NPU access enabled");
     }
 
     if security.allow_hardware() {
-        for device in [
+        for path in [
             "/dev/bus/usb",
             "/dev/input",
             "/dev/video0",
             "/dev/video1",
             "/dev/snd",
         ] {
-            add_system_path(ruleset, device, AccessFs::from_all(abi), abi)?;
+            device(path, AccessFs::from_all(abi));
         }
         tracing::debug!("landlock: general hardware access enabled");
     }
-
-    Ok(())
 }
 
 /// Everything a writable location may do, except execute.
@@ -358,19 +584,6 @@ fn configured_rules(config: &SandboxConfigData, abi: ABI) -> Vec<ConfiguredRule>
     rules
 }
 
-/// Grant access to the paths the caller configured.
-fn add_configured_rules(
-    ruleset: &mut RulesetCreated,
-    config: &SandboxConfigData,
-    abi: ABI,
-) -> Result<()> {
-    for rule in configured_rules(config, abi) {
-        add_required_path(ruleset, &rule.path, rule.access, abi)?;
-    }
-
-    Ok(())
-}
-
 /// Add a rule for a path the sandbox needs but that may legitimately be absent.
 ///
 /// Distributions differ in which system paths exist, so a missing one is
@@ -419,7 +632,7 @@ fn add_rule(
     access: BitFlags<AccessFs>,
     abi: ABI,
 ) -> Result<()> {
-    let access = effective_path_access(&fd, path, access, abi)?;
+    let access = effective_path_access(&fd, path.display(), access, abi)?;
 
     ruleset
         .add_rule(PathBeneath::new(fd, access))
@@ -432,13 +645,29 @@ fn add_rule(
         })
 }
 
+/// Add a rule for an inode that `fd` holds.
+fn add_rule_fd(
+    ruleset: &mut RulesetCreated,
+    fd: BorrowedFd<'_>,
+    access: BitFlags<AccessFs>,
+) -> Result<()> {
+    ruleset
+        .add_rule(PathBeneath::new(fd, access))
+        .map(|_| ())
+        .map_err(|error| {
+            Error::InvalidProfile(format!(
+                "Landlock rejected a rule for a held inode: {error}"
+            ))
+        })
+}
+
 /// Reduce a request to the rights that make sense for the target.
 ///
 /// Landlock rejects directory-only rights on a regular file, so a rule naming a
 /// file keeps only the file rights.
 fn effective_path_access(
-    path_fd: &PathFd,
-    path: &Path,
+    path_fd: &impl AsFd,
+    path: impl std::fmt::Display,
     access: BitFlags<AccessFs>,
     abi: ABI,
 ) -> Result<BitFlags<AccessFs>> {
@@ -451,13 +680,13 @@ fn effective_path_access(
         return Err(Error::InvalidProfile(format!(
             "Landlock path {} is not a directory, but the requested access {access:?} requires \
              directory semantics",
-            path.display(),
+            path,
         )));
     }
 
     if file_access != access {
         tracing::trace!(
-            path = %path.display(),
+            path = %path,
             requested = ?access,
             effective = ?file_access,
             "landlock: narrowed non-directory path access"
@@ -467,7 +696,7 @@ fn effective_path_access(
     Ok(file_access)
 }
 
-fn path_is_directory(path_fd: &PathFd) -> Result<bool> {
+fn path_is_directory(path_fd: &impl AsFd) -> Result<bool> {
     let mut stat = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: the descriptor is open and `stat` is a valid destination.
     let rc = unsafe { libc::fstat(path_fd.as_fd().as_raw_fd(), stat.as_mut_ptr()) };
@@ -505,9 +734,13 @@ mod tests {
         File::create(&file_path).expect("creates");
 
         let path_fd = PathFd::new(&file_path).expect("opens");
-        let access =
-            effective_path_access(&path_fd, &file_path, AccessFs::from_all(ABI::V4), ABI::V4)
-                .expect("narrows");
+        let access = effective_path_access(
+            &path_fd,
+            file_path.display(),
+            AccessFs::from_all(ABI::V4),
+            ABI::V4,
+        )
+        .expect("narrows");
 
         assert_eq!(access, AccessFs::from_file(ABI::V4));
     }
@@ -516,9 +749,13 @@ mod tests {
     fn directory_rules_keep_directory_access() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path_fd = PathFd::new(dir.path()).expect("opens");
-        let access =
-            effective_path_access(&path_fd, dir.path(), AccessFs::from_all(ABI::V4), ABI::V4)
-                .expect("keeps");
+        let access = effective_path_access(
+            &path_fd,
+            dir.path().display(),
+            AccessFs::from_all(ABI::V4),
+            ABI::V4,
+        )
+        .expect("keeps");
 
         assert_eq!(access, AccessFs::from_all(ABI::V4));
     }
@@ -530,8 +767,13 @@ mod tests {
         File::create(&file_path).expect("creates");
 
         let path_fd = PathFd::new(&file_path).expect("opens");
-        let error = effective_path_access(&path_fd, &file_path, AccessFs::ReadDir.into(), ABI::V4)
-            .expect_err("rejects");
+        let error = effective_path_access(
+            &path_fd,
+            file_path.display(),
+            AccessFs::ReadDir.into(),
+            ABI::V4,
+        )
+        .expect_err("rejects");
 
         assert!(matches!(error, Error::InvalidProfile(_)));
     }

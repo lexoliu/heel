@@ -1,10 +1,13 @@
 //! Linux sandbox backend, built on Landlock and Seccomp.
 
+pub(crate) mod broker;
 mod landlock_rules;
 mod seccomp_filter;
 
+use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Output};
+use std::process::{Child as StdChild, Command, Output};
+use std::sync::Arc;
 
 use blocking::unblock;
 
@@ -20,7 +23,13 @@ const MIN_KERNEL_VERSION: KernelVersion = KernelVersion::new(6, 7, 0);
 /// Linux sandbox backend using Landlock for files and network, Seccomp for
 /// syscalls.
 pub struct LinuxBackend {
-    _private: (),
+    /// The broker, when the configuration needs one.
+    broker: Option<broker::Broker>,
+    /// The Landlock ruleset every command of the sandbox is restricted by, built
+    /// once with the sandbox.
+    ruleset: landlock_rules::PreparedRuleset,
+    /// Where the denials the broker records are collected.
+    sink: Arc<broker::sink::DenialSink>,
 }
 
 /// A parsed kernel release.
@@ -71,7 +80,7 @@ impl LinuxBackend {
     /// creating a ruleset rather than by forking a child and applying one:
     /// forking a multi-threaded process and then allocating in the child is
     /// unsound.
-    pub fn new(_config: &SandboxConfigData) -> Result<Self> {
+    pub fn new(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<Self> {
         let kernel = detect_kernel_version()?;
         if kernel < MIN_KERNEL_VERSION {
             return Err(Error::UnsupportedPlatformVersion {
@@ -83,15 +92,50 @@ impl LinuxBackend {
 
         landlock_rules::probe_support()?;
 
-        tracing::info!(%kernel, "Linux sandbox backend initialized");
-        Ok(Self { _private: () })
+        let sink = Arc::new(broker::sink::DenialSink::default());
+        let (broker, ruleset) = match broker::Broker::new(config, proxy_port, Arc::clone(&sink))? {
+            Some((broker, ruleset)) => (Some(broker), ruleset),
+            None => (None, landlock_rules::build_ruleset(config, proxy_port)?),
+        };
+
+        tracing::info!(%kernel, broker = broker.is_some(), "Linux sandbox backend initialized");
+        Ok(Self {
+            broker,
+            ruleset,
+            sink,
+        })
+    }
+
+    /// Where the denials the broker records are collected.
+    pub(crate) fn denial_sink(&self) -> &Arc<broker::sink::DenialSink> {
+        &self.sink
+    }
+
+    /// Start a prepared command, through the broker's launcher when there is one.
+    fn start(&self, cmd: Command, listener: Option<OwnedFd>) -> std::io::Result<StdChild> {
+        match (&self.broker, listener) {
+            (Some(broker), Some(listener)) => broker.spawn(cmd, listener),
+            (None, None) => {
+                let mut cmd = cmd;
+                cmd.spawn()
+            }
+            _ => unreachable!("a command is prepared for the broker exactly when there is one"),
+        }
     }
 
     /// Turn a spawn request into a configured command.
-    fn build_command(&self, request: &SpawnRequest<'_>) -> Result<Command> {
-        // Both are built here, on the host, so that the post-fork path only
-        // issues syscalls.
-        let ruleset = landlock_rules::build_ruleset(request.config, request.proxy_port)?;
+    fn build_command(&self, request: &SpawnRequest<'_>) -> Result<(Command, Option<OwnedFd>)> {
+        // Built here, on the host, so that the post-fork path only issues
+        // syscalls. A duplicate of the sandbox's ruleset descriptor: the ruleset
+        // itself, pool rules included, was built once with the sandbox.
+        let ruleset = self.ruleset.try_clone()?;
+        let (hook, listener) = match &self.broker {
+            Some(broker) => {
+                let (hook, listener) = broker.prepare()?;
+                (Some(hook), Some(listener))
+            }
+            None => (None, None),
+        };
         let allow_tcp = request.proxy_port.is_some();
         let filter = seccomp_filter::build_filter(allow_tcp)?;
         let setup = PreExecSetup::new(request.config)?;
@@ -131,6 +175,10 @@ impl LinuxBackend {
                     .ok_or_else(|| std::io::Error::other("Landlock ruleset already applied"))?
                     .restrict_self()?;
 
+                if let Some(hook) = &hook {
+                    hook.install()?;
+                }
+
                 filter
                     .take()
                     .ok_or_else(|| std::io::Error::other("seccomp filter already applied"))?
@@ -140,7 +188,7 @@ impl LinuxBackend {
             });
         }
 
-        Ok(cmd)
+        Ok((cmd, listener))
     }
 }
 
@@ -162,12 +210,13 @@ impl Backend for LinuxBackend {
     async fn execute(&self, request: SpawnRequest<'_>) -> Result<Output> {
         tracing::debug!(program = %request.program, args = ?request.args, "sandbox: executing");
 
-        let mut cmd = self.build_command(&request)?;
+        let (mut cmd, listener) = self.build_command(&request)?;
         cmd.stdin(std::process::Stdio::from(request.stdin));
         cmd.stdout(std::process::Stdio::from(request.stdout));
         cmd.stderr(std::process::Stdio::from(request.stderr));
 
-        let output = unblock(move || cmd.output()).await?;
+        let child = self.start(cmd, listener)?;
+        let output = unblock(move || child.wait_with_output()).await?;
 
         tracing::debug!(
             program = %request.program,
@@ -182,14 +231,14 @@ impl Backend for LinuxBackend {
     async fn spawn(&self, request: SpawnRequest<'_>) -> Result<Child> {
         tracing::debug!(program = %request.program, args = ?request.args, "sandbox: spawning");
 
-        let mut cmd = self.build_command(&request)?;
+        let (mut cmd, listener) = self.build_command(&request)?;
         cmd.stdin(std::process::Stdio::from(request.stdin));
         cmd.stdout(std::process::Stdio::from(request.stdout));
         cmd.stderr(std::process::Stdio::from(request.stderr));
         // Its own process group, so the whole tree can be killed at once.
         cmd.process_group(0);
 
-        let child = cmd.spawn()?;
+        let child = self.start(cmd, listener)?;
         tracing::debug!(program = %request.program, pid = child.id(), "sandbox: spawned");
 
         Ok(Child::new(UnixChild::new(child)))

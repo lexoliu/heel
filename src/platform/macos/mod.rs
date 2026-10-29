@@ -23,12 +23,16 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// macOS sandbox backend using `sandbox-exec`.
 pub struct MacOSBackend {
-    _private: (),
+    /// The SBPL profile every command of the sandbox runs under, generated once
+    /// with the sandbox so a configured path that cannot be granted fails
+    /// creation.
+    profile: String,
 }
 
 impl MacOSBackend {
-    /// Create the backend, checking that the OS is new enough.
-    pub fn new(_config: &SandboxConfigData) -> Result<Self> {
+    /// Create the backend, checking that the OS is new enough and generating
+    /// the sandbox profile.
+    pub fn new(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<Self> {
         let version = Self::macos_version()?;
         if version < (10, 15) {
             return Err(Error::UnsupportedPlatformVersion {
@@ -38,7 +42,8 @@ impl MacOSBackend {
             });
         }
 
-        Ok(Self { _private: () })
+        let profile = profile::generate_profile(config, proxy_port)?;
+        Ok(Self { profile })
     }
 
     /// Read the host's macOS version.
@@ -62,10 +67,8 @@ impl MacOSBackend {
 
     /// Turn a spawn request into a configured `sandbox-exec` invocation.
     fn build_command(&self, request: &SpawnRequest<'_>) -> Result<Command> {
-        let profile = profile::generate_profile(request.config, request.proxy_port)?;
-
         let mut cmd = Command::new(SANDBOX_EXEC);
-        cmd.arg("-p").arg(&profile);
+        cmd.arg("-p").arg(&self.profile);
         cmd.arg(request.program);
         cmd.args(request.args);
         cmd.current_dir(request.working_dir());
