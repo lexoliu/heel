@@ -12,7 +12,7 @@
 //! everything beneath it.
 
 use std::io;
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, WIN32_ERROR};
@@ -35,14 +35,18 @@ use windows::Win32::Security::{
     INHERIT_ONLY_ACE, INHERITED_ACE, InitializeSecurityDescriptor, MapGenericMask,
     OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERIT_REQ,
     SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL,
-    SetFileSecurityW, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    SetFileSecurityW, SetKernelObjectSecurity, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl,
 };
 #[cfg(test)]
 use windows::Win32::Storage::FileSystem::FILE_TRAVERSE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    WRITE_DAC,
+    CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC,
 };
 use windows::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
@@ -189,27 +193,7 @@ fn reread(object: &str, mut attempt: impl FnMut() -> WIN32_ERROR) -> io::Result<
 /// how it opens the object. The object itself is the only scope it has.
 fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
     let _guard = lock()?;
-    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    let mut current: *mut ACL = std::ptr::null_mut();
-
-    reread("the kernel object", || {
-        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-        current = std::ptr::null_mut();
-        // SAFETY: the out-parameters are valid destinations.
-        unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(&mut current),
-                None,
-                Some(&mut descriptor),
-            )
-        }
-    })?;
-    let _descriptor = LocalBuffer(descriptor.0);
+    let (_descriptor, current) = read_dacl_handle(handle, SE_KERNEL_OBJECT, "the kernel object")?;
 
     let updated = merge(
         sddl,
@@ -221,27 +205,224 @@ fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
         "the kernel object",
     )?;
 
-    // SAFETY: `updated` is the list just built, valid while the guard lives.
+    write_dacl_handle(handle, SE_KERNEL_OBJECT, updated, "the kernel object")
+}
+
+/// Read the DACL of the object `handle` refers to, retrying while it moves.
+///
+/// The handle must carry `READ_CONTROL`. The returned pair is the security
+/// descriptor — whose `LocalBuffer` owns the memory the list points into — and
+/// the list itself.
+fn read_dacl_handle(
+    handle: HANDLE,
+    kind: SE_OBJECT_TYPE,
+    object: &str,
+) -> io::Result<(LocalBuffer, *mut ACL)> {
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let mut current: *mut ACL = std::ptr::null_mut();
+
+    reread(object, || {
+        descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        current = std::ptr::null_mut();
+        // SAFETY: the out-parameters are valid destinations.
+        unsafe {
+            GetSecurityInfo(
+                handle,
+                kind,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut current),
+                None,
+                Some(&mut descriptor),
+            )
+        }
+    })?;
+    Ok((LocalBuffer(descriptor.0), current))
+}
+
+/// Replace the DACL of the object `handle` refers to with `list`.
+///
+/// The handle must carry `WRITE_DAC`. Unlike the named call, which opens the
+/// object again, this writes to the object the caller already holds.
+fn write_dacl_handle(
+    handle: HANDLE,
+    kind: SE_OBJECT_TYPE,
+    list: LocalBuffer,
+    object: &str,
+) -> io::Result<()> {
+    // SAFETY: `list` is the list just built, valid until it is dropped below.
     let status = unsafe {
         SetSecurityInfo(
             handle,
-            SE_KERNEL_OBJECT,
+            kind,
             DACL_SECURITY_INFORMATION,
             None,
             None,
-            Some(updated.0.cast()),
+            Some(list.0.cast()),
             None,
         )
     };
-    drop(updated);
+    drop(list);
 
     if status.is_err() {
         return Err(io::Error::other(format!(
-            "cannot apply the access control list to the kernel object: {status:?}"
+            "cannot apply the access control list to {object}: {status:?}"
         )));
     }
 
     Ok(())
+}
+
+/// A path that is not the object it names: a link or junction sits in it.
+#[derive(Debug)]
+struct Redirected;
+
+impl std::fmt::Display for Redirected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the path passes through a symbolic link or junction")
+    }
+}
+
+impl std::error::Error for Redirected {}
+
+/// Whether `error` says a path was not the object it names.
+pub(crate) fn is_redirected(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<Redirected>())
+}
+
+/// The bit that marks a reparse tag as redirecting a name to another path:
+/// symbolic links, junctions and the like. Placeholders and other reparse
+/// points (cloud files, deduplication) redirect nothing and do not carry it.
+const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
+/// The `\\?\` spelling of `path`, with `/` separators turned into `\`.
+fn verbatim(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\");
+    if text.starts_with(r"\\?\") {
+        text
+    } else if let Some(rest) = text.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{rest}")
+    } else {
+        format!(r"\\?\{text}")
+    }
+}
+
+/// `name` in the one form two spellings of a path compare equal in: no
+/// verbatim prefix, no trailing separator, lower case.
+fn comparable(name: &str) -> String {
+    let name = name.strip_prefix(r"\\?\").unwrap_or(name);
+    let name = match name.strip_prefix(r"UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => name.to_owned(),
+    };
+    name.trim_end_matches('\\').to_lowercase()
+}
+
+/// Open `path` once, and fail unless the handle is the object `path` names.
+///
+/// A name is resolved on every use, so checking it and then handing it to a
+/// call that opens it again leaves a window in which a process that can write
+/// a parent swaps the object for a junction. The check here is made on the
+/// handle instead: the open does not follow a link in the last component, and
+/// the handle's own final path must be the path asked for, which it is not when
+/// any component, a parent included, redirected the open. Whatever is then
+/// done with the handle lands on that object and no other.
+///
+/// Only a redirecting reparse point (a symbolic link or junction) is refused:
+/// a placeholder or deduplicated file is the object it names. `path` must be
+/// the resolved path, long names and all, as `std::fs::canonicalize` spells it.
+/// The name the handle reports is returned, for recording.
+///
+/// `access` is added to the rights the check itself needs.
+fn open_unredirected(path: &Path, access: u32) -> io::Result<(OwnedHandle, String)> {
+    crate::platform::unresolved::require_normal(path)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let expected = verbatim(path);
+    let wide: Vec<u16> = expected.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            access | FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(
+                FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0,
+            ),
+            None,
+        )
+    }
+    .map_err(|source| io::Error::other(format!("cannot open {}: {source}", path.display())))?;
+    // SAFETY: the handle came from the call above and is closed exactly once.
+    let owned = unsafe { OwnedHandle::from_raw_handle(handle.0.cast()) };
+
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: `tag` is the structure this information class fills, and the size
+    // passed is its size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&raw mut tag).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>())
+                .expect("the structure is a few bytes"),
+        )
+    }
+    .map_err(|source| {
+        io::Error::other(format!(
+            "cannot read the attributes of {}: {source}",
+            path.display()
+        ))
+    })?;
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        && tag.ReparseTag & REPARSE_TAG_NAME_SURROGATE != 0
+    {
+        return Err(io::Error::other(Redirected));
+    }
+
+    let mut buffer = vec![0u16; 512];
+    let length = loop {
+        // SAFETY: `buffer` is a valid destination of the length passed.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                &mut buffer,
+                GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0),
+            )
+        } as usize;
+        if length == 0 {
+            return Err(io::Error::other(format!(
+                "cannot read the final path of {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        if length < buffer.len() {
+            break length;
+        }
+        buffer.resize(length + 1, 0);
+    };
+    let actual = String::from_utf16_lossy(&buffer[..length]);
+    if comparable(&actual) != comparable(&expected) {
+        return Err(io::Error::other(Redirected));
+    }
+
+    Ok((owned, actual))
+}
+
+/// The verbatim name of `path`, after proving no link or junction is in it.
+pub(crate) fn unredirected_name(path: &Path) -> io::Result<String> {
+    open_unredirected(path, READ_CONTROL.0).map(|(_, name)| name)
+}
+
+/// The raw handle of an owned one, for the Win32 calls.
+fn raw(handle: &OwnedHandle) -> HANDLE {
+    HANDLE(handle.as_raw_handle().cast())
 }
 
 /// Add `entries` for `sid` to the access control list of `path`.
@@ -250,11 +431,17 @@ fn grant_handle(handle: HANDLE, sddl: &str, access: u32) -> io::Result<()> {
 /// than replacing it, so nothing the machine or the user already relies on is
 /// removed.
 ///
-/// The resolved name the entries were written to is returned so the caller
-/// can hand the same name to `revoke` when the sandbox is dropped.
+/// `path` is the resolved path and is opened once, without following a link:
+/// the entries are written through that handle to the object the path names, or
+/// not at all when a link or junction stands in the way (see
+/// [`open_unredirected`]). The name the handle reports is returned so the
+/// caller can hand the same name to `revoke` when the sandbox is dropped.
 pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<String> {
-    let name = resolve(path)?;
-    apply(&name, sid, entries, SE_FILE_OBJECT)?;
+    let _guard = lock()?;
+    let (handle, name) = open_unredirected(path, READ_CONTROL.0 | WRITE_DAC.0)?;
+    let (_descriptor, current) = read_dacl_handle(raw(&handle), SE_FILE_OBJECT, &name)?;
+    let updated = merge(sid, current, entries, &name)?;
+    write_dacl_handle(raw(&handle), SE_FILE_OBJECT, updated, &name)?;
     Ok(name)
 }
 
@@ -271,12 +458,13 @@ pub(crate) fn grant(path: &Path, sid: &str, entries: &[Entry]) -> io::Result<Str
 /// and propagates nothing. The list keeps its protected and auto-inherited
 /// bits, so how it relates to its parent is unchanged.
 ///
-/// The resolved name the entry was written to is returned, as `grant`
-/// returns it, for the matching `revoke_this_only` call.
+/// `path` is opened once and the entry is written through the handle, as
+/// `grant` does. The name the handle reports is returned, as `grant` returns
+/// it, for the matching `revoke_this_only` call.
 pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result<String> {
     let _guard = lock()?;
-    let name = resolve(path)?;
-    let (descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
+    let (handle, name) = open_unredirected(path, READ_CONTROL.0 | WRITE_DAC.0)?;
+    let (descriptor, current) = read_dacl_handle(raw(&handle), SE_FILE_OBJECT, &name)?;
     let updated = merge(
         sid,
         current,
@@ -286,7 +474,7 @@ pub(crate) fn grant_this_only(path: &Path, sid: &str, access: u32) -> io::Result
         }],
         &name,
     )?;
-    write_file_dacl(&name, &descriptor, updated)?;
+    write_file_dacl_handle(raw(&handle), &name, &descriptor, updated)?;
     Ok(name)
 }
 
@@ -297,7 +485,7 @@ pub(crate) fn add_without_propagation(path: &Path, sid: &str, entries: &[Entry])
     let name = resolve(path)?;
     let (descriptor, current) = read_dacl(&name, SE_FILE_OBJECT)?;
     let updated = merge(sid, current, entries, &name)?;
-    write_file_dacl(&name, &descriptor, updated)
+    write_file_dacl_named(&name, &descriptor, updated)
 }
 
 /// Remove every entry `sddl` holds on the object `name` refers to.
@@ -320,7 +508,7 @@ pub(crate) fn revoke_this_only(name: &str, sddl: &str) -> io::Result<()> {
     let _guard = lock()?;
     let (descriptor, current) = read_dacl(name, SE_FILE_OBJECT)?;
     let updated = without(sddl, current, name)?;
-    write_file_dacl(name, &descriptor, updated)
+    write_file_dacl_named(name, &descriptor, updated)
 }
 
 /// The rights named `trustees` receive from the object's own DACL on `path`.
@@ -629,8 +817,12 @@ fn write_dacl(name: &str, list: LocalBuffer, kind: SE_OBJECT_TYPE) -> io::Result
 /// unchanged. `NtSetSecurityObject` keeps `SE_DACL_AUTO_INHERITED` only when
 /// `SE_DACL_AUTO_INHERIT_REQ` is requested; without that request, the object
 /// stops being auto-inherited.
-fn write_file_dacl(name: &str, descriptor: &LocalBuffer, list: LocalBuffer) -> io::Result<()> {
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+fn write_file_dacl(
+    name: &str,
+    descriptor: &LocalBuffer,
+    list: LocalBuffer,
+    set: impl FnOnce(PSECURITY_DESCRIPTOR) -> windows::core::Result<()>,
+) -> io::Result<()> {
     let descriptor = PSECURITY_DESCRIPTOR(descriptor.0.cast());
 
     let mut control = 0u16;
@@ -652,14 +844,12 @@ fn write_file_dacl(name: &str, descriptor: &LocalBuffer, list: LocalBuffer) -> i
     let inheritance = SECURITY_DESCRIPTOR_CONTROL(inheritance_mask);
     let inheritance_value = SECURITY_DESCRIPTOR_CONTROL(inheritance_value);
     // SAFETY: `absolute` outlives every call below, and `list` — which it
-    // points at once the list is set — outlives the write.
+    // points at once the list is set — outlives the write, `set` included.
     let status = unsafe {
         InitializeSecurityDescriptor(written, SECURITY_DESCRIPTOR_REVISION)
             .and_then(|()| SetSecurityDescriptorDacl(written, true, Some(list.0.cast()), false))
             .and_then(|()| SetSecurityDescriptorControl(written, inheritance, inheritance_value))
-            .and_then(|()| {
-                SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, written).ok()
-            })
+            .and_then(|()| set(written))
     };
     drop(list);
 
@@ -667,6 +857,35 @@ fn write_file_dacl(name: &str, descriptor: &LocalBuffer, list: LocalBuffer) -> i
         io::Error::other(format!(
             "cannot apply the access control list to {name}: {source}"
         ))
+    })
+}
+
+/// [`write_file_dacl`] to the file `name` refers to, opening it by name.
+fn write_file_dacl_named(
+    name: &str,
+    descriptor: &LocalBuffer,
+    list: LocalBuffer,
+) -> io::Result<()> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    write_file_dacl(name, descriptor, list, |written| {
+        // SAFETY: `wide` is NUL-terminated and `written` is the descriptor built
+        // by the caller, valid for the call.
+        unsafe { SetFileSecurityW(PCWSTR(wide.as_ptr()), DACL_SECURITY_INFORMATION, written) }.ok()
+    })
+}
+
+/// [`write_file_dacl`] to the object `handle` refers to, which the caller
+/// opened with `WRITE_DAC` and proved to be the object it meant.
+fn write_file_dacl_handle(
+    handle: HANDLE,
+    name: &str,
+    descriptor: &LocalBuffer,
+    list: LocalBuffer,
+) -> io::Result<()> {
+    write_file_dacl(name, descriptor, list, |written| {
+        // SAFETY: `handle` is open for the call and `written` is the descriptor
+        // built by the caller, valid for the call.
+        unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, written) }
     })
 }
 
@@ -763,7 +982,7 @@ mod tests {
     // A this-object ACL write preserves the parent's auto-inherited DACL.
     #[test]
     fn this_object_writes_preserve_auto_inheritance() {
-        let outer = tempfile::tempdir().expect("an outer temp directory");
+        let outer = crate::platform::unresolved::resolved_tempdir();
         let marker = "S-1-15-3-1024-2";
         grant(
             outer.path(),
@@ -819,5 +1038,52 @@ mod tests {
             inherited,
             "the revoke preserves inherited ACEs: {revoked}"
         );
+    }
+
+    #[test]
+    fn spellings_of_one_path_compare_equal_and_other_paths_do_not() {
+        assert_eq!(comparable(r"\\?\C:\Users\Me\"), comparable(r"c:\users\me"));
+        assert_eq!(
+            comparable(r"\\?\UNC\host\share\x"),
+            comparable(r"\\host\share\X")
+        );
+        assert_ne!(comparable(r"C:\a\b"), comparable(r"C:\a\c"));
+        assert_eq!(verbatim(Path::new("C:/a/b")), r"\\?\C:\a\b");
+        assert_eq!(verbatim(Path::new(r"\\host\share")), r"\\?\UNC\host\share");
+    }
+
+    #[test]
+    fn a_junction_in_the_path_is_refused_and_nothing_is_written_at_its_target() {
+        let root = crate::platform::unresolved::resolved_tempdir();
+        let real = root.path().join("real");
+        let inner = real.join("inner");
+        std::fs::create_dir_all(&inner).expect("the directories are created");
+        let link = root.path().join("link");
+        crate::platform::unresolved::junction(&link, &real);
+        let marker = "S-1-15-3-1024-3";
+        let entries = [Entry {
+            access: FILE_TRAVERSE.0,
+            applies_to: Scope::Directories,
+        }];
+
+        // The last component, and a parent of it.
+        for through in [link.clone(), link.join("inner")] {
+            let error = grant(&through, marker, &entries).expect_err("a junction is refused");
+            assert!(is_redirected(&error), "{through:?}: {error}");
+            let error = grant_this_only(&through, marker, FILE_TRAVERSE.0)
+                .expect_err("a junction is refused");
+            assert!(is_redirected(&error), "{through:?}: {error}");
+        }
+        for target in [&real, &inner] {
+            let name = resolve(target).expect("the target resolves");
+            assert!(
+                !names_trustee(&name, marker).expect("the DACL reads"),
+                "the junction's target {name} must not be granted"
+            );
+        }
+
+        grant(&inner, marker, &entries).expect("the real path is granted");
+        let name = resolve(&inner).expect("resolves");
+        assert!(names_trustee(&name, marker).expect("the DACL reads"));
     }
 }

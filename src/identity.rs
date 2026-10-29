@@ -54,6 +54,8 @@ impl Identity {
     }
 
     /// Keep `grant` on the identity's AppContainer profile.
+    ///
+    /// The grant's path is absolute and already resolved, as for any grant.
     #[must_use]
     pub fn persistent_grant(mut self, grant: Grant) -> Self {
         match self
@@ -85,15 +87,19 @@ impl Identity {
     /// # Errors
     ///
     /// Returns [`Error::InitFailed`] if Windows cannot prepare the profile or
-    /// grants.
+    /// grants, and [`Error::GrantRedirected`] if a persistent grant, or a
+    /// directory above one, has become a symbolic link or junction.
     pub fn prepare(&self) -> Result<()> {
         #[cfg(windows)]
-        crate::platform::windows::identity::prepare(self).map_err(|source| {
-            Error::InitFailed(format!(
+        crate::platform::windows::identity::prepare(self).map_err(|source| match source {
+            crate::platform::windows::Win32Failure::Internal(
+                error @ Error::GrantRedirected { .. },
+            ) => error,
+            source => Error::InitFailed(format!(
                 "cannot prepare identity {}: {}",
                 self.name,
                 crate::platform::windows::with_causes(&source)
-            ))
+            )),
         })?;
 
         Ok(())

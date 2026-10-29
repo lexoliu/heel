@@ -389,6 +389,24 @@ impl SandboxConfigData {
         &self.working_dir
     }
 
+    /// Every path this configuration lets the sandbox write: the writable
+    /// grants, the working directory and a virtual environment that accepts
+    /// installs.
+    pub(crate) fn writable_paths(&self) -> Vec<&Path> {
+        self.grants
+            .iter()
+            .filter(|grant| grant.access().can_write())
+            .map(Grant::path)
+            .chain(std::iter::once(self.working_dir()))
+            .chain(
+                self.python
+                    .as_ref()
+                    .filter(|python| python.allow_pip_install())
+                    .map(|python| python.venv().path()),
+            )
+            .collect()
+    }
+
     /// Whether the working directory path was generated rather than supplied.
     pub fn working_dir_is_auto(&self) -> bool {
         self.working_dir_auto
@@ -638,6 +656,16 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     ///
     /// Granting the same path twice keeps the union: `.writable(p).executable(p)`
     /// and `.grant(p, Access::WRITE | Access::EXEC)` configure the same sandbox.
+    ///
+    /// The path must be absolute, already resolved and spelled without `.` or
+    /// `..` components: the sandbox never follows a symbolic link to honour a
+    /// grant. Building a sandbox checks each component of the path without
+    /// following links and fails with
+    /// [`Error::GrantRedirected`](crate::Error::GrantRedirected) if one has
+    /// become a link (on Windows, a symbolic link or junction), so a process
+    /// that can replace a granted directory with a link cannot move the grant to
+    /// the link's target. A path that does not exist is an error too. Resolve
+    /// the paths a user wrote with [`resolve_paths`](crate::resolve_paths).
     pub fn grant(mut self, path: impl AsRef<Path>, access: Access) -> Self {
         self.data.push_grant(path.as_ref().to_path_buf(), access);
         self
@@ -750,6 +778,11 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     ///
     /// The directory is created when the sandbox starts if it does not exist.
     /// A directory supplied here is never deleted when the sandbox is dropped.
+    ///
+    /// Like a grant, the path must be absolute, already resolved and spelled
+    /// without `.` or `..` components, and it is never resolved again: if a
+    /// sandbox of an earlier run replaced it with a link, starting a sandbox
+    /// fails with [`Error::GrantRedirected`](crate::Error::GrantRedirected).
     pub fn working_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.data.working_dir = path.as_ref().to_path_buf();
         self.data.working_dir_auto = false;

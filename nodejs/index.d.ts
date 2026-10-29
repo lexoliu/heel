@@ -56,7 +56,11 @@ export interface SandboxConfigJs {
   isolation?: IsolationJs
   /** Security toggles layered onto the isolation level's preset. */
   security?: SecurityConfigJs
-  /** Paths the sandbox may use, each mapped to an access mode of `r`, `rw`, `rx` or `rwx`. */
+  /**
+   * Paths the sandbox may use, each mapped to an access mode of `r`, `rw`, `rx` or `rwx`.
+   * Each path must exist; it is resolved once, when the sandbox is created, and a path
+   * crossing a link that a sandbox could have planted is refused.
+   */
   grants?: Record<string, string>
   /** Python configuration. */
   python?: PythonConfigJs
@@ -82,7 +86,10 @@ export interface NetworkPolicyConfig {
 }
 /** Virtual environment configuration. */
 export interface VenvConfigJs {
-  /** Where the environment lives. */
+  /**
+   * Where the environment lives. It must exist; the path is resolved once, when the sandbox is created,
+   * and a path crossing a link that a sandbox could have planted is refused.
+   */
   path?: string
   /** Interpreter used to create the environment. */
   python?: string

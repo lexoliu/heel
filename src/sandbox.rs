@@ -32,8 +32,20 @@ fn create_ipc_socket_dir() -> Result<(WorkingDir, PathBuf)> {
 /// Locate the `heel` binary that IPC wrappers execute.
 ///
 /// Resolution is explicit and never builds anything: the configured path, then
-/// `HEEL_BIN`, then this process if it is itself `heel`, then `PATH`.
-fn resolve_heel_binary(configured: Option<&std::path::Path>) -> Result<PathBuf> {
+/// `HEEL_BIN`, then this process if it is itself `heel`, then `PATH`. The
+/// chosen path is resolved once, here, because the host picks the binary and it
+/// is often reached through a link (a package manager's shim): the link is
+/// followed unless it lies at or below a path the sandbox may write, where the
+/// sandbox could have planted it.
+fn resolve_heel_binary(
+    configured: Option<&std::path::Path>,
+    writable: &[&std::path::Path],
+) -> Result<PathBuf> {
+    let chosen = choose_heel_binary(configured)?;
+    crate::resolve::resolve_outside(&chosen, writable)
+}
+
+fn choose_heel_binary(configured: Option<&std::path::Path>) -> Result<PathBuf> {
     if let Some(path) = configured {
         if !path.is_file() {
             return Err(Error::InitFailed(format!(
@@ -227,8 +239,8 @@ impl<N: NetworkPolicy> Sandbox<N> {
         #[cfg(not(windows))]
         config_data.adopt_persistent_grants();
 
-        // Create and canonicalize the working directory before anything else
-        // derives paths from it.
+        // Create the working directory before anything else derives paths from
+        // it. A supplied one is already resolved and is only verified.
         let requested_dir = config_data.working_dir().to_path_buf();
         let auto = config_data.working_dir_is_auto();
         let working_dir = unblock(move || WorkingDir::create(&requested_dir, auto)).await?;
@@ -250,10 +262,9 @@ impl<N: NetworkPolicy> Sandbox<N> {
             }
             (None, Some(endpoint)) => {
                 let (socket_dir, socket) = unblock(create_ipc_socket_dir).await?;
-                config_data.push_grant(
-                    resolve_heel_binary(config_data.heel_binary())?,
-                    Access::EXEC,
-                );
+                let heel_binary =
+                    resolve_heel_binary(config_data.heel_binary(), &config_data.writable_paths())?;
+                config_data.push_grant(heel_binary, Access::EXEC);
                 config_data.set_ipc_socket(Some(socket.clone()));
                 let server = IpcServer::new(socket, endpoint, executor).await?;
                 (Some(server), Some(socket_dir))
@@ -315,7 +326,8 @@ impl<N: NetworkPolicy> Sandbox<N> {
         router: crate::ipc::IpcRouter,
         executor: E,
     ) -> Result<(IpcServer, WorkingDir)> {
-        let heel_binary = resolve_heel_binary(config_data.heel_binary())?;
+        let heel_binary =
+            resolve_heel_binary(config_data.heel_binary(), &config_data.writable_paths())?;
 
         // Writing the shims and creating the socket directory are both blocking
         // filesystem work; the router is handed to the worker and handed back so

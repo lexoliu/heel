@@ -79,6 +79,7 @@ async fn create_with_builder<I>(
     config: &MergedConfig,
     builder: SandboxConfigBuilder<heel::DenyAll, I>,
 ) -> CliResult<SandboxHandle> {
+    let venv = python_venv_config(config);
     let audit = config
         .audit_log
         .as_deref()
@@ -87,25 +88,29 @@ async fn create_with_builder<I>(
 
     Ok(match (config.network_mode, audit) {
         (NetworkMode::Deny, _) => {
-            SandboxHandle::DenyAll(Sandbox::with_config(build(builder, config)).await?)
+            SandboxHandle::DenyAll(Sandbox::with_config(build(builder, config, venv)).await?)
         }
         (NetworkMode::Allow, None) => SandboxHandle::AllowAll(
-            Sandbox::with_config(build(builder.network(AllowAll), config)).await?,
+            Sandbox::with_config(build(builder.network(AllowAll), config, venv)).await?,
         ),
         (NetworkMode::Allow, Some(log)) => SandboxHandle::AuditedAllowAll(
-            Sandbox::with_config(build(builder.network(Audited::new(AllowAll, log)), config))
-                .await?,
+            Sandbox::with_config(build(
+                builder.network(Audited::new(AllowAll, log)),
+                config,
+                venv,
+            ))
+            .await?,
         ),
         (NetworkMode::AllowList, None) => {
             let policy = AllowList::new(config.allow_domains.iter());
             SandboxHandle::AllowList(
-                Sandbox::with_config(build(builder.network(policy), config)).await?,
+                Sandbox::with_config(build(builder.network(policy), config, venv)).await?,
             )
         }
         (NetworkMode::AllowList, Some(log)) => {
             let policy = Audited::new(AllowList::new(config.allow_domains.iter()), log);
             SandboxHandle::AuditedAllowList(
-                Sandbox::with_config(build(builder.network(policy), config)).await?,
+                Sandbox::with_config(build(builder.network(policy), config, venv)).await?,
             )
         }
     })
@@ -115,6 +120,7 @@ async fn create_with_builder<I>(
 fn build<N: NetworkPolicy, I>(
     builder: SandboxConfigBuilder<N, I>,
     config: &MergedConfig,
+    venv: Option<VenvConfig>,
 ) -> SandboxConfig<N> {
     let mut builder = builder
         .security(config.security.clone())
@@ -129,7 +135,7 @@ fn build<N: NetworkPolicy, I>(
         builder = builder.working_dir(dir);
     }
 
-    if let Some(venv) = python_venv_config(config) {
+    if let Some(venv) = venv {
         builder = builder.python(
             PythonConfig::builder()
                 .venv(venv)
@@ -142,6 +148,8 @@ fn build<N: NetworkPolicy, I>(
 }
 
 /// The virtual environment configuration, when Python was configured at all.
+///
+/// The environment's path has been resolved by `MergedConfig::resolve_paths`.
 pub fn python_venv_config(config: &MergedConfig) -> Option<VenvConfig> {
     let python = &config.python;
     if python.venv.is_none() && python.packages.is_empty() {
@@ -151,11 +159,13 @@ pub fn python_venv_config(config: &MergedConfig) -> Option<VenvConfig> {
     let mut builder = VenvConfig::builder()
         .system_site_packages(python.system_site_packages)
         .backend(python.backend)
-        .packages(python.packages.iter().cloned());
-
-    if let Some(path) = &python.venv {
-        builder = builder.path(path);
-    }
+        .packages(python.packages.iter().cloned())
+        .path(
+            python
+                .venv
+                .as_deref()
+                .expect("resolve_paths names the environment whenever Python is configured"),
+        );
     if let Some(interpreter) = &python.interpreter {
         builder = builder.python(interpreter);
     }

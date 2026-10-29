@@ -41,7 +41,7 @@ struct Probe {
 }
 
 fn probe() -> Probe {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = fixtures::tempdir();
     let binary = fixtures::compile(
         directory.path(),
         include_str!("fixtures/broker_probe.rs"),

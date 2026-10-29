@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use heel::{
-    Access, CpuPriority, Grant, IoPriority, NiceLevel, ProcessPriority, ResourceLimits,
-    SecurityConfig, SecurityOverrides, VenvBackend,
+    Access, CpuPriority, Grant, IoPriority, NiceLevel, PathRequest, ProcessPriority,
+    ResourceLimits, SecurityConfig, SecurityOverrides, VenvBackend, VenvConfig,
 };
 use serde::Deserialize;
 
@@ -205,6 +205,66 @@ pub fn merge_config(file: FileConfig, cli: &CommonArgs) -> CliResult<MergedConfi
 }
 
 /// Layer the `python` subcommand's own arguments onto the merged config.
+impl MergedConfig {
+    /// Resolve every path the user wrote, once, for this run.
+    ///
+    /// The library takes only resolved paths, so this is where a spelling such
+    /// as `/tmp/x` or a relative path becomes the path the sandbox is built
+    /// from. Links the user's own spelling crosses are followed, but a path
+    /// that crosses a link at or below a path this configuration makes writable
+    /// is refused: a sandbox of an earlier run may have planted it, and
+    /// following it would move a grant to the link's target. Two spellings of
+    /// one path merge into one grant.
+    ///
+    /// The working directory and the virtual environment may not exist yet.
+    /// When Python is configured the environment's path is always set, to the
+    /// library default when the user gave none.
+    pub fn resolve_paths(&mut self) -> CliResult<()> {
+        let python = &self.python;
+        let venv = (python.venv.is_some() || !python.packages.is_empty()).then(|| {
+            python
+                .venv
+                .clone()
+                .unwrap_or_else(|| VenvConfig::default().path().to_path_buf())
+        });
+
+        let mut requests: Vec<PathRequest> = self
+            .grants
+            .iter()
+            .map(|grant| PathRequest::new(grant.path(), grant.access().can_write()))
+            .collect();
+        let grant_count = requests.len();
+        requests.extend(
+            self.working_dir
+                .iter()
+                .map(|dir| PathRequest::new(dir, true).allow_missing_tail()),
+        );
+        requests.extend(
+            venv.iter()
+                .map(|path| PathRequest::new(path, python.allow_pip_install).allow_missing_tail()),
+        );
+
+        let mut resolved = heel::resolve_paths(&requests)?.into_iter();
+
+        let mut grants = BTreeMap::<PathBuf, Access>::new();
+        for (grant, path) in self.grants.iter().zip(resolved.by_ref().take(grant_count)) {
+            *grants.entry(path).or_insert(grant.access()) |= grant.access();
+        }
+        self.grants = grants
+            .into_iter()
+            .map(|(path, access)| Grant::new(path, access))
+            .collect();
+
+        if let Some(dir) = &mut self.working_dir {
+            *dir = resolved.next().expect("one resolved path per request");
+        }
+        if venv.is_some() {
+            self.python.venv = Some(resolved.next().expect("one resolved path per request"));
+        }
+        Ok(())
+    }
+}
+
 pub fn merge_python_args(config: &mut MergedConfig, args: &PythonArgs) {
     let python = &mut config.python;
 
@@ -585,5 +645,172 @@ mod tests {
         // ignored, which is what `deny_unknown_fields` buys.
         let error = toml::from_str::<FileConfig>("not_a_real_setting = \"allow\"").unwrap_err();
         assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    /// A directory at its resolved path.
+    #[cfg(unix)]
+    fn resolved_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dunce::canonicalize(dir.path()).expect("resolves");
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    fn resolve(args: &[&str]) -> CliResult<MergedConfig> {
+        let mut merged = merge_config(FileConfig::default(), &common_args(args))?;
+        merged.resolve_paths()?;
+        Ok(merged)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spellings_of_one_grant_resolve_and_merge() {
+        let (_guard, root) = resolved_dir();
+        let cache = root.join("cache");
+        std::fs::create_dir(&cache).expect("creates");
+        std::os::unix::fs::symlink(&cache, root.join("alias")).expect("links");
+        let (cache_arg, alias_arg) = (
+            cache.to_str().expect("utf-8"),
+            root.join("alias").to_string_lossy().into_owned(),
+        );
+
+        let merged = resolve(&["--readable", &alias_arg, "--executable", cache_arg]).expect("ok");
+
+        assert_eq!(
+            merged.grants,
+            [Grant::new(&cache, Access::READ | Access::EXEC)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_above_a_writable_grant_is_followed() {
+        let (_guard, root) = resolved_dir();
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("grant")).expect("creates");
+        std::os::unix::fs::symlink(&real, root.join("home")).expect("links");
+
+        let merged = resolve(&[
+            "--writable",
+            root.join("home/grant").to_str().expect("utf-8"),
+        ])
+        .expect("a link outside writable territory resolves");
+
+        assert_eq!(
+            merged.grants,
+            [Grant::new(real.join("grant"), Access::WRITE)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_granted_directory_a_sandbox_replaced_with_a_link_is_refused() {
+        let (_guard, root) = resolved_dir();
+        let (granted, target) = (root.join("granted"), root.join("target"));
+        std::fs::create_dir_all(&target).expect("creates");
+        std::os::unix::fs::symlink(&target, &granted).expect("links");
+
+        let error = resolve(&["--writable", granted.to_str().expect("utf-8")])
+            .expect_err("a planted link must be refused");
+
+        assert!(
+            matches!(&error, CliError::Sandbox(heel::Error::GrantRedirected { path }) if *path == granted),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_grant_names_itself() {
+        let (_guard, root) = resolved_dir();
+        let missing = root.join("absent");
+
+        let error = resolve(&["--readable", missing.to_str().expect("utf-8")])
+            .expect_err("a missing path cannot be granted");
+
+        assert!(
+            matches!(&error, CliError::Sandbox(heel::Error::Path { path, .. }) if *path == missing),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_working_directory_and_environment_may_not_exist_yet() {
+        let (_guard, root) = resolved_dir();
+        let real = root.join("real");
+        std::fs::create_dir(&real).expect("creates");
+        std::os::unix::fs::symlink(&real, root.join("link")).expect("links");
+        let mut file = FileConfig::default();
+        file.python.packages = vec!["numpy".into()];
+        file.workdir.path = Some(root.join("link/work"));
+        file.python.venv = Some(root.join("link/venv"));
+        let mut merged = merge_config(file, &common_args(&[])).expect("merges");
+
+        merged.resolve_paths().expect("resolves");
+
+        assert_eq!(merged.working_dir, Some(real.join("work")));
+        assert_eq!(merged.python.venv, Some(real.join("venv")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_default_environment_path_is_set_and_absolute() {
+        let mut file = FileConfig::default();
+        file.python.packages = vec!["numpy".into()];
+        let mut merged = merge_config(file, &common_args(&[])).expect("merges");
+
+        merged.resolve_paths().expect("resolves");
+
+        let venv = merged.python.venv.expect("named");
+        assert!(
+            venv.is_absolute() && venv.ends_with(".sandbox-venv"),
+            "{venv:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_environment_replaced_with_a_link_is_refused() {
+        let (_guard, root) = resolved_dir();
+        let (venv, target) = (root.join("venv"), root.join("target"));
+        std::fs::create_dir_all(&target).expect("creates");
+        std::os::unix::fs::symlink(&target, &venv).expect("links");
+        let mut file = FileConfig::default();
+        file.python.venv = Some(venv.clone());
+        file.python.allow_pip_install = Some(true);
+        let mut merged = merge_config(file, &common_args(&[])).expect("merges");
+
+        let error = merged.resolve_paths().expect_err("planted");
+
+        assert!(
+            matches!(
+                &error,
+                CliError::Sandbox(heel::Error::GrantRedirected { .. })
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_working_directory_replaced_with_a_link_is_refused() {
+        let (_guard, root) = resolved_dir();
+        let (work, target) = (root.join("work"), root.join("target"));
+        std::fs::create_dir_all(&target).expect("creates");
+        std::os::unix::fs::symlink(&target, &work).expect("links");
+        let mut file = FileConfig::default();
+        file.workdir.path = Some(work);
+        let mut merged = merge_config(file, &common_args(&[])).expect("merges");
+
+        let error = merged.resolve_paths().expect_err("planted");
+
+        assert!(
+            matches!(
+                &error,
+                CliError::Sandbox(heel::Error::GrantRedirected { .. })
+            ),
+            "{error:?}"
+        );
     }
 }

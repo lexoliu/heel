@@ -50,12 +50,18 @@
 //! file or a directory whose whole tree becomes executable, so granting it on a
 //! writable path gives up write-then-execute for that path.
 //!
+//! A granted path is absolute, already resolved and free of `.` and `..`
+//! components: the sandbox checks each of its components without following
+//! symbolic links and refuses to build if one has become a link, so a grant can
+//! never move to a link's target. [`resolve_paths`] turns the paths a user wrote
+//! into such paths, once, and refuses a link a sandbox could have planted.
+//!
 //! ```rust,ignore
 //! use heel::{Access, SandboxConfig};
 //!
 //! let config = SandboxConfig::builder()
 //!     .readable("/usr/share")
-//!     .grant("target", Access::WRITE | Access::EXEC)
+//!     .grant(std::fs::canonicalize("target")?, Access::WRITE | Access::EXEC)
 //!     .build();
 //! ```
 //!
@@ -115,6 +121,7 @@ mod priority;
 #[cfg(target_os = "macos")]
 pub(crate) mod pty;
 mod python;
+mod resolve;
 mod sandbox;
 mod security;
 mod workdir;
@@ -140,6 +147,7 @@ pub use platform::Child;
 pub use policy::{ReadDenylist, WriteDenylist};
 pub use priority::{CpuPriority, InvalidNiceLevel, IoPriority, NiceLevel, ProcessPriority};
 pub use python::VenvManager;
+pub use resolve::{PathRequest, resolve_paths};
 pub use sandbox::Sandbox;
 pub use security::{SecurityConfig, SecurityConfigBuilder, SecurityOverrides};
 pub use workdir::WorkingDir;

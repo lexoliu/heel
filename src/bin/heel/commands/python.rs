@@ -8,6 +8,7 @@ use crate::sandbox::{create_sandbox, python_venv_config};
 /// Run a Python script or REPL in the sandbox, returning its exit code.
 pub async fn execute(args: PythonArgs, mut config: MergedConfig) -> CliResult<i32> {
     merge_python_args(&mut config, &args);
+    config.resolve_paths()?;
 
     // The environment is prepared before the sandbox starts, because installing
     // packages needs the network access the sandbox denies.

@@ -8,6 +8,8 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 #![allow(clippy::unwrap_used)]
 
+mod fixtures;
+
 use std::path::Path;
 use std::process::Output;
 
@@ -41,7 +43,7 @@ async fn default_sandbox() -> Sandbox {
 
 /// A file outside the sandbox that must stay unreadable.
 fn secret_file() -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = fixtures::tempdir();
     let path = dir.path().join("secret.txt");
     std::fs::write(&path, "token-value").expect("writes");
     (dir, path)

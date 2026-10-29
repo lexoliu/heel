@@ -96,12 +96,12 @@ mod enforced {
         // creates, so a failed protection damages nothing on the host. The refusal
         // is the write denylist's: with the home directory unprotected, Linux
         // grants it whole.
-        let rustup = tempfile::tempdir().unwrap();
+        let rustup = fixtures::tempdir();
         let settings = std::fs::canonicalize(rustup.path())
             .unwrap()
             .join("settings.toml");
         std::fs::write(&settings, "version = \"12\"\n").unwrap();
-        let unrelated_home = tempfile::tempdir().unwrap();
+        let unrelated_home = fixtures::tempdir();
         let sandbox = start(
             reader(DenyAll, unrelated_home.path()).write_denylist(
                 WriteDenylist::persistence()
@@ -132,7 +132,7 @@ mod enforced {
     #[tokio::test]
     async fn a_path_the_embedder_adds_is_denied() {
         let home = home_with(&[]);
-        let secrets = tempfile::tempdir().unwrap();
+        let secrets = fixtures::tempdir();
         std::fs::write(secrets.path().join("token"), "t").unwrap();
         let path = std::fs::canonicalize(secrets.path()).unwrap().join("token");
         let sandbox = start(
@@ -206,7 +206,7 @@ mod enforced {
         const SECRET: &'static str = "heel-test-secret";
 
         fn create() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixtures::tempdir();
             let fake_home = dir.path().join("home");
             std::fs::create_dir(&fake_home).unwrap();
             let keychain = dir.path().join("test.keychain-db");
@@ -599,7 +599,7 @@ mod enforced {
 #[cfg(windows)]
 #[tokio::test]
 async fn a_denylist_on_a_platform_that_cannot_enforce_it_fails_at_construction() {
-    let home = tempfile::tempdir().unwrap();
+    let home = fixtures::tempdir();
     for builder in [
         SandboxConfigBuilder::default()
             .read_denylist(ReadDenylist::credentials().home(home.path())),

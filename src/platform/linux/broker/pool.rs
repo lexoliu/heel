@@ -15,12 +15,13 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use landlock::{AccessFs, BitFlags};
-use rustix::fs::{CWD, Mode, OFlags};
+use rustix::fs::{CWD, Mode, OFlags, ResolveFlags};
+use rustix::io::Errno;
 
 use crate::config::InodePool;
 use crate::error::{Error, Result};
@@ -226,43 +227,78 @@ impl Drop for Pool {
     }
 }
 
+/// A pool directory, created and held without following any link.
+struct Location {
+    path: PathBuf,
+    held: OwnedFd,
+}
+
+/// Open a directory as a path descriptor, refusing a link in any component.
+///
+/// The directories a pool lives in can be inside a tree the sandbox may write,
+/// so a component swapped for a link between two steps must not move the pool.
+/// Everything the pool does afterwards is relative to descriptors opened here.
+fn open_directory(path: &Path) -> rustix::io::Result<OwnedFd> {
+    rustix::fs::openat2(
+        CWD,
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    )
+}
+
 /// Where the pool for filesystem `device` lives: the cache directory if that is
 /// on it, otherwise a hidden directory in the shallowest member that can be
 /// written to.
-fn locate(cache: Option<&Path>, device: u64, members: &[&Ancestor]) -> Option<PathBuf> {
-    if let Some(cache) = cache {
-        let on_device = std::fs::create_dir_all(cache)
-            .ok()
-            .and_then(|()| std::fs::metadata(cache).ok())
-            .is_some_and(|metadata| metadata.dev() == device);
-        if on_device && let Some(pool) = create_unique(cache, "pool-") {
-            return Some(pool);
-        }
+fn locate(cache: Option<&Path>, device: u64, members: &[&Ancestor]) -> Option<Location> {
+    if let Some(cache) = cache
+        && std::fs::create_dir_all(cache).is_ok()
+        && let Ok(root) = open_directory(cache)
+        && rustix::fs::fstat(&root).is_ok_and(|stat| stat.st_dev == device)
+        && let Some(pool) = create_unique(root, cache, "pool-")
+    {
+        return Some(pool);
     }
     let mut shallowest: Vec<&Ancestor> = members.to_vec();
     shallowest.sort_by_key(|ancestor| ancestor.path.components().count());
     for ancestor in shallowest {
         remove_stale(&ancestor.path, ".heel-pool-");
-        if let Some(pool) = create_unique(&ancestor.path, ".heel-pool-") {
+        if let Ok(root) = open_directory(&ancestor.path)
+            && let Some(pool) = create_unique(root, &ancestor.path, ".heel-pool-")
+        {
             return Some(pool);
         }
     }
     None
 }
 
-/// Create `<prefix><pid>-<n>` in `directory` for the first `n` nobody holds.
+/// Create `<prefix><pid>-<n>` in the directory `root` holds, for the first `n`
+/// nobody holds. `path` is where `root` was opened, for naming the result.
 ///
 /// Creation is exclusive, so every pool of every sandbox in every process is a
 /// directory of its own, and one that exists is never taken over: its owner is
 /// alive, or its pid was reused and `remove_stale` clears it once that process
 /// is gone.
-fn create_unique(directory: &Path, prefix: &str) -> Option<PathBuf> {
+fn create_unique(root: OwnedFd, path: &Path, prefix: &str) -> Option<Location> {
     let pid = std::process::id();
     for number in 0u32.. {
-        let pool = directory.join(format!("{prefix}{pid}-{number}"));
-        match std::fs::DirBuilder::new().mode(0o700).create(&pool) {
-            Ok(()) => return Some(pool),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        let name = format!("{prefix}{pid}-{number}");
+        match rustix::fs::mkdirat(&root, &name, Mode::RWXU) {
+            Ok(()) => {
+                let held = rustix::fs::openat(
+                    &root,
+                    &name,
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .ok()?;
+                return Some(Location {
+                    path: path.join(name),
+                    held,
+                });
+            }
+            Err(Errno::EXIST) => {}
             Err(_) => return None,
         }
     }
@@ -270,39 +306,36 @@ fn create_unique(directory: &Path, prefix: &str) -> Option<PathBuf> {
 }
 
 fn populate(
-    directory: PathBuf,
+    location: Location,
     capacity: InodePool,
     rights: BitFlags<AccessFs>,
     grant: &mut Grant<'_>,
     members: &[&Ancestor],
 ) -> Result<Group> {
-    let held = rustix::fs::openat(
-        CWD,
-        &directory,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|errno| Error::path(&directory, errno.into()))?;
+    let Location {
+        path: directory,
+        held,
+    } = location;
+    let entry_error = |name: &str, errno: Errno| Error::path(directory.join(name), errno.into());
+
     let mut files = Vec::with_capacity(capacity.files());
     for number in 0..capacity.files() {
         let name = format!("f{number}");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(directory.join(&name))
-            .map_err(|error| Error::path(directory.join(&name), error))?;
-        grant(open_entry(&directory, &name)?.as_fd(), rights)?;
+        rustix::fs::openat(
+            &held,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|errno| entry_error(&name, errno))?;
+        grant(open_entry(&held, &name, &directory)?.as_fd(), rights)?;
         files.push(name);
     }
     let mut directories = Vec::with_capacity(capacity.directories());
     for number in 0..capacity.directories() {
         let name = format!("d{number}");
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(directory.join(&name))
-            .map_err(|error| Error::path(directory.join(&name), error))?;
-        grant(open_entry(&directory, &name)?.as_fd(), rights)?;
+        rustix::fs::mkdirat(&held, &name, Mode::RWXU).map_err(|errno| entry_error(&name, errno))?;
+        grant(open_entry(&held, &name, &directory)?.as_fd(), rights)?;
         directories.push(name);
     }
     Ok(Group {
@@ -317,14 +350,14 @@ fn populate(
     })
 }
 
-/// Open `name` in `directory` as a path descriptor that follows no link.
-fn open_entry(directory: &Path, name: &str) -> Result<OwnedFd> {
-    let path = directory.join(name);
+/// Open `name` in the pool directory `held` as a path descriptor that follows
+/// no link. `directory` names the pool for the error.
+fn open_entry(held: &OwnedFd, name: &str, directory: &Path) -> Result<OwnedFd> {
     rustix::fs::openat(
-        CWD,
-        &path,
+        held,
+        name,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|errno| Error::path(&path, errno.into()))
+    .map_err(|errno| Error::path(directory.join(name), errno.into()))
 }

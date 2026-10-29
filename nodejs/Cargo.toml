@@ -32,3 +32,5 @@ executor-core = { version = "0.7", features = ["tokio"] }
 [build-dependencies]
 napi-build = "2"
 
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }

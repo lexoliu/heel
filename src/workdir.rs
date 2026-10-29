@@ -57,45 +57,62 @@ pub struct WorkingDir {
 }
 
 impl WorkingDir {
-    /// Create the working directory and canonicalize its path.
+    /// Create the working directory.
     ///
-    /// Canonicalization is required, not cosmetic: macOS sandbox profiles match
-    /// against resolved paths, so a rule naming `/tmp/x` never matches the
-    /// kernel's `/private/tmp/x`.
+    /// `auto` marks a generated directory, which is removed on drop and is
+    /// created exclusively: its parent is the host's own (a temporary root),
+    /// resolved here once, and the directory itself must not exist yet.
     ///
-    /// `auto` marks a generated directory, which is removed on drop and must
-    /// not already exist. A caller-supplied directory is created if missing and
-    /// always preserved.
+    /// A caller-supplied directory is a grant of the sandbox's own: it is
+    /// absolute and already resolved, created if missing and always preserved,
+    /// and it is never resolved again. A sandboxed process may replace it with
+    /// a link between two sandboxes, and following the link would make the
+    /// link's target the writable working directory, so a link anywhere in the
+    /// path fails with [`Error::GrantRedirected`].
     pub(crate) fn create(path: &Path, auto: bool) -> Result<Self> {
-        if auto {
-            std::fs::create_dir_all(path).map_err(|error| Error::WorkingDir {
-                path: path.to_path_buf(),
-                source: error,
-            })?;
+        let working_dir_error = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| Error::WorkingDir { path, source }
+        };
+
+        let path = if auto {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Err(working_dir_error(path)(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a generated working directory needs a parent and a name",
+                )));
+            };
+            std::fs::create_dir_all(parent).map_err(working_dir_error(parent))?;
+            // `dunce` avoids the `\\?\` verbatim prefix that `std` returns on
+            // Windows, which many Win32 APIs and child processes do not accept.
+            let path = dunce::canonicalize(parent)
+                .map_err(working_dir_error(parent))?
+                .join(name);
+            std::fs::create_dir(&path).map_err(working_dir_error(&path))?;
             // A directory the sandbox created for itself holds the sandboxed
             // process's files and, for IPC, its socket. Neither is anyone
             // else's business, and a shared temp root is world-readable by
             // default.
-            restrict_to_owner(path)?;
-        } else if !path.exists() {
-            std::fs::create_dir_all(path).map_err(|error| Error::WorkingDir {
-                path: path.to_path_buf(),
-                source: error,
-            })?;
-            tracing::debug!(path = %path.display(), "created working directory");
-        }
+            restrict_to_owner(&path)?;
+            path
+        } else {
+            crate::platform::unresolved::require_normal(path)?;
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(path).map_err(working_dir_error(path))?;
+                    tracing::debug!(path = %path.display(), "created working directory");
+                }
+                Err(error) => return Err(working_dir_error(path)(error)),
+            }
+            crate::platform::unresolved::verify(path)?;
+            path.to_path_buf()
+        };
 
-        // `dunce` avoids the `\\?\` verbatim prefix that `std` returns on
-        // Windows, which many Win32 APIs and child processes do not accept.
-        let canonical = dunce::canonicalize(path).map_err(|error| Error::WorkingDir {
-            path: path.to_path_buf(),
-            source: error,
-        })?;
-
-        tracing::debug!(path = %canonical.display(), auto, "working directory ready");
+        tracing::debug!(path = %path.display(), auto, "working directory ready");
 
         Ok(Self {
-            path: canonical,
+            path,
             remove_on_drop: auto,
         })
     }
@@ -109,13 +126,13 @@ impl WorkingDir {
     ///
     /// # Errors
     ///
-    /// Returns an error if the directory cannot be created, restricted to its
-    /// owner, or canonicalized.
+    /// Returns an error if the directory cannot be created or restricted to its
+    /// owner, or if `parent` cannot be resolved.
     pub fn random_in(parent: impl AsRef<Path>) -> Result<Self> {
         Self::create(&parent.as_ref().join(generate_working_dir_name()), true)
     }
 
-    /// The canonical path of the working directory.
+    /// The resolved path of the working directory.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -172,6 +189,10 @@ impl Drop for WorkingDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved_temp_dir() -> PathBuf {
+        dunce::canonicalize(std::env::temp_dir()).expect("the temp dir resolves")
+    }
 
     #[test]
     fn generated_names_use_four_words_and_a_suffix() {
@@ -231,7 +252,7 @@ mod tests {
 
     #[test]
     fn supplied_directories_are_preserved() {
-        let path = std::env::temp_dir().join(generate_working_dir_name());
+        let path = resolved_temp_dir().join(generate_working_dir_name());
         std::fs::create_dir_all(&path).expect("creates");
         let dir = WorkingDir::create(&path, false).expect("opens");
         let canonical = dir.path().to_path_buf();
@@ -255,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn paths_are_canonicalized() {
+    fn generated_paths_are_resolved() {
         // The system temp dir is a symlink on macOS; a profile built from the
         // unresolved path would silently match nothing.
         let path = std::env::temp_dir().join(generate_working_dir_name());
@@ -267,5 +288,68 @@ mod tests {
             dir.path(),
             dunce::canonicalize(dir.path()).expect("already canonical")
         );
+    }
+
+    #[test]
+    fn a_supplied_directory_is_created_when_missing() {
+        let path = resolved_temp_dir()
+            .join(generate_working_dir_name())
+            .join("nested");
+        let dir = WorkingDir::create(&path, false).expect("creates");
+        assert_eq!(dir.path(), path);
+        assert!(path.is_dir());
+        std::fs::remove_dir_all(path.parent().expect("has a parent")).ok();
+    }
+
+    #[test]
+    fn a_generated_directory_must_not_exist() {
+        let path = std::env::temp_dir().join(generate_working_dir_name());
+        let first = WorkingDir::create(&path, true).expect("creates");
+        assert!(matches!(
+            WorkingDir::create(&path, true),
+            Err(Error::WorkingDir { .. })
+        ));
+        drop(first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_supplied_directory_replaced_by_a_link_is_refused_not_followed() {
+        let root = crate::platform::unresolved::resolved_tempdir();
+        let root = root.path().to_path_buf();
+        let target = root.join("target");
+        let wanted = root.join("work");
+        std::fs::create_dir_all(&target).expect("creates");
+        std::fs::create_dir_all(&wanted).expect("creates");
+        WorkingDir::create(&wanted, false).expect("an unchanged directory opens");
+
+        std::fs::remove_dir(&wanted).expect("removes");
+        std::os::unix::fs::symlink(&target, &wanted).expect("links");
+
+        let error = WorkingDir::create(&wanted, false).expect_err("must not follow the link");
+        assert!(
+            matches!(&error, Error::GrantRedirected { path } if *path == wanted),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_is_refused_rather_than_created_through() {
+        let root = crate::platform::unresolved::resolved_tempdir();
+        let root = root.path().to_path_buf();
+        let wanted = root.join("work");
+        std::os::unix::fs::symlink(root.join("absent"), &wanted).expect("links");
+
+        let error = WorkingDir::create(&wanted, false).expect_err("a link");
+        assert!(matches!(error, Error::GrantRedirected { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn a_relative_supplied_directory_is_refused() {
+        assert!(matches!(
+            WorkingDir::create(Path::new("relative-work"), false),
+            Err(Error::Path { .. })
+        ));
     }
 }

@@ -1,6 +1,6 @@
 //! SBPL profile generation using compile-time templates.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use askama::Template;
 
@@ -8,6 +8,7 @@ use crate::config::SandboxConfigData;
 use crate::denial::denial_tag;
 use crate::error::{Error, Result};
 use crate::grant::Grant;
+use crate::platform::unresolved;
 use crate::policy::{Pattern, Resolved};
 
 /// A Python virtual environment as the template sees it.
@@ -21,7 +22,7 @@ struct VenvRules {
 /// The two filters are not interchangeable: `literal` matches exactly one path,
 /// so naming a directory with it grants nothing at all, while `subpath` covers
 /// the whole tree beneath it. Which one a rule needs follows from what the
-/// canonicalized path is, and is decided once, when the profile is generated.
+/// granted path is, and is decided once, when the profile is generated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathFilter {
     /// One path, matched exactly: a grant naming a single file.
@@ -31,9 +32,10 @@ enum PathFilter {
 }
 
 impl PathFilter {
-    /// The filter that grants `path`, which must already be canonical.
+    /// The filter that grants `path`, which must already be resolved.
     fn for_path(path: &Path) -> Result<Self> {
-        let metadata = std::fs::metadata(path).map_err(|source| Error::path(path, source))?;
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|source| Error::path(path, source))?;
         Ok(if metadata.is_dir() {
             Self::Subpath
         } else {
@@ -192,18 +194,14 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
             .map(sbpl_path)
             .transpose()?,
         // The socket file itself may not exist yet when a profile is generated
-        // before the server binds, so it is escaped rather than canonicalized;
-        // its directory is canonical already.
+        // before the server binds, so only its directory is verified.
         ipc_socket: config
             .ipc_socket()
             .map(|socket| -> Result<String> {
                 let dir = socket.parent().unwrap_or(Path::new("/"));
                 let name = socket.file_name().unwrap_or_default();
-                escape_path(
-                    &std::fs::canonicalize(dir)
-                        .map_err(|e| Error::path(dir, e))?
-                        .join(name),
-                )
+                unresolved::verify(dir)?;
+                escape_path(&dir.join(name))
             })
             .transpose()?,
         python_venv: config
@@ -293,20 +291,10 @@ fn traversal_paths(profile: &SandboxProfile) -> Vec<String> {
     ancestors
 }
 
-/// Canonicalize a path and escape it for an SBPL string literal.
+/// Verify a granted path and escape it for an SBPL string literal.
 fn sbpl_path(path: &Path) -> Result<String> {
-    escape_path(&canonical_path(path)?)
-}
-
-/// Resolve a configured path to the form the kernel matches rules against.
-///
-/// Canonicalization is a correctness requirement rather than tidiness: the
-/// macOS sandbox matches rules against fully resolved paths, so a rule naming
-/// `/tmp/data` never matches the kernel's `/private/tmp/data` and would
-/// silently grant nothing. A path that cannot be resolved is an error, because
-/// emitting a rule that matches nothing is exactly the failure this avoids.
-fn canonical_path(path: &Path) -> Result<PathBuf> {
-    std::fs::canonicalize(path).map_err(|source| Error::path(path, source))
+    unresolved::verify(path)?;
+    escape_path(path)
 }
 
 /// Build the rules for the configured grants, choosing a filter per path.
@@ -318,10 +306,13 @@ fn grant_rules(grants: &[Grant]) -> Result<Vec<GrantRules>> {
     grants
         .iter()
         .map(|grant| {
-            let canonical = canonical_path(grant.path())?;
+            // The kernel matches rules against resolved paths, so the path is
+            // emitted as the caller resolved it. A component that has become
+            // a link since is refused rather than followed.
+            unresolved::verify(grant.path())?;
             Ok(GrantRules {
-                filter: PathFilter::for_path(&canonical)?,
-                path: escape_path(&canonical)?,
+                filter: PathFilter::for_path(grant.path())?,
+                path: escape_path(grant.path())?,
                 writable: grant.access().can_write(),
                 executable: grant.access().can_execute(),
             })
@@ -374,6 +365,7 @@ mod tests {
     use crate::grant::Access;
     use crate::network::AllowAll;
     use crate::workdir::WorkingDir;
+    use std::path::PathBuf;
     use std::process::Command;
 
     /// A configuration whose working directory exists, as it would at runtime.
@@ -385,6 +377,11 @@ mod tests {
             .expect("working directory is created");
         data.set_working_dir(dir.path().to_path_buf());
         (data, dir)
+    }
+
+    /// A temporary directory's path as a caller must pass it: resolved.
+    fn resolved(dir: &tempfile::TempDir) -> PathBuf {
+        std::fs::canonicalize(dir.path()).expect("the temporary directory resolves")
     }
 
     #[test]
@@ -411,11 +408,14 @@ mod tests {
     #[test]
     fn writable_locations_cannot_be_executed() {
         let scratch = tempfile::tempdir().expect("tempdir");
-        let (data, dir) =
-            prepared_config(SandboxConfig::builder().writable(scratch.path()).build());
+        let (data, dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(resolved(&scratch))
+                .build(),
+        );
         let profile = generate_profile(&data, None).unwrap();
 
-        let scratch_canonical = std::fs::canonicalize(scratch.path()).expect("canonical");
+        let scratch_canonical = resolved(&scratch);
         assert!(profile.contains(&format!(
             "(deny process-exec (subpath \"{}\"))",
             scratch_canonical.display()
@@ -430,11 +430,14 @@ mod tests {
     #[test]
     fn an_executable_directory_is_granted_as_a_subpath() {
         let tools = tempfile::tempdir().expect("tempdir");
-        let (data, _dir) =
-            prepared_config(SandboxConfig::builder().executable(tools.path()).build());
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .executable(resolved(&tools))
+                .build(),
+        );
         let profile = generate_profile(&data, None).unwrap();
 
-        let canonical = std::fs::canonicalize(tools.path()).expect("canonical");
+        let canonical = resolved(&tools);
         assert!(
             profile.contains(&format!(
                 "(allow process-exec (subpath \"{}\"))",
@@ -451,7 +454,7 @@ mod tests {
     #[test]
     fn an_executable_file_is_granted_as_a_literal() {
         let tools = tempfile::tempdir().expect("tempdir");
-        let binary = tools.path().join("tool");
+        let binary = resolved(&tools).join("tool");
         std::fs::write(&binary, b"#!/bin/sh\n").expect("writes");
 
         let (data, _dir) = prepared_config(SandboxConfig::builder().executable(&binary).build());
@@ -479,11 +482,11 @@ mod tests {
         let cache = tempfile::tempdir().expect("tempdir");
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .grant(cache.path(), Access::WRITE | Access::EXEC)
+                .grant(resolved(&cache), Access::WRITE | Access::EXEC)
                 .build(),
         );
         let profile = generate_profile(&data, None).unwrap();
-        let canonical = std::fs::canonicalize(cache.path()).expect("canonical");
+        let canonical = resolved(&cache);
 
         for rule in [
             "allow file-read*",
@@ -514,7 +517,7 @@ mod tests {
         // resolves an operation with the last matching rule. A grant under the
         // shared temp directory, which pass 2 denies wholesale, is the case
         // where that ordering is the only thing doing the work.
-        let tools = Path::new("/tmp").join(crate::workdir::generate_working_dir_name());
+        let tools = Path::new("/private/tmp").join(crate::workdir::generate_working_dir_name());
         std::fs::create_dir_all(&tools).expect("creates");
 
         let (data, _dir) = prepared_config(SandboxConfig::builder().executable(&tools).build());
@@ -541,7 +544,8 @@ mod tests {
     #[test]
     fn a_writable_grant_alone_is_still_denied_exec() {
         let cache = tempfile::tempdir().expect("tempdir");
-        let (data, _dir) = prepared_config(SandboxConfig::builder().writable(cache.path()).build());
+        let (data, _dir) =
+            prepared_config(SandboxConfig::builder().writable(resolved(&cache)).build());
         let profile = generate_profile(&data, None).unwrap();
         let canonical = std::fs::canonicalize(cache.path()).expect("canonical");
 
@@ -556,20 +560,67 @@ mod tests {
     }
 
     #[test]
-    fn paths_are_canonicalized_into_the_profile() {
-        // /tmp is a symlink to /private/tmp on macOS; the profile must name the
-        // resolved path or the rule matches nothing.
-        let scratch = Path::new("/tmp").join(crate::workdir::generate_working_dir_name());
+    fn a_grant_is_emitted_as_the_caller_resolved_it() {
+        let scratch = Path::new("/private/tmp").join(crate::workdir::generate_working_dir_name());
         std::fs::create_dir_all(&scratch).expect("creates");
 
         let (data, _dir) = prepared_config(SandboxConfig::builder().readable(&scratch).build());
         let profile = generate_profile(&data, None).unwrap();
 
         assert!(
-            profile.contains("(allow file-read* (subpath \"/private/tmp/"),
-            "expected a resolved path in:\n{profile}"
+            profile.contains(&format!(
+                "(allow file-read* (subpath \"{}\"))",
+                scratch.display()
+            )),
+            "expected the granted path verbatim in:\n{profile}"
         );
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn an_unresolved_grant_is_refused_and_nothing_is_emitted() {
+        // /tmp is a symlink to /private/tmp on macOS. Resolving it here would
+        // let a swapped link redirect a grant, so the caller resolves it.
+        let (data, _dir) = prepared_config(SandboxConfig::builder().readable("/tmp").build());
+
+        let error = generate_profile(&data, None).unwrap_err();
+        assert!(
+            matches!(&error, Error::GrantRedirected { path } if path == Path::new("/tmp")),
+            "expected the redirected grant to be named, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_grant_replaced_by_a_link_fails_the_next_build() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = resolved(&root);
+        let granted = root.join("granted");
+        let nested = granted.join("nested");
+        let target = root.join("target");
+        std::fs::create_dir_all(&nested).expect("creates");
+        std::fs::create_dir_all(&target).expect("creates");
+
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(&granted)
+                .writable(&nested)
+                .build(),
+        );
+        generate_profile(&data, None).expect("an unchanged grant still builds");
+
+        // The inner grant, then its parent, which is a grant too and is
+        // checked first: each refusal names the first grant that reaches a link.
+        for replaced in [&nested, &granted] {
+            std::fs::remove_dir_all(replaced).expect("removes");
+            std::os::unix::fs::symlink(&target, replaced).expect("links");
+
+            let error = generate_profile(&data, None).unwrap_err();
+            assert!(
+                matches!(&error, Error::GrantRedirected { path } if path == replaced),
+                "expected {} to be named, got {error:?}",
+                replaced.display()
+            );
+        }
     }
 
     #[test]
@@ -590,23 +641,20 @@ mod tests {
     #[test]
     fn persistent_identity_grants_are_adopted_into_the_profile() {
         let directory = tempfile::tempdir().expect("tempdir");
+        let directory_path = resolved(&directory);
         let (mut data, _dir) = prepared_config(
             SandboxConfig::builder()
                 .identity(
                     crate::identity::Identity::named("macos-test")
                         .expect("the identity name is valid")
-                        .persistent_grant(crate::grant::Grant::new(directory.path(), Access::READ)),
+                        .persistent_grant(crate::grant::Grant::new(&directory_path, Access::READ)),
                 )
                 .build(),
         );
         data.adopt_persistent_grants();
 
         let profile = generate_profile(&data, None).expect("the profile is generated");
-        let canonical = directory
-            .path()
-            .canonicalize()
-            .expect("the grant path canonicalizes");
-        let path = escape_path(&canonical).expect("the grant path escapes");
+        let path = escape_path(&directory_path).expect("the grant path escapes");
         assert!(
             profile.contains(&format!("(allow file-read* (subpath \"{path}\"))")),
             "the persistent grant is present in the profile:\n{profile}"
@@ -641,7 +689,7 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
-                .writable(dir.path())
+                .writable(resolved(&dir))
                 .read_denylist(crate::ReadDenylist::credentials().home(home.path()))
                 .write_denylist(crate::WriteDenylist::persistence().home(home.path()))
                 .build(),

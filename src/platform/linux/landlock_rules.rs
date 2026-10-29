@@ -6,7 +6,7 @@
 //! granted back one path or port at a time.
 
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 // The `Access` trait supplies `AccessFs::from_all` and friends and is only
@@ -615,20 +615,42 @@ fn add_required_path(
     access: BitFlags<AccessFs>,
     abi: ABI,
 ) -> Result<()> {
-    let fd = PathFd::new(path).map_err(|error| {
-        Error::path(
-            path,
-            std::io::Error::other(format!("cannot open configured path: {error}")),
-        )
-    })?;
+    let fd = open_unresolved(path)?;
     add_rule(ruleset, path, fd, access, abi)
+}
+
+/// Open a configured path for a rule without following any symbolic link.
+///
+/// A grant names a path the caller has already resolved. `openat2` with
+/// `RESOLVE_NO_SYMLINKS` refuses a link in any component, the last included,
+/// and does it inside the one call that opens the inode the rule then holds, so
+/// there is no window between checking the path and using it. The kernel does
+/// not say which component was the link, only that one was.
+fn open_unresolved(path: &Path) -> Result<OwnedFd> {
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+    use rustix::io::Errno;
+
+    crate::platform::unresolved::require_normal(path)?;
+    openat2(
+        CWD,
+        path,
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|errno| match errno {
+        Errno::LOOP => Error::GrantRedirected {
+            path: path.to_path_buf(),
+        },
+        errno => Error::path(path, errno.into()),
+    })
 }
 
 /// Add one rule, narrowing directory-only rights on non-directories.
 fn add_rule(
     ruleset: &mut RulesetCreated,
     path: &Path,
-    fd: PathFd,
+    fd: impl AsFd,
     access: BitFlags<AccessFs>,
     abi: ABI,
 ) -> Result<()> {
@@ -789,6 +811,35 @@ mod tests {
             matches!(error, Error::Path { .. }),
             "a configured path that cannot be granted must be an error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn a_configured_path_replaced_by_a_link_is_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(root.path()).expect("resolves");
+        let parent = root.join("parent");
+        let granted = parent.join("granted");
+        fs::create_dir_all(&granted).expect("creates");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("granted")).expect("creates");
+
+        let (data, _dir) = prepared(SandboxConfig::builder().writable(&granted).build());
+        build_ruleset(&data, None).expect("an unchanged grant builds");
+
+        // The grant itself, then a parent of it.
+        for (replaced, destination) in [
+            (&granted, elsewhere.join("granted")),
+            (&parent, elsewhere.clone()),
+        ] {
+            fs::remove_dir_all(replaced).expect("removes");
+            std::os::unix::fs::symlink(&destination, replaced).expect("links");
+
+            let error = build_ruleset(&data, None).expect_err("must fail");
+            assert!(
+                matches!(&error, Error::GrantRedirected { path } if *path == granted),
+                "expected the redirected grant to be named, got {error:?}"
+            );
+        }
     }
 
     #[test]

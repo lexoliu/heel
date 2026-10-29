@@ -83,6 +83,18 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// A granted path reaches a symbolic link, or a Windows junction.
+    ///
+    /// A grant names a path the caller has already resolved, and the sandbox
+    /// never follows a link to honour it: a component that has become a link
+    /// since the caller resolved the path would redirect the grant to the
+    /// link's target, so the build is refused and nothing is granted.
+    #[error("granted path {path} passes through a symbolic link")]
+    GrantRedirected {
+        /// The granted path, as the caller configured it.
+        path: PathBuf,
+    },
+
     /// The working directory could not be prepared or removed.
     #[error("cannot prepare working directory {path}: {source}")]
     WorkingDir {

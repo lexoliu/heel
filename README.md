@@ -135,6 +135,18 @@ let config = SandboxConfig::builder()
     .build();
 ```
 
+A granted path, like a supplied working directory, is absolute, already
+resolved and spelled without `.` or `..` components. The sandbox never follows
+a symbolic link to honour one: building a sandbox checks every component of
+each path without following links and fails with `Error::GrantRedirected` if
+one has become a link, so a process that can replace a granted directory with a
+link cannot move the grant to the link's target. Paths a user wrote are
+resolved once, where they enter, with `heel::resolve_paths`: it follows the
+links the user's own spelling crosses (`/tmp`, a symlinked home) but refuses a
+link at or below a path the configuration makes writable, which a sandbox of an
+earlier run may have planted. The `heel` CLI and the Node bindings do this for
+you.
+
 The working directory is not a grant: it is always writable, never executable,
 and no configuration changes that.
 

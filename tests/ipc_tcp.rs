@@ -40,7 +40,7 @@ async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
         .with_env_filter("heel=debug")
         .try_init();
     let fixture = blocking::unblock(|| {
-        let dir = tempfile::tempdir().expect("fixture directory");
+        let dir = fixtures::tempdir();
         let binary = fixtures::compile(
             dir.path(),
             include_str!("fixtures/tcp_probe.rs"),
