@@ -362,7 +362,7 @@ fn open_no_reparse(path: &Path, access: u32) -> io::Result<OwnedHandle> {
         )
     }
     .map_err(|source| {
-        let source = io::Error::from(source);
+        let source = os_error(&source);
         io::Error::new(
             source.kind(),
             format!("cannot open {}: {source}", path.display()),
@@ -370,6 +370,25 @@ fn open_no_reparse(path: &Path, access: u32) -> io::Result<OwnedHandle> {
     })?;
     // SAFETY: the handle came from the call above and is closed exactly once.
     Ok(unsafe { OwnedHandle::from_raw_handle(handle.0.cast()) })
+}
+
+/// The `io::Error` for a Win32 failure the `windows` crate reports as an
+/// `HRESULT`.
+///
+/// `io::Error::from` keeps the `HRESULT` (`0x80070005`) as the raw OS error,
+/// which `std` does not recognise as `ERROR_ACCESS_DENIED`, so its `kind()` is
+/// not `PermissionDenied`. A Win32 error code is carried in an `HRESULT` as
+/// `HRESULT_FROM_WIN32`: facility 7 and the code in the low 16 bits (Microsoft,
+/// "HRESULT" in the Win32 error-code documentation, learn.microsoft.com/
+/// openspecs/windows_protocols/ms-erref/0642cb2f-2075-4469-918c-4441e69c548a).
+fn os_error(source: &windows::core::Error) -> io::Error {
+    const FACILITY_WIN32: u32 = 7;
+    let code = source.code().0.cast_unsigned();
+    if code >> 16 == 0x8000 | FACILITY_WIN32 {
+        io::Error::from_raw_os_error((code & 0xFFFF).cast_signed())
+    } else {
+        io::Error::from_raw_os_error(source.code().0)
+    }
 }
 
 /// The final path of the object `handle` refers to, as the system spells it.
@@ -505,7 +524,14 @@ fn open_unredirected(path: &Path, access: u32) -> io::Result<Opened> {
 ///
 /// A directory the caller cannot rewrite (a system directory whose list is not
 /// ours to change) opens for reading its list only; granting through that handle
-/// fails, which is the failure a grant there has always been.
+/// fails, which is the failure a grant there has always been. `CreateFileW`
+/// checks each requested right against the DACL, so asking for `WRITE_DAC` on a
+/// directory whose list grants the caller `READ_CONTROL` but not `WRITE_DAC`
+/// (`C:\Windows\System32`, owned by TrustedInstaller) fails with
+/// `ERROR_ACCESS_DENIED`; `READ_CONTROL` is what `GetSecurityInfo` needs and
+/// `WRITE_DAC` is what `SetSecurityInfo` needs (Microsoft, "File Security and
+/// Access Rights", learn.microsoft.com/windows/win32/fileio/file-security-and-access-rights;
+/// "GetSecurityInfo" and "SetSecurityInfo" remarks).
 pub(crate) fn open(path: &Path) -> io::Result<Opened> {
     match open_unredirected(path, READ_CONTROL.0 | WRITE_DAC.0) {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {

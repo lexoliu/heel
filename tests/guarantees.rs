@@ -78,6 +78,10 @@ trait Probes {
     fn swap_for_link(dir: &Path, target: &Path) -> String;
 }
 
+/// The exit code of a swap command that could not leave the directory it
+/// removes (Windows only: the unix command leaves for `/`).
+const LEAVE_FAILED: u32 = 20;
+
 /// The exit code of a swap command whose removal of the directory failed.
 const REMOVE_FAILED: u32 = 21;
 
@@ -165,10 +169,18 @@ impl Probes for Platform {
     // Each step reports itself, because the cause of "Access is denied" on a
     // sandboxed `mklink` is not established: it may be the removal or the
     // mount point. The step's own message and exit code are in the failure.
+    // The shell leaves the directory for its parent, which the test grants
+    // and so is a directory the sandbox can enter, rather than for
+    // `%SystemRoot%`, which a package is not promised to enter: the first
+    // run with `cd /d %SystemRoot%` failed with exit code 1, a code none of
+    // the mapped steps can produce, so it was that `cd`.
     fn swap_for_link(dir: &Path, target: &Path) -> String {
+        let parent = dir.parent().expect("the swapped directory has a parent");
         format!(
-            "cd /d %SystemRoot% && (rmdir /S /Q {dir} || (echo rmdir failed & exit /b {REMOVE_FAILED})) \
+            "(cd /d {parent} || (echo cd failed & exit /b {LEAVE_FAILED})) \
+             && (rmdir /S /Q {dir} || (echo rmdir failed & exit /b {REMOVE_FAILED})) \
              && (mklink /J {dir} {target} || (echo mklink failed & exit /b {LINK_FAILED}))",
+            parent = parent.display(),
             dir = dir.display(),
             target = target.display()
         )
@@ -427,7 +439,8 @@ impl Swap {
         assert!(
             swapped.status.success(),
             "the sandboxed process must be able to plant the link (exit code {:?}: \
-             {REMOVE_FAILED} is the removal, {LINK_FAILED} the link): {}{}",
+             {LEAVE_FAILED} is leaving the directory, {REMOVE_FAILED} the removal, \
+             {LINK_FAILED} the link): {}{}",
             swapped.status.code(),
             stdout(&swapped),
             stderr(&swapped)
