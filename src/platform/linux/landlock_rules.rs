@@ -6,7 +6,7 @@
 //! granted back one path or port at a time.
 
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 // The `Access` trait supplies `AccessFs::from_all` and friends and is only
@@ -262,9 +262,11 @@ pub(crate) fn protected_patterns(config: &SandboxConfigData) -> Vec<Pattern> {
 /// Every existing path beneath a granted rule that one of `patterns` matches.
 ///
 /// A matched path is not searched further, and a symbolic link is not followed.
-/// A directory that cannot be listed is skipped: it cannot be listed from the
-/// sandbox either. Paths the sandbox creates later are the broker's to judge.
-pub(crate) fn find_protected(rules: &[Planned], patterns: &[Pattern]) -> Vec<PathBuf> {
+/// A grant path arrives resolved and verified, and one that cannot be inspected
+/// is an error. A directory below it that cannot be listed is skipped: it cannot
+/// be listed from the sandbox either. Paths the sandbox creates later are the
+/// broker's to judge.
+pub(crate) fn find_protected(rules: &[Planned], patterns: &[Pattern]) -> Result<Vec<PathBuf>> {
     fn walk(path: &Path, patterns: &[Pattern], found: &mut Vec<PathBuf>) {
         let Ok(metadata) = std::fs::symlink_metadata(path) else {
             return;
@@ -284,14 +286,13 @@ pub(crate) fn find_protected(rules: &[Planned], patterns: &[Pattern]) -> Vec<Pat
 
     let mut found = Vec::new();
     if patterns.is_empty() {
-        return found;
+        return Ok(found);
     }
     for rule in rules.iter().filter(|rule| rule.grant) {
-        if let Ok(root) = std::fs::canonicalize(&rule.path) {
-            walk(&root, patterns, &mut found);
-        }
+        std::fs::symlink_metadata(&rule.path).map_err(|error| Error::path(&rule.path, error))?;
+        walk(&rule.path, patterns, &mut found);
     }
-    found
+    Ok(found)
 }
 
 /// Remove the right to read, list and execute below each of `denied`.
@@ -321,9 +322,9 @@ pub(crate) fn carve(rules: Vec<Planned>, denied: &[PathBuf], abi: ABI) -> Result
         ancestors: Vec::new(),
     };
     for rule in rules {
-        // Denied paths are real paths, so the rule is compared by its real path:
-        // a grant given through a symbolic link names the same place.
-        let location = std::fs::canonicalize(&rule.path).unwrap_or_else(|_| rule.path.clone());
+        // Denied paths are real paths and rule paths arrive resolved, so they
+        // compare as they are.
+        let location = rule.path.clone();
         let inside = denied.iter().any(|path| location.starts_with(path));
         if inside && !rule.grant {
             let access = rule.access & !withheld;
@@ -687,20 +688,43 @@ fn add_required_path(
     access: BitFlags<AccessFs>,
     abi: ABI,
 ) -> Result<()> {
-    let fd = PathFd::new(path).map_err(|error| {
-        Error::path(
-            path,
-            std::io::Error::other(format!("cannot open configured path: {error}")),
-        )
-    })?;
+    let fd = open_unresolved(path)?;
     add_rule(ruleset, path, fd, access, abi)
+}
+
+/// Open a configured path for a rule without following any symbolic link.
+///
+/// A grant names a path the caller has already resolved. `openat2` with
+/// `RESOLVE_NO_SYMLINKS` refuses a link in any component, the last included,
+/// and does it inside the one call that opens the inode the rule then holds, so
+/// there is no window between checking the path and using it. The kernel does
+/// not say which component was the link, only that one was.
+fn open_unresolved(path: &Path) -> Result<OwnedFd> {
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+    use rustix::io::Errno;
+
+    crate::platform::unresolved::require_normal(path)?;
+    openat2(
+        CWD,
+        path,
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|errno| match errno {
+        Errno::LOOP => Error::GrantRedirected {
+            path: path.to_path_buf(),
+            reason: crate::error::Redirection::SymbolicLink,
+        },
+        errno => Error::path(path, errno.into()),
+    })
 }
 
 /// Add one rule, narrowing directory-only rights on non-directories.
 fn add_rule(
     ruleset: &mut RulesetCreated,
     path: &Path,
-    fd: PathFd,
+    fd: impl AsFd,
     access: BitFlags<AccessFs>,
     abi: ABI,
 ) -> Result<()> {
@@ -852,15 +876,54 @@ mod tests {
 
     #[test]
     fn missing_configured_paths_are_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::platform::unresolved::resolved_tempdir();
         let missing = dir.path().join("absent");
-        let (data, _dir) = prepared(SandboxConfig::builder().readable(&missing).build());
+        std::fs::create_dir(&missing).expect("creates");
+        let (data, _dir) = prepared(
+            SandboxConfig::builder()
+                .readable(crate::platform::unresolved::resolved(&missing))
+                .build(),
+        );
+        std::fs::remove_dir(&missing).expect("removes");
 
         let error = build_ruleset(&data, None).expect_err("must fail");
         assert!(
             matches!(error, Error::Path { .. }),
             "a configured path that cannot be granted must be an error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn a_configured_path_replaced_by_a_link_is_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(root.path()).expect("resolves");
+        let parent = root.join("parent");
+        let granted = parent.join("granted");
+        fs::create_dir_all(&granted).expect("creates");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("granted")).expect("creates");
+
+        let (data, _dir) = prepared(
+            SandboxConfig::builder()
+                .writable(crate::platform::unresolved::resolved(&granted))
+                .build(),
+        );
+        build_ruleset(&data, None).expect("an unchanged grant builds");
+
+        // The grant itself, then a parent of it.
+        for (replaced, destination) in [
+            (&granted, elsewhere.join("granted")),
+            (&parent, elsewhere.clone()),
+        ] {
+            fs::remove_dir_all(replaced).expect("removes");
+            std::os::unix::fs::symlink(&destination, replaced).expect("links");
+
+            let error = build_ruleset(&data, None).expect_err("must fail");
+            assert!(
+                matches!(&error, Error::GrantRedirected { path, .. } if *path == granted),
+                "expected the redirected grant to be named, got {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -895,13 +958,16 @@ mod tests {
         let cache = tempfile::tempdir().expect("tempdir");
         let (data, _dir) = prepared(
             SandboxConfig::builder()
-                .writable(cache.path())
-                .executable(cache.path())
+                .writable(crate::platform::unresolved::resolved(cache.path()))
+                .executable(crate::platform::unresolved::resolved(cache.path()))
                 .build(),
         );
         assert_eq!(
             data.grants(),
-            [Grant::new(cache.path(), Access::WRITE | Access::EXEC)],
+            [Grant::new(
+                crate::platform::unresolved::resolved(cache.path()),
+                Access::WRITE | Access::EXEC
+            )],
             "granting a path twice must widen one grant, not add a second"
         );
 
@@ -929,13 +995,22 @@ mod tests {
                 .identity(
                     crate::identity::Identity::named("landlock-test")
                         .expect("the identity name is valid")
-                        .persistent_grant(Grant::new(directory.path(), Access::READ)),
+                        .persistent_grant(Grant::new(
+                            crate::platform::unresolved::resolved(directory.path()),
+                            Access::READ,
+                        )),
                 )
                 .build(),
         );
         data.adopt_persistent_grants();
 
-        assert_eq!(data.grants(), [Grant::new(directory.path(), Access::READ)]);
+        assert_eq!(
+            data.grants(),
+            [Grant::new(
+                crate::platform::unresolved::resolved(directory.path()),
+                Access::READ
+            )]
+        );
         assert!(
             configured_rules(&data, ABI::V4)
                 .iter()
@@ -1012,10 +1087,24 @@ mod tests {
             .map(Pattern::anywhere)
             .collect();
 
-        let mut found = find_protected(&[rule(&home, true)], &patterns);
+        let mut found = find_protected(&[rule(&home, true)], &patterns).expect("finds");
         found.sort();
         assert_eq!(found, [home.join(".npmrc"), home.join("project/.ssh")]);
-        assert!(find_protected(&[rule(&home, false)], &patterns).is_empty());
+        assert!(
+            find_protected(&[rule(&home, false)], &patterns)
+                .expect("finds")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_grant_that_cannot_be_inspected_is_an_error_not_a_skip() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home = fs::canonicalize(home.path()).expect("canonical");
+        let patterns = vec![Pattern::anywhere(".ssh")];
+
+        let result = find_protected(&[rule(&home.join("missing"), true)], &patterns);
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]

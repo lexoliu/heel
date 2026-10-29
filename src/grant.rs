@@ -8,11 +8,13 @@
 //! each backend has to rediscover.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use serde::de::{Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
+
+use crate::resolve::ResolvedPath;
 
 /// The operations a [`Grant`] permits.
 ///
@@ -180,22 +182,26 @@ impl<'de> Deserialize<'de> for Access {
 /// One configured path and what the sandbox may do with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
-    path: PathBuf,
+    path: ResolvedPath,
     access: Access,
 }
 
 impl Grant {
-    /// Grant `access` on `path`.
-    pub fn new(path: impl AsRef<Path>, access: Access) -> Self {
-        Self {
-            path: path.as_ref().to_path_buf(),
-            access,
-        }
+    /// Grant `access` on `path`, which the caller has already resolved.
+    #[must_use]
+    pub fn new(path: ResolvedPath, access: Access) -> Self {
+        Self { path, access }
     }
 
     /// The path this grant covers.
     #[must_use]
     pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    /// The resolved path this grant covers.
+    #[must_use]
+    pub fn resolved_path(&self) -> &ResolvedPath {
         &self.path
     }
 
@@ -309,10 +315,14 @@ mod tests {
 
     #[test]
     fn a_grant_widens_to_the_union() {
-        let mut grant = Grant::new("/opt/tools", Access::WRITE);
+        let tools = crate::platform::unresolved::resolved_tempdir();
+        let mut grant = Grant::new(
+            ResolvedPath::new(tools.path()).expect("resolved"),
+            Access::WRITE,
+        );
         grant.widen(Access::EXEC);
 
-        assert_eq!(grant.path(), Path::new("/opt/tools"));
+        assert_eq!(grant.path(), tools.path());
         assert_eq!(grant.access(), Access::WRITE | Access::EXEC);
     }
 }

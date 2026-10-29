@@ -98,12 +98,12 @@ mod enforced {
         // creates, so a failed protection damages nothing on the host. The refusal
         // is the write denylist's: with the home directory unprotected, Linux
         // grants it whole.
-        let rustup = tempfile::tempdir().unwrap();
+        let rustup = fixtures::tempdir();
         let settings = std::fs::canonicalize(rustup.path())
             .unwrap()
             .join("settings.toml");
         std::fs::write(&settings, "version = \"12\"\n").unwrap();
-        let unrelated_home = tempfile::tempdir().unwrap();
+        let unrelated_home = fixtures::tempdir();
         let sandbox = start(
             reader(DenyAll, unrelated_home.path()).write_denylist(
                 WriteDenylist::persistence()
@@ -134,7 +134,7 @@ mod enforced {
     #[tokio::test]
     async fn a_path_the_embedder_adds_is_denied() {
         let home = home_with(&[]);
-        let secrets = tempfile::tempdir().unwrap();
+        let secrets = fixtures::tempdir();
         std::fs::write(secrets.path().join("token"), "t").unwrap();
         let path = std::fs::canonicalize(secrets.path()).unwrap().join("token");
         let sandbox = start(
@@ -189,7 +189,8 @@ mod enforced {
         for strict in READ_POLICIES {
             let home = home_with(&[".ssh/id_ed25519", ".aws/credentials", "notes.txt"]);
             let root = std::fs::canonicalize(home.path()).unwrap();
-            let sandbox = start(denylisted(strict, &root).readable(&root)).await;
+            let sandbox =
+                start(denylisted(strict, &root).readable(fixtures::resolved(&root))).await;
 
             for store in [".ssh/id_ed25519", ".aws/credentials"] {
                 let error = cat(&sandbox, &root, store)
@@ -211,7 +212,9 @@ mod enforced {
         for strict in READ_POLICIES {
             let home = home_with(&[".ssh/id_ed25519", ".aws/credentials"]);
             let root = std::fs::canonicalize(home.path()).unwrap();
-            let sandbox = start(denylisted(strict, &root).readable(root.join(".ssh"))).await;
+            let sandbox =
+                start(denylisted(strict, &root).readable(fixtures::resolved(root.join(".ssh"))))
+                    .await;
 
             cat(&sandbox, &root, ".ssh/id_ed25519")
                 .await
@@ -229,8 +232,8 @@ mod enforced {
             let root = std::fs::canonicalize(home.path()).unwrap();
             let sandbox = start(
                 denylisted(strict, &root)
-                    .readable(&root)
-                    .readable(root.join(".ssh/keys")),
+                    .readable(fixtures::resolved(&root))
+                    .readable(fixtures::resolved(root.join(".ssh/keys"))),
             )
             .await;
 
@@ -279,7 +282,8 @@ mod enforced {
             files.push("notes.txt");
             let home = home_with(&files);
             let root = std::fs::canonicalize(home.path()).unwrap();
-            let sandbox = start(toggled(strict, writable).readable(&root)).await;
+            let sandbox =
+                start(toggled(strict, writable).readable(fixtures::resolved(&root))).await;
 
             for protected in TOGGLED_FILES {
                 cat(&sandbox, &root, protected).await.expect_err(&format!(
@@ -306,7 +310,7 @@ mod enforced {
             ];
             let mut builder = toggled(strict, writable);
             for path in named {
-                builder = builder.readable(root.join(path));
+                builder = builder.readable(fixtures::resolved(root.join(path)));
             }
             let sandbox = start(builder).await;
 
@@ -332,7 +336,7 @@ mod enforced {
     async fn a_credential_directory_cannot_be_moved_to_a_name_that_is_readable() {
         let home = home_with(&[".ssh/id_ed25519", ".config/other/x"]);
         let root = std::fs::canonicalize(home.path()).unwrap();
-        let sandbox = start(reader(DenyAll, home.path()).writable(&root)).await;
+        let sandbox = start(reader(DenyAll, home.path()).writable(fixtures::resolved(&root))).await;
 
         let moved = sh(
             &sandbox,
@@ -371,7 +375,7 @@ mod enforced {
         const SECRET: &'static str = "heel-test-secret";
 
         fn create() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixtures::tempdir();
             let fake_home = dir.path().join("home");
             std::fs::create_dir(&fake_home).unwrap();
             let keychain = dir.path().join("test.keychain-db");
@@ -454,7 +458,7 @@ mod enforced {
             SandboxConfigBuilder::default()
                 .filesystem_strict(true)
                 .security(SecurityConfig::strict())
-                .readable(&directory),
+                .readable(fixtures::resolved(&directory)),
         )
         .await;
         let output = sh(&protected, &keychain.command()).await;
@@ -472,7 +476,7 @@ mod enforced {
                         .protect_keychain(false)
                         .build(),
                 )
-                .readable(&directory),
+                .readable(fixtures::resolved(&directory)),
         )
         .await;
         let output = sh(&unprotected, &keychain.command()).await;
@@ -689,7 +693,8 @@ mod enforced {
     async fn a_grant_does_not_reopen_a_persistence_location() {
         let home = home_with(&[".cargo/bin/cargo"]);
         let root = std::fs::canonicalize(home.path()).unwrap();
-        let sandbox = start(writer(home.path()).writable(root.join(".cargo/bin"))).await;
+        let sandbox =
+            start(writer(home.path()).writable(fixtures::resolved(root.join(".cargo/bin")))).await;
 
         let output = sh(
             &sandbox,
@@ -764,7 +769,7 @@ mod enforced {
 #[cfg(windows)]
 #[tokio::test]
 async fn a_denylist_on_a_platform_that_cannot_enforce_it_fails_at_construction() {
-    let home = tempfile::tempdir().unwrap();
+    let home = fixtures::tempdir();
     for builder in [
         SandboxConfigBuilder::default()
             .read_denylist(ReadDenylist::credentials().home(home.path())),

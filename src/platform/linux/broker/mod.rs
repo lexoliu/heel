@@ -355,7 +355,7 @@ impl Broker {
                 }
                 None => Vec::new(),
             };
-            denied.extend(landlock_rules::find_protected(&plan, &protected));
+            denied.extend(landlock_rules::find_protected(&plan, &protected)?);
             let carved = landlock_rules::carve(plan.clone(), &denied, abi)?;
             let sandbox_rules = without_writes(&carved.rules, abi);
             let mut sandbox_ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;

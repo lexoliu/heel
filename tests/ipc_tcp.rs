@@ -40,7 +40,7 @@ async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
         .with_env_filter("heel=debug")
         .try_init();
     let fixture = blocking::unblock(|| {
-        let dir = tempfile::tempdir().expect("fixture directory");
+        let dir = fixtures::tempdir();
         let binary = fixtures::compile(
             dir.path(),
             include_str!("fixtures/tcp_probe.rs"),
@@ -55,7 +55,7 @@ async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
     let router = IpcRouter::new().register(Echo);
     let sandbox = Sandbox::with_config_and_executor(
         SandboxConfigBuilder::default()
-            .executable(&probe)
+            .executable(fixtures::resolved(&probe))
             .external_ipc(TcpIpcEndpoint::new(address, Duration::from_secs(5)))
             .heel_binary(env!("CARGO_BIN_EXE_heel"))
             .build(),

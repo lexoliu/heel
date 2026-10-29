@@ -353,6 +353,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::platform::unresolved::resolved as grant_path;
     use crate::{ReadDenylist, SandboxConfig, WriteDenylist};
 
     fn guard(home: &Path) -> Guard {
@@ -441,8 +442,8 @@ mod tests {
         }
         let (_, data, _) = SandboxConfig::builder()
             .read_denylist(ReadDenylist::credentials().home(&root))
-            .readable(&root)
-            .readable(root.join(".ssh/keys"))
+            .readable(grant_path(&root))
+            .readable(grant_path(root.join(".ssh/keys")))
             .build()
             .into_parts();
         let guard = Guard::new(&data, HashSet::new(), Vec::new()).unwrap();
@@ -461,8 +462,8 @@ mod tests {
         let root = std::fs::canonicalize(home.path()).unwrap();
         std::fs::create_dir_all(root.join("project/.ssh")).unwrap();
         let (_, data, _) = SandboxConfig::builder()
-            .readable(&root)
-            .readable(root.join("project/.ssh"))
+            .readable(grant_path(&root))
+            .readable(grant_path(root.join("project/.ssh")))
             .build()
             .into_parts();
         let guard = Guard::new(&data, HashSet::new(), Vec::new()).unwrap();
@@ -487,7 +488,7 @@ mod tests {
                     .home(&root)
                     .deny(root.join(".ssh/inner")),
             )
-            .readable(root.join(".ssh"))
+            .readable(grant_path(root.join(".ssh")))
             .build()
             .into_parts();
         let guard = Guard::new(&data, HashSet::new(), Vec::new()).unwrap();
