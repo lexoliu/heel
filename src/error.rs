@@ -25,14 +25,14 @@ pub enum Error {
         current: String,
     },
 
-    /// The configuration asks for a policy this platform's backend cannot enforce.
+    /// The configuration asks for a setting this platform's backend cannot enforce.
     ///
     /// Raised when the sandbox is constructed, so that a boundary the caller
     /// wrote down is never silently weaker than the one that runs.
-    #[error("{policy} is not supported on {platform}, and a sandbox is never built without it")]
-    UnsupportedPolicy {
-        /// The policy that cannot be enforced.
-        policy: &'static str,
+    #[error("{setting} is not supported on {platform}, and a sandbox is never built without it")]
+    UnsupportedSetting {
+        /// The setting that cannot be enforced.
+        setting: &'static str,
         /// The platform that cannot enforce it.
         platform: &'static str,
     },

@@ -9,7 +9,7 @@
 //! Recording is a property of the platform, not of the sandbox: a platform whose
 //! kernel reports denials nowhere, or nowhere a process can follow, answers
 //! [`Sandbox::record_denials`](crate::Sandbox::record_denials) with
-//! [`Error::UnsupportedPolicy`](crate::Error::UnsupportedPolicy) instead of an
+//! [`Error::UnsupportedSetting`](crate::Error::UnsupportedSetting) instead of an
 //! empty list that would read as "nothing was denied".
 
 #[cfg(target_os = "macos")]
@@ -158,8 +158,8 @@ pub struct DenialRecorder(std::convert::Infallible);
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl DenialRecorder {
     pub(crate) async fn start() -> Result<Self> {
-        Err(crate::error::Error::UnsupportedPolicy {
-            policy: "denial reports",
+        Err(crate::error::Error::UnsupportedSetting {
+            setting: "denial reports",
             platform: std::env::consts::OS,
         })
     }

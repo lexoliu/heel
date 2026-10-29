@@ -413,7 +413,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
     /// refusals. Start it before the work whose denials are wanted and call
     /// [`DenialRecorder::finish`] after it.
     ///
-    /// Anywhere else this fails with [`Error::UnsupportedPolicy`] rather than
+    /// Anywhere else this fails with [`Error::UnsupportedSetting`] rather than
     /// reporting that nothing was denied.
     pub async fn record_denials(&self) -> Result<DenialRecorder> {
         #[cfg(target_os = "linux")]

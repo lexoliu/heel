@@ -424,27 +424,6 @@ impl SandboxConfigData {
     /// Fail when a platform backend cannot enforce what the configuration asks
     /// for beyond its grants.
     ///
-    /// The host protection policies are enforced by the macOS and Linux
-    /// backends. A sandbox that carried one on Windows would run with a weaker
-    /// boundary than the caller wrote down, so construction refuses.
-    #[cfg(windows)]
-    pub(crate) fn require_enforceable(&self) -> crate::error::Result<()> {
-        let platform = std::env::consts::OS;
-        if self.read_denylist.is_some() {
-            return Err(crate::error::Error::UnsupportedPolicy {
-                policy: "the credential read denylist",
-                platform,
-            });
-        }
-        if self.write_denylist.is_some() {
-            return Err(crate::error::Error::UnsupportedPolicy {
-                policy: "the persistence write denylist",
-                platform,
-            });
-        }
-        Ok(())
-    }
-
     /// Host environment variables forwarded into the sandbox.
     pub fn env_passthrough(&self) -> &[String] {
         &self.env_passthrough
@@ -759,6 +738,9 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     }
 
     /// Make the whole filesystem writable (permissive mode).
+    ///
+    /// Not supported on Windows: building a sandbox fails with
+    /// [`Error::UnsupportedSetting`](crate::Error::UnsupportedSetting).
     pub fn writable_file_system(mut self, enabled: bool) -> Self {
         self.data.writable_file_system = enabled;
         self

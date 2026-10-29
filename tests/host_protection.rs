@@ -612,7 +612,7 @@ async fn a_denylist_on_a_platform_that_cannot_enforce_it_fails_at_construction()
                 .err()
                 .expect("the sandbox must not start");
         assert!(
-            matches!(error, heel::Error::UnsupportedPolicy { .. }),
+            matches!(error, heel::Error::UnsupportedSetting { .. }),
             "{error:?}"
         );
     }

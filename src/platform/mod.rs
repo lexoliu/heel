@@ -115,8 +115,6 @@ pub(crate) fn create_native_backend(
     config: &SandboxConfigData,
     proxy_port: Option<u16>,
 ) -> Result<NativeBackend> {
-    #[cfg(windows)]
-    config.require_enforceable()?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     return NativeBackend::new(config, proxy_port);
     #[cfg(target_os = "windows")]
@@ -134,9 +132,91 @@ pub(crate) fn create_native_backend(
     Err(crate::error::Error::UnsupportedPlatform)
 }
 
+/// Reject the settings the Windows backend cannot enforce.
+///
+/// An AppContainer token is default-deny and only ACL entries naming its SID
+/// open anything, so "the whole filesystem is writable" would mean rewriting
+/// the ACL of every drive root and everything beneath it. That is neither
+/// possible without administrator rights nor something a sandbox may do to the
+/// host, so the setting is refused rather than run as if it were strict.
+///
+/// The host protection policies are enforced by the macOS and Linux backends
+/// only. A sandbox that carried one here would run with a weaker boundary than
+/// the caller wrote down, so it is refused too.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn require_windows_support(config: &SandboxConfigData) -> Result<()> {
+    let refused = if config.writable_file_system() {
+        Some("writable_file_system")
+    } else if config.read_denylist().is_some() {
+        Some("the credential read denylist")
+    } else if config.write_denylist().is_some() {
+        Some("the persistence write denylist")
+    } else {
+        None
+    };
+    match refused {
+        Some(setting) => Err(crate::error::Error::UnsupportedSetting {
+            setting,
+            platform: "windows",
+        }),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_refuses_a_writable_file_system() {
+        let config = crate::SandboxConfig::builder()
+            .writable_file_system(true)
+            .build();
+        let error = require_windows_support(config.data()).expect_err("must be refused");
+        assert!(matches!(
+            error,
+            crate::error::Error::UnsupportedSetting {
+                setting: "writable_file_system",
+                platform: "windows"
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "writable_file_system is not supported on windows, and a sandbox is never built without it"
+        );
+    }
+
+    #[test]
+    fn windows_refuses_the_host_protection_policies() {
+        let configs = [
+            crate::SandboxConfig::builder()
+                .read_denylist(crate::ReadDenylist::credentials())
+                .build(),
+            crate::SandboxConfig::builder()
+                .write_denylist(crate::WriteDenylist::persistence())
+                .build(),
+        ];
+        for config in configs {
+            let error = require_windows_support(config.data()).expect_err("must be refused");
+            assert!(matches!(
+                error,
+                crate::error::Error::UnsupportedSetting {
+                    platform: "windows",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn windows_accepts_every_other_filesystem_configuration() {
+        for strict in [true, false] {
+            let config = crate::SandboxConfig::builder()
+                .filesystem_strict(strict)
+                .build();
+            require_windows_support(config.data()).expect("supported");
+        }
+    }
 
     #[test]
     fn environment_names_match_under_host_rules() {

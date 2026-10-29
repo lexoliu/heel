@@ -8,6 +8,7 @@ pub fn convert_error(err: heel::Error) -> Error {
     let code = match &err {
         heel::Error::UnsupportedPlatform => "ERR_UNSUPPORTED_PLATFORM",
         heel::Error::UnsupportedPlatformVersion { .. } => "ERR_UNSUPPORTED_PLATFORM_VERSION",
+        heel::Error::UnsupportedSetting { .. } => "ERR_UNSUPPORTED_SETTING",
         heel::Error::InitFailed(_) => "ERR_INIT_FAILED",
         heel::Error::NotEnforced(_) => "ERR_NOT_ENFORCED",
         heel::Error::InvalidProfile(_) => "ERR_INVALID_PROFILE",
