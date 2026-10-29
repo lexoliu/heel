@@ -8,6 +8,8 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 #![allow(clippy::unwrap_used)]
 
+mod fixtures;
+
 use std::path::{Path, PathBuf};
 
 use heel::{
@@ -59,11 +61,14 @@ fn compile_probe(dir: &Path) -> PathBuf {
 
 /// Run the probe two processes below a sandbox configured with `priority`.
 async fn observe(priority: ProcessPriority) -> Observed {
-    let tools = tempfile::tempdir().expect("tools dir");
+    let tools = fixtures::tempdir();
     let probe = compile_probe(tools.path());
 
     let config = SandboxConfigBuilder::default()
-        .grant(tools.path(), Access::READ | Access::EXEC)
+        .grant(
+            fixtures::resolved(tools.path()),
+            Access::READ | Access::EXEC,
+        )
         .priority(priority)
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)

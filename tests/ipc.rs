@@ -10,6 +10,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod fixtures;
+
 use heel::ipc::{IpcCommand, IpcError, IpcRouter, NoArgs};
 use heel::{Sandbox, SandboxConfigBuilder};
 use serde::Deserialize;
@@ -290,4 +292,45 @@ async fn the_shim_directory_is_the_only_executable_place_in_the_working_director
     )
     .await;
     assert_ne!(stdout(&denied), "executed");
+}
+
+#[tokio::test]
+async fn a_heel_binary_reached_through_a_link_is_used() {
+    // A package manager's shim: the binary the host picks is a link.
+    let dir = fixtures::tempdir();
+    let link = dir.path().join("heel");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_heel"), &link).expect("links");
+    let config = SandboxConfigBuilder::default()
+        .ipc(IpcRouter::new().register(Structured))
+        .heel_binary(&link)
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("a heel binary behind a link builds");
+
+    let output = sh(&sandbox, "structured").await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[tokio::test]
+async fn a_heel_binary_link_the_sandbox_could_plant_is_refused() {
+    let dir = fixtures::tempdir();
+    let link = dir.path().join("heel");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_heel"), &link).expect("links");
+    let config = SandboxConfigBuilder::default()
+        .ipc(IpcRouter::new().register(Structured))
+        .writable(fixtures::resolved(dir.path()))
+        .heel_binary(&link)
+        .build();
+
+    let error = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .err()
+        .expect("a link below a writable path is refused");
+
+    assert!(
+        matches!(&error, heel::Error::GrantRedirected { path, .. } if *path == link),
+        "{error:?}"
+    );
 }

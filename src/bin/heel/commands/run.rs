@@ -1,12 +1,12 @@
 use crate::cli::RunArgs;
-use crate::config::MergedConfig;
+use crate::config::{MergedConfig, ResolvedPaths};
 use crate::error::CliResult;
 use crate::sandbox::create_sandbox;
 use heel::StdioConfig;
 
 /// Run one program in the sandbox, returning its exit code.
-pub async fn execute(args: RunArgs, config: MergedConfig) -> CliResult<i32> {
-    let mut sandbox = create_sandbox(&config).await?;
+pub async fn execute(args: RunArgs, config: MergedConfig, paths: ResolvedPaths) -> CliResult<i32> {
+    let mut sandbox = create_sandbox(&config, &paths).await?;
     if config.keep_working_dir {
         sandbox.keep_working_dir();
     }

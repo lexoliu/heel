@@ -126,14 +126,29 @@ writable or executable but not readable, and a path granted twice keeps the
 union of both grants.
 
 ```rust
-use heel::{Access, SandboxConfig};
+use heel::{Access, ResolvedPath, SandboxConfig};
 
 let config = SandboxConfig::builder()
-    .readable("/usr/share")                             // Access::READ
-    .writable("/var/spool/work")                        // Access::WRITE, denied exec
-    .grant("/opt/cache", Access::WRITE | Access::EXEC)  // written, then run
+    .readable(ResolvedPath::new("/usr/share")?)                            // Access::READ
+    .writable(ResolvedPath::new("/var/spool/work")?)                       // Access::WRITE, denied exec
+    .grant(ResolvedPath::new("/opt/cache")?, Access::WRITE | Access::EXEC) // written, then run
     .build();
 ```
+
+A granted path is a `ResolvedPath`: absolute, already resolved and spelled
+without `.` or `..` components, which `ResolvedPath::new` checks. The sandbox
+never follows a symbolic link to honour one: building a sandbox checks every
+component of each path again without following links and fails with
+`Error::GrantRedirected` if one has become a link, so a process that can
+replace a granted directory with a link cannot move the grant to the link's
+target. Paths a user wrote are resolved once, where they enter, with
+`heel::resolve_paths`: it follows the links the user's own spelling crosses
+(`/tmp`, a symlinked home) but refuses a link inside a directory the
+configuration makes writable, and a writable path that is itself a link, which a
+sandbox of an earlier run may have planted. "Inside" is decided by file
+identity, so no spelling of the writable directory hides the link. The `heel`
+CLI and the Node bindings do this for you. A supplied working directory is
+resolved the same way.
 
 The working directory is not a grant: it is always writable, never executable,
 and no configuration changes that.
