@@ -10,6 +10,7 @@ use executor_core::{DefaultExecutor, Executor, try_init_global_executor};
 
 use crate::command::{Command, ProxyEndpoint};
 use crate::config::{SandboxConfig, SandboxConfigData};
+use crate::denial::DenialRecorder;
 use crate::error::{Error, Result};
 use crate::grant::Access;
 use crate::ipc::{IpcLayout, IpcServer};
@@ -266,8 +267,9 @@ impl<N: NetworkPolicy> Sandbox<N> {
         // Windows grants by inheritance, and inheritance only reaches files
         // created once the grant is in place.
         let backend_config = config_data.clone();
+        let proxy_port = proxy.as_ref().map(|proxy| proxy.addr().port());
         let backend = unblock(move || {
-            let backend = platform::create_native_backend(&backend_config)?;
+            let backend = platform::create_native_backend(&backend_config, proxy_port)?;
 
             // The endpoint is a named pipe — a kernel object whose access control
             // list names nothing an AppContainer token carries — so the pipe must
@@ -401,6 +403,31 @@ impl<N: NetworkPolicy> Sandbox<N> {
     /// The sandbox working directory.
     pub fn working_dir(&self) -> &std::path::Path {
         self.working_dir.path()
+    }
+
+    /// Start recording the accesses this sandbox denies.
+    ///
+    /// On macOS the kernel reports every denial to the system log and the
+    /// recorder follows it for the ones this sandbox's profile tagged. On Linux
+    /// the broker that judges the host protection policies records its own
+    /// refusals. Start it before the work whose denials are wanted and call
+    /// [`DenialRecorder::finish`] after it.
+    ///
+    /// Anywhere else this fails with [`Error::UnsupportedSetting`] rather than
+    /// reporting that nothing was denied.
+    pub async fn record_denials(&self) -> Result<DenialRecorder> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(DenialRecorder::start(self.backend.denial_sink()))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            DenialRecorder::start(crate::denial::denial_tag(self.working_dir.path())).await
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            DenialRecorder::start().await
+        }
     }
 
     /// Run an interactive command on a pseudo-terminal.

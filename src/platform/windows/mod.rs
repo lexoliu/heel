@@ -157,7 +157,8 @@ impl WindowsBackend {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedSetting`] if the configuration makes the
-    /// whole filesystem writable, which an AppContainer cannot express.
+    /// whole filesystem writable, which an AppContainer cannot express, or
+    /// carries a host protection policy, which this backend does not enforce.
     /// Returns an error if the AppContainer profile cannot be opened or
     /// created, or if a configured path cannot be opened to it.
     pub fn new(config: &SandboxConfigData) -> Result<Self> {

@@ -103,12 +103,14 @@
 pub(crate) mod accept;
 mod command;
 mod config;
+mod denial;
 mod error;
 mod grant;
 mod identity;
 pub mod ipc;
 mod network;
 mod platform;
+mod policy;
 mod priority;
 #[cfg(target_os = "macos")]
 pub(crate) mod pty;
@@ -121,10 +123,11 @@ mod workdir;
 pub use command::DEFAULT_SANDBOX_PATH;
 pub use command::{Command, StdioConfig, default_sandbox_path};
 pub use config::{
-    IpcConfigured, IpcUnconfigured, PythonConfig, PythonConfigBuilder, ResourceLimits,
+    InodePool, IpcConfigured, IpcUnconfigured, PythonConfig, PythonConfigBuilder, ResourceLimits,
     ResourceLimitsBuilder, SandboxConfig, SandboxConfigBuilder, SandboxConfigData, VenvBackend,
     VenvConfig, VenvConfigBuilder, python_data_science_preset, python_dev_preset, strict_preset,
 };
+pub use denial::{Denial, DenialRecorder};
 pub use error::{Error, Result};
 pub use grant::{Access, Grant, ParseAccessError};
 pub use identity::Identity;
@@ -134,6 +137,7 @@ pub use network::{
     NetworkPolicy,
 };
 pub use platform::Child;
+pub use policy::{ReadDenylist, WriteDenylist};
 pub use priority::{CpuPriority, InvalidNiceLevel, IoPriority, NiceLevel, ProcessPriority};
 pub use python::VenvManager;
 pub use sandbox::Sandbox;

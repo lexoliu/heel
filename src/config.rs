@@ -11,6 +11,7 @@ use crate::grant::{Access, Grant};
 use crate::identity::Identity;
 use crate::ipc::IpcRouter;
 use crate::network::{DenyAll, NetworkPolicy};
+use crate::policy::{ReadDenylist, WriteDenylist};
 use crate::priority::ProcessPriority;
 use crate::security::SecurityConfig;
 use crate::workdir::generate_working_dir_name;
@@ -272,6 +273,48 @@ impl PythonConfigBuilder {
     }
 }
 
+/// The inodes the Linux backend keeps ready for new entries in the directories
+/// above a denied path.
+///
+/// Landlock can only grant, so a directory that holds a credential store, such
+/// as the home directory, is granted entry by entry, and an entry created in it
+/// later has no grant of its own. The backend serves such a creation by moving a
+/// pre-created, already granted file or directory into place. Each count is
+/// per group of directories that share a filesystem and the rights their
+/// entries need, and when one runs out the creation fails with `ENOSPC` and the
+/// log names this setting.
+///
+/// The defaults suit a build that creates a few temporary entries directly in
+/// the home directory; a tool that creates thousands needs more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InodePool {
+    files: usize,
+    directories: usize,
+}
+
+impl InodePool {
+    /// A pool of `files` regular files and `directories` directories.
+    pub const fn new(files: usize, directories: usize) -> Self {
+        Self { files, directories }
+    }
+
+    /// How many regular files are kept ready.
+    pub const fn files(&self) -> usize {
+        self.files
+    }
+
+    /// How many directories are kept ready.
+    pub const fn directories(&self) -> usize {
+        self.directories
+    }
+}
+
+impl Default for InodePool {
+    fn default() -> Self {
+        Self::new(256, 64)
+    }
+}
+
 /// Sandbox configuration without the network policy.
 ///
 /// The policy is generic over the sandbox type, so it is split out before the
@@ -288,6 +331,10 @@ pub struct SandboxConfigData {
     working_dir_auto: bool,
     filesystem_strict: bool,
     writable_file_system: bool,
+    read_denylist: Option<ReadDenylist>,
+    write_denylist: Option<WriteDenylist>,
+    inode_pool: InodePool,
+    broker_sync_wake_up: bool,
     env_passthrough: Vec<String>,
     limits: ResourceLimits,
     priority: ProcessPriority,
@@ -352,6 +399,31 @@ impl SandboxConfigData {
         self.filesystem_strict
     }
 
+    /// The credential stores the sandbox must not read, if a policy is set.
+    pub fn read_denylist(&self) -> Option<&ReadDenylist> {
+        self.read_denylist.as_ref()
+    }
+
+    /// The persistence locations the sandbox must not write, if a policy is set.
+    pub fn write_denylist(&self) -> Option<&WriteDenylist> {
+        self.write_denylist.as_ref()
+    }
+
+    /// The inodes the Linux backend keeps ready for new entries in the
+    /// directories above a denied path.
+    pub fn inode_pool(&self) -> InodePool {
+        self.inode_pool
+    }
+
+    /// Whether the Linux backend asks the kernel to wake its supervisor on the
+    /// calling task's CPU.
+    pub fn broker_sync_wake_up(&self) -> bool {
+        self.broker_sync_wake_up
+    }
+
+    /// Fail when a platform backend cannot enforce what the configuration asks
+    /// for beyond its grants.
+    ///
     /// Host environment variables forwarded into the sandbox.
     pub fn env_passthrough(&self) -> &[String] {
         &self.env_passthrough
@@ -512,6 +584,10 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 working_dir_auto: true,
                 filesystem_strict: true,
                 writable_file_system: false,
+                read_denylist: None,
+                write_denylist: None,
+                inode_pool: InodePool::default(),
+                broker_sync_wake_up: true,
                 env_passthrough: Vec::new(),
                 limits: ResourceLimits::default(),
                 priority: ProcessPriority::default(),
@@ -609,6 +685,55 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Deny reads outside the working directory and the allow list.
     pub fn filesystem_strict(mut self, enabled: bool) -> Self {
         self.data.filesystem_strict = enabled;
+        self
+    }
+
+    /// Deny reads of credential stores and keys, whatever else is readable.
+    ///
+    /// Combined with `filesystem_strict(false)` this is a denylist read policy:
+    /// everything is readable except the credentials, so a toolchain installed
+    /// anywhere on the host works without being listed. Combined with
+    /// `filesystem_strict(true)` it adds to the allowlist what the allowlist
+    /// cannot say, such as the keychain services and agent sockets.
+    ///
+    /// The denial is enforced after every grant: a grant naming a denied path
+    /// does not reopen it. macOS and Linux enforce it, and a sandbox that
+    /// carries it on Windows fails at construction.
+    pub fn read_denylist(mut self, denylist: ReadDenylist) -> Self {
+        self.data.read_denylist = Some(denylist);
+        self
+    }
+
+    /// Deny writes to persistence locations, whatever else is writable.
+    ///
+    /// Combined with `writable_file_system(true)` this is a denylist write
+    /// policy: everything is writable except the places where a write persists
+    /// as code that runs outside the sandbox later.
+    ///
+    /// The denial is enforced after every grant. macOS and Linux enforce it, and
+    /// a sandbox that carries it on Windows fails at construction.
+    pub fn write_denylist(mut self, denylist: WriteDenylist) -> Self {
+        self.data.write_denylist = Some(denylist);
+        self
+    }
+
+    /// How many inodes the Linux backend keeps ready for new entries in the
+    /// directories above a denied path. Ignored elsewhere.
+    ///
+    /// See [`InodePool`].
+    pub fn inode_pool(mut self, pool: InodePool) -> Self {
+        self.data.inode_pool = pool;
+        self
+    }
+
+    /// Whether the Linux backend asks the kernel to wake its supervisor on the
+    /// calling task's CPU (the default). Ignored elsewhere.
+    ///
+    /// Waking on the caller's CPU spares a migration for each brokered call, but
+    /// leaves the supervisor's other threads idle while one call is served, so
+    /// whether it pays is a property of the machine and the build.
+    pub fn broker_sync_wake_up(mut self, enabled: bool) -> Self {
+        self.data.broker_sync_wake_up = enabled;
         self
     }
 

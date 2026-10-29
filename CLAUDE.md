@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Platform support:
 - **macOS**: `sandbox-exec` with SBPL profiles (fully implemented)
-- **Linux**: Landlock (ABI v4, kernel 6.7+) + Seccomp (implemented, requires kernel support)
+- **Linux**: Landlock (ABI v4, kernel 6.7+) + Seccomp (implemented, requires kernel support). With a read or write denylist, or a network proxy, a seccomp user-notification broker (`src/platform/linux/broker/`) performs the file-changing calls and `connect`/`bind` for the sandbox; it needs `ptrace_scope` of 1 or lower
 - **Windows**: AppContainer + job objects (implemented). Access is granted per
   path to the container's package SID by ACL; a job object carries the resource
   limits and kills the process tree

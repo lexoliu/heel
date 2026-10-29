@@ -39,12 +39,15 @@ pub struct NetworkProxy<N: NetworkPolicy> {
     _policy: std::marker::PhantomData<fn() -> N>,
 }
 
+/// The address the proxy listens on, and so the only one a sandbox may connect to.
+pub(crate) const PROXY_ADDRESS: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
+
 impl<N: NetworkPolicy> NetworkProxy<N> {
     /// Bind the proxy on loopback and start serving.
     ///
     /// This is internal - [`Sandbox`](crate::Sandbox) provides the executor.
     pub(crate) async fn new<E: Executor + Clone + 'static>(policy: N, executor: E) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind((PROXY_ADDRESS, 0)).await?;
         let addr = listener.local_addr()?;
         let (shutdown, shutdown_rx) = ShutdownSignal::new();
 

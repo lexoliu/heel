@@ -21,6 +21,8 @@ use crate::error::{Error, Result};
 /// and the kernel's "most restrictive result wins" leaves no ambiguity.
 pub(crate) struct PreparedFilter {
     programs: Vec<seccompiler::BpfProgram>,
+    /// Programs written by hand, installed after the compiled ones.
+    raw: Vec<Vec<libc::sock_filter>>,
 }
 
 impl PreparedFilter {
@@ -31,6 +33,25 @@ impl PreparedFilter {
     pub(crate) fn apply(self) -> std::io::Result<()> {
         for program in &self.programs {
             seccompiler::apply_filter(program).map_err(seccomp_error_to_io)?;
+        }
+        for program in &self.raw {
+            let fprog = libc::sock_fprog {
+                len: u16::try_from(program.len())
+                    .map_err(|_| std::io::Error::from_raw_os_error(libc::E2BIG))?,
+                filter: program.as_ptr().cast_mut(),
+            };
+            // SAFETY: `fprog` points at `len` instructions that outlive the call.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER,
+                    0,
+                    &raw const fprog,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
         Ok(())
     }
@@ -78,8 +99,19 @@ pub(crate) fn build_filter(allow_tcp: bool) -> Result<PreparedFilter> {
 
     tracing::debug!(allow_tcp, "seccomp: filters built");
 
+    // Installed last, so that where it and an earlier program both answer with
+    // an error the kernel picks it: the newest filter wins a tie. The x32 ABI
+    // shares x86-64's audit architecture and numbers its calls `nr | 0x40000000`,
+    // so every rule above, which names plain numbers, would otherwise not match
+    // the same call made that way.
+    #[cfg(target_arch = "x86_64")]
+    let raw = vec![crate::platform::linux::broker::x32_refusal()];
+    #[cfg(not(target_arch = "x86_64"))]
+    let raw = Vec::new();
+
     Ok(PreparedFilter {
         programs: vec![denied, unsupported],
+        raw,
     })
 }
 
@@ -118,6 +150,8 @@ fn build_rules(allow_tcp: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
     // `clone3` is refused by its own filter, with a different error; see
     // `build_filter`.
 
+    rules.insert(libc::SYS_ioctl, terminal_injection_rules()?);
+    rules.insert(libc::SYS_prctl, undumpable_rules()?);
     add_dangerous_syscall_blocks(&mut rules);
 
     Ok(rules)
@@ -182,6 +216,21 @@ fn namespace_clone_rules() -> Result<Vec<SeccompRule>> {
     Ok(vec![SeccompRule::new(vec![condition]).map_err(|e| {
         Error::InvalidProfile(format!("seccomp rule error: {e:?}"))
     })?])
+}
+
+/// `TIOCSTI` and `TIOCLINUX` push input into, or take over, a terminal the
+/// sandboxed process may share with its parent shell.
+fn terminal_injection_rules() -> Result<Vec<SeccompRule>> {
+    [libc::TIOCSTI, libc::TIOCLINUX]
+        .into_iter()
+        .map(|request| rule(&[(1, request)]))
+        .collect()
+}
+
+/// `prctl(PR_SET_DUMPABLE, 0)` would make the process unreadable to the broker,
+/// which serves it by reading its memory and `/proc` entries.
+fn undumpable_rules() -> Result<Vec<SeccompRule>> {
+    Ok(vec![rule(&[(0, libc::PR_SET_DUMPABLE as u64), (1, 0)])?])
 }
 
 /// Build a rule matching on the given `(argument index, value)` equalities.

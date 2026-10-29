@@ -26,11 +26,14 @@ pub enum Error {
     },
 
     /// The configuration asks for a setting this platform's backend cannot enforce.
-    #[error("{setting} is not supported on {platform}")]
+    ///
+    /// Raised when the sandbox is constructed, so that a boundary the caller
+    /// wrote down is never silently weaker than the one that runs.
+    #[error("{setting} is not supported on {platform}, and a sandbox is never built without it")]
     UnsupportedSetting {
-        /// The configuration setting.
+        /// The setting that cannot be enforced.
         setting: &'static str,
-        /// Platform name.
+        /// The platform that cannot enforce it.
         platform: &'static str,
     },
 
