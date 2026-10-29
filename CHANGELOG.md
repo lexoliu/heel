@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2](https://github.com/lexoliu/heel/compare/heel-v0.7.1...heel-v0.7.2) - 2026-10-29
+
+### Added
+
+- supervise a sandboxed command's process tree on Linux
+
+### Fixed
+
+- tear supervisors down together and signal through pidfds
+- reap every child and keep the sandbox's teardown inside the supervisor
+- map HRESULT access denials before the read-only DACL fallback
+- decide writable territory by file identity, not spelling
+- never follow a link to honour a grant
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/129-supervise
+- plant the Windows swap from the host
+- report the parent's ACL when the Windows swap probe cannot enter it
+- let the swap probe enter the parent it removes from
+- let the swap probe list the parent it removes from
+
 ## [0.7.1](https://github.com/lexoliu/heel/compare/heel-v0.7.0...heel-v0.7.1) - 2026-10-29
 
 ### Fixed
