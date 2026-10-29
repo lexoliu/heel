@@ -403,8 +403,9 @@ async fn writing_to(granted: &[heel::ResolvedPath]) -> heel::Result<Sandbox> {
 /// The swapped directory's parent is readable and writable too: removing a
 /// directory needs the right to change its parent on Linux and Windows, and a
 /// grant nested in another is how a sandbox ends up able to do it. A write-only
-/// grant is not enough on Windows, where entering the parent and removing the
-/// directory's contents both list a directory.
+/// grant is not enough on Windows: removing the directory's contents lists it,
+/// and entering the parent asks for `FILE_TRAVERSE`, which on a directory is
+/// the execute right.
 struct Swap {
     _guard: tempfile::TempDir,
     parent: std::path::PathBuf,
@@ -501,7 +502,10 @@ async fn a_grant_the_sandbox_replaced_with_a_link_fails_the_next_build() {
     let swapped = fixtures::resolved(&swap.swapped);
     let build = || {
         let config = SandboxConfigBuilder::default()
-            .grant(parent.clone(), heel::Access::READ | heel::Access::WRITE)
+            .grant(
+                parent.clone(),
+                heel::Access::READ | heel::Access::WRITE | heel::Access::EXEC,
+            )
             .writable(swapped.clone())
             .build();
         Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
@@ -529,7 +533,10 @@ async fn a_working_directory_the_sandbox_replaced_with_a_link_fails_the_next_bui
     let parent = fixtures::resolved(&swap.parent);
     let config = |swap: &Swap| {
         SandboxConfigBuilder::default()
-            .grant(parent.clone(), heel::Access::READ | heel::Access::WRITE)
+            .grant(
+                parent.clone(),
+                heel::Access::READ | heel::Access::WRITE | heel::Access::EXEC,
+            )
             .working_dir(&swap.swapped)
             .build()
     };
