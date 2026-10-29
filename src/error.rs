@@ -9,6 +9,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors that can occur during sandbox operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The host platform has no sandbox backend.
     #[error("unsupported platform")]
@@ -40,6 +41,30 @@ pub enum Error {
     /// The backend could not be initialized.
     #[error("sandbox initialization failed: {0}")]
     InitFailed(String),
+
+    /// Yama's `kernel.yama.ptrace_scope` forbids the broker from reading the
+    /// memory of the processes it serves.
+    ///
+    /// A host precondition: an administrator lowers the setting, the sandbox
+    /// cannot.
+    #[error(
+        "kernel.yama.ptrace_scope is {scope}, but the sandbox broker needs {max} or lower; \
+         lower it with `sysctl kernel.yama.ptrace_scope={max}`"
+    )]
+    PtraceScopeTooStrict {
+        /// The value the host reports.
+        scope: u8,
+        /// The highest value the broker works under.
+        max: u8,
+    },
+
+    /// The kernel does not offer seccomp user notification, which the broker
+    /// is built on.
+    ///
+    /// A host precondition: typically a kernel built without it, or a container
+    /// runtime whose seccomp policy blocks the `seccomp` syscall.
+    #[error("seccomp user notification is unavailable on this host: {0}")]
+    SeccompNotifyUnavailable(io::Error),
 
     /// The kernel accepted the request but would not enforce the sandbox.
     #[error("sandbox not enforced: {0}")]
