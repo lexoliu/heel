@@ -61,20 +61,27 @@ pub mod host {
             .write_denylist(WriteDenylist::persistence().home(home))
     }
 
+    /// How long a sandbox may take to start or to run one short command.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
     pub async fn start<N: NetworkPolicy>(builder: SandboxConfigBuilder<N>) -> Sandbox<N> {
-        Sandbox::with_config_and_executor(builder.build(), executor_core::tokio::TokioGlobal)
-            .await
-            .expect("the sandbox starts")
+        tokio::time::timeout(
+            BOUND,
+            Sandbox::with_config_and_executor(builder.build(), executor_core::tokio::TokioGlobal),
+        )
+        .await
+        .expect("the sandbox starts in time")
+        .expect("the sandbox starts")
     }
 
     pub async fn sh<N: NetworkPolicy>(sandbox: &Sandbox<N>, script: &str) -> Output {
-        sandbox
-            .command("/bin/sh")
-            .arg("-c")
-            .arg(script)
-            .output()
-            .await
-            .expect("the shell runs")
+        tokio::time::timeout(
+            BOUND,
+            sandbox.command("/bin/sh").arg("-c").arg(script).output(),
+        )
+        .await
+        .expect("the shell finishes in time")
+        .expect("the shell runs")
     }
 
     pub fn stderr(output: &Output) -> String {

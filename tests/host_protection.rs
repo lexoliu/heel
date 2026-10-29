@@ -22,8 +22,10 @@ use std::path::PathBuf;
 use heel::DenyAll;
 #[cfg(windows)]
 use heel::Sandbox;
+#[cfg(unix)]
+use heel::SecurityConfig;
 #[cfg(target_os = "macos")]
-use heel::{AllowAll, SecurityConfig, SecurityConfigBuilder};
+use heel::{AllowAll, SecurityConfigBuilder};
 use heel::{ReadDenylist, SandboxConfigBuilder, WriteDenylist};
 
 #[cfg(unix)]
@@ -152,15 +154,178 @@ mod enforced {
         assert!(stderr(&output).contains(&path.display().to_string()));
     }
 
-    #[tokio::test]
-    async fn a_grant_does_not_reopen_a_credential_store() {
-        let home = home_with(&[".ssh/id_ed25519"]);
-        let ssh = home.path().join(".ssh");
-        let path = std::fs::canonicalize(&ssh).unwrap().join("id_ed25519");
-        let sandbox = start(reader(DenyAll, home.path()).readable(&ssh)).await;
+    /// Every sandbox that reads outside its grants and one that reads only
+    /// inside them, the two shapes a host that grants a directory runs in.
+    const READ_POLICIES: [bool; 2] = [false, true];
 
-        let output = sh(&sandbox, &format!("cat '{}'", path.display())).await;
-        assert!(!output.status.success(), "a grant reopened the store");
+    fn denylisted(strict: bool, home: &Path) -> SandboxConfigBuilder<DenyAll> {
+        SandboxConfigBuilder::default()
+            .filesystem_strict(strict)
+            .security(open_security())
+            .read_denylist(ReadDenylist::credentials().home(home))
+    }
+
+    /// Whether `cat` of `relative` under `root` succeeded and printed the
+    /// stand-in's content, with the failure's message when it did not.
+    async fn cat<N: heel::NetworkPolicy>(
+        sandbox: &heel::Sandbox<N>,
+        root: &Path,
+        relative: &str,
+    ) -> Result<(), String> {
+        let path = root.join(relative);
+        let output = sh(sandbox, &format!("cat '{}'", path.display())).await;
+        if output.status.success() {
+            assert_eq!(stdout(&output), "secret", "{relative}");
+            Ok(())
+        } else {
+            Err(stderr(&output))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_of_a_directory_holding_a_credential_store_does_not_open_it() {
+        // The directory a host starts a session in is granted whole, and may be
+        // the home directory or one above it.
+        for strict in READ_POLICIES {
+            let home = home_with(&[".ssh/id_ed25519", ".aws/credentials", "notes.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(denylisted(strict, &root).readable(&root)).await;
+
+            for store in [".ssh/id_ed25519", ".aws/credentials"] {
+                let error = cat(&sandbox, &root, store)
+                    .await
+                    .expect_err("the grant reopened a credential store");
+                assert!(
+                    error.contains(&root.join(store).display().to_string()),
+                    "strict={strict}: the failure does not name {store}: {error}"
+                );
+            }
+            cat(&sandbox, &root, "notes.txt")
+                .await
+                .unwrap_or_else(|error| panic!("strict={strict}: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_naming_a_credential_store_opens_it_and_only_it() {
+        for strict in READ_POLICIES {
+            let home = home_with(&[".ssh/id_ed25519", ".aws/credentials"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(denylisted(strict, &root).readable(root.join(".ssh"))).await;
+
+            cat(&sandbox, &root, ".ssh/id_ed25519")
+                .await
+                .unwrap_or_else(|error| panic!("strict={strict}: {error}"));
+            cat(&sandbox, &root, ".aws/credentials")
+                .await
+                .expect_err("a grant of one store opened another");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_inside_a_credential_store_opens_what_it_names() {
+        for strict in READ_POLICIES {
+            let home = home_with(&[".ssh/id_ed25519", ".ssh/keys/deploy"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(
+                denylisted(strict, &root)
+                    .readable(&root)
+                    .readable(root.join(".ssh/keys")),
+            )
+            .await;
+
+            cat(&sandbox, &root, ".ssh/keys/deploy")
+                .await
+                .unwrap_or_else(|error| panic!("strict={strict}: {error}"));
+            cat(&sandbox, &root, ".ssh/id_ed25519")
+                .await
+                .expect_err("a grant inside a store opened the rest of it");
+        }
+    }
+
+    /// The files the security toggles protect, one in each group.
+    #[cfg(unix)]
+    const TOGGLED_FILES: &[&str] = &[
+        ".ssh/id_ed25519",
+        ".gnupg/private-keys-v1.d/key.key",
+        ".aws/credentials",
+        ".kube/config",
+        ".npmrc",
+        ".cargo/credentials.toml",
+        ".zsh_history",
+        "Library/Keychains/login.keychain-db",
+        "Library/Application Support/Google/Chrome/Default/Cookies",
+    ];
+
+    /// A sandbox with the strict toggles and no denylist, in the three shapes of
+    /// filesystem policy: reads only inside grants, reads everywhere, and
+    /// writes everywhere.
+    #[cfg(unix)]
+    const TOGGLE_MODES: [(bool, bool); 3] = [(true, false), (false, false), (false, true)];
+
+    #[cfg(unix)]
+    fn toggled(strict: bool, writable: bool) -> SandboxConfigBuilder<DenyAll> {
+        SandboxConfigBuilder::default()
+            .filesystem_strict(strict)
+            .writable_file_system(writable)
+            .security(SecurityConfig::strict())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grant_of_a_directory_does_not_open_what_the_security_toggles_protect() {
+        for (strict, writable) in TOGGLE_MODES {
+            let mut files = TOGGLED_FILES.to_vec();
+            files.push("notes.txt");
+            let home = home_with(&files);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(toggled(strict, writable).readable(&root)).await;
+
+            for protected in TOGGLED_FILES {
+                cat(&sandbox, &root, protected).await.expect_err(&format!(
+                    "strict={strict} writable={writable}: a grant reopened {protected}"
+                ));
+            }
+            cat(&sandbox, &root, "notes.txt")
+                .await
+                .unwrap_or_else(|error| panic!("strict={strict} writable={writable}: {error}"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grant_naming_what_the_security_toggles_protect_opens_it() {
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(TOGGLED_FILES);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let named = [
+                ".ssh",
+                ".aws/credentials",
+                "Library/Keychains",
+                "Library/Application Support/Google/Chrome/Default",
+            ];
+            let mut builder = toggled(strict, writable);
+            for path in named {
+                builder = builder.readable(root.join(path));
+            }
+            let sandbox = start(builder).await;
+
+            for opened in [
+                ".ssh/id_ed25519",
+                ".aws/credentials",
+                "Library/Keychains/login.keychain-db",
+                "Library/Application Support/Google/Chrome/Default/Cookies",
+            ] {
+                cat(&sandbox, &root, opened).await.unwrap_or_else(|error| {
+                    panic!("strict={strict} writable={writable}: {opened}: {error}")
+                });
+            }
+            for still_protected in [".gnupg/private-keys-v1.d/key.key", ".kube/config", ".npmrc"] {
+                cat(&sandbox, &root, still_protected)
+                    .await
+                    .expect_err("a grant opened a location it does not name");
+            }
+        }
     }
 
     #[tokio::test]

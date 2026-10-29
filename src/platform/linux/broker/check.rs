@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::SandboxConfigData;
 use crate::error::Result;
+use crate::platform::linux::landlock_rules;
 use crate::policy::{Pattern, Resolved};
 
 /// A device and inode number.
@@ -34,6 +35,11 @@ struct WriteRules {
 #[derive(Debug, Default)]
 pub(crate) struct Guard {
     read_trees: Vec<PathBuf>,
+    /// The paths the configuration names, under every name they have. One that
+    /// is, or lies inside, a read tree opens the part of it that it names.
+    named: Vec<PathBuf>,
+    /// The locations the security toggles protect, wherever they are found.
+    protected: Vec<Pattern>,
     read_guarded_parents: Vec<PathBuf>,
     write: WriteRules,
     inodes: HashSet<InodeId>,
@@ -160,6 +166,14 @@ impl Guard {
             ..Self::default()
         };
 
+        let named: Vec<PathBuf> = landlock_rules::plan(config)
+            .into_iter()
+            .filter(|rule| rule.grant)
+            .map(|rule| std::fs::canonicalize(&rule.path).unwrap_or(rule.path))
+            .collect();
+        guard.named = expand(&named, &mounts);
+        guard.protected = landlock_rules::protected_patterns(config);
+
         if let Some(read) = config.read_denylist() {
             let resolved = read.resolve()?;
             guard.reads_denied = true;
@@ -201,12 +215,25 @@ impl Guard {
 
     /// Whether any denial is configured, so that opens that only read matter.
     pub(crate) fn watches_reads(&self) -> bool {
-        self.reads_denied
+        self.reads_denied || !self.protected.is_empty()
     }
 
-    /// Whether `path` is below a credential store.
+    /// Whether `path` is below a credential store that nothing named opens for
+    /// it: a path the configuration names, at or inside the store, opens the
+    /// part of the store beneath it.
     pub(crate) fn read_denied(&self, path: &Path) -> bool {
-        self.read_trees.iter().any(|tree| path.starts_with(tree))
+        let opened = |names: &dyn Fn(&Path) -> bool| {
+            self.named
+                .iter()
+                .any(|named| path.starts_with(named) && names(named))
+        };
+        self.read_trees
+            .iter()
+            .any(|tree| path.starts_with(tree) && !opened(&|named| named.starts_with(tree)))
+            || self
+                .protected
+                .iter()
+                .any(|pattern| pattern.matches(path) && !opened(&|named| pattern.matches(named)))
     }
 
     /// Whether the name `path` may not be created, changed or given to
@@ -403,6 +430,70 @@ mod tests {
         assert!(guard.read_denied(&root.join(".aws/credentials")));
         assert!(guard.write_denied(&root.join(".aws/credentials")));
         assert!(!guard.read_denied(&root.join(".zshrc")));
+    }
+
+    #[test]
+    fn a_path_the_configuration_names_opens_the_part_of_a_store_it_names() {
+        let home = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        for relative in [".ssh/keys", ".aws"] {
+            std::fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        let (_, data, _) = SandboxConfig::builder()
+            .read_denylist(ReadDenylist::credentials().home(&root))
+            .readable(&root)
+            .readable(root.join(".ssh/keys"))
+            .build()
+            .into_parts();
+        let guard = Guard::new(&data, HashSet::new(), Vec::new()).unwrap();
+
+        // A grant of the directory holding the stores opens none of them.
+        assert!(guard.read_denied(&root.join(".aws/credentials")));
+        assert!(guard.read_denied(&root.join(".ssh/id_ed25519")));
+        // A grant inside a store opens what it names and nothing else.
+        assert!(!guard.read_denied(&root.join(".ssh/keys/id")));
+        assert!(!guard.read_denied(&root.join("notes.txt")));
+    }
+
+    #[test]
+    fn the_security_toggles_protect_by_name_wherever_a_grant_reaches() {
+        let home = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(root.join("project/.ssh")).unwrap();
+        let (_, data, _) = SandboxConfig::builder()
+            .readable(&root)
+            .readable(root.join("project/.ssh"))
+            .build()
+            .into_parts();
+        let guard = Guard::new(&data, HashSet::new(), Vec::new()).unwrap();
+
+        assert!(guard.watches_reads());
+        assert!(guard.read_denied(&root.join(".aws/credentials")));
+        assert!(guard.read_denied(&root.join(".npmrc")));
+        assert!(!guard.read_denied(&root.join("notes.txt")));
+        // The grant naming a store opens it.
+        assert!(!guard.read_denied(&root.join("project/.ssh/id")));
+        assert!(guard.read_denied(&root.join(".ssh/id")));
+    }
+
+    #[test]
+    fn a_grant_naming_a_store_opens_it_but_not_a_store_denied_inside_it() {
+        let home = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(root.join(".ssh/inner")).unwrap();
+        let (_, data, _) = SandboxConfig::builder()
+            .read_denylist(
+                ReadDenylist::credentials()
+                    .home(&root)
+                    .deny(root.join(".ssh/inner")),
+            )
+            .readable(root.join(".ssh"))
+            .build()
+            .into_parts();
+        let guard = Guard::new(&data, HashSet::new(), Vec::new()).unwrap();
+
+        assert!(!guard.read_denied(&root.join(".ssh/id_ed25519")));
+        assert!(guard.read_denied(&root.join(".ssh/inner/secret")));
     }
 
     #[test]

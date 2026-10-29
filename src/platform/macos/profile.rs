@@ -9,6 +9,7 @@ use crate::denial::denial_tag;
 use crate::error::{Error, Result};
 use crate::grant::Grant;
 use crate::policy::{Pattern, Resolved};
+use crate::security::SecurityConfig;
 
 /// A Python virtual environment as the template sees it.
 struct VenvRules {
@@ -59,15 +60,113 @@ impl std::fmt::Display for PathFilter {
 /// loop rather than of how three separate loops happen to be arranged.
 struct GrantRules {
     path: String,
+    canonical: PathBuf,
     filter: PathFilter,
     writable: bool,
     executable: bool,
+}
+
+/// A path the profile allows, as the protections have to see it.
+struct Opening {
+    filter: PathFilter,
+    /// The canonical path.
+    path: PathBuf,
+    /// The path escaped for an SBPL string.
+    escaped: String,
+}
+
+/// Every path the profile allows, which is what the protections may not
+/// swallow when a path names the thing they protect.
+struct Openings {
+    granted: Vec<Opening>,
+    /// The directories above the granted paths, allowed as literals so that
+    /// resolving into a granted path works.
+    ancestors: Vec<Opening>,
+}
+
+impl Openings {
+    /// No path is allowed, so nothing is opened by name.
+    fn none() -> Self {
+        Self {
+            granted: Vec::new(),
+            ancestors: Vec::new(),
+        }
+    }
+
+    fn new(granted: Vec<Opening>) -> Result<Self> {
+        let mut paths: Vec<PathBuf> = granted
+            .iter()
+            .flat_map(|opening| {
+                opening
+                    .path
+                    .ancestors()
+                    .skip(1)
+                    .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let ancestors = paths
+            .into_iter()
+            .map(|path| {
+                Ok(Opening {
+                    filter: PathFilter::Literal,
+                    escaped: escape_path(&path)?,
+                    path,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { granted, ancestors })
+    }
+
+    /// The `require-not` clauses that leave a protection of `names` open where
+    /// a granted path is, or lies inside, a protected location, and the
+    /// directories on the way to it.
+    ///
+    /// A grant of a directory that only contains a protected location is not
+    /// among them.
+    fn opened_by_name(&self, names: impl Fn(&Path) -> bool) -> Vec<String> {
+        self.granted
+            .iter()
+            .chain(&self.ancestors)
+            .filter(|opening| names(&opening.path))
+            .map(|opening| format!("(require-not ({} \"{}\"))", opening.filter, opening.escaped))
+            .collect()
+    }
+}
+
+/// `filter` without the places `exemptions` name.
+fn excluding(filter: String, exemptions: &[String]) -> String {
+    if exemptions.is_empty() {
+        filter
+    } else {
+        format!("(require-all {filter} {})", exemptions.join(" "))
+    }
+}
+
+/// The deny filters for the locations the enabled toggles protect.
+fn protected_rules(security: &SecurityConfig, openings: &Openings) -> Vec<String> {
+    security
+        .protected_locations()
+        .map(|location| {
+            let pattern = Pattern::anywhere(location);
+            excluding(
+                format!("(regex #\"{}\")", quote_regex(&pattern.regex(true))),
+                &openings.opened_by_name(|path| pattern.matches(path)),
+            )
+        })
+        .collect()
 }
 
 /// A host protection policy as the template sees it: every path already
 /// resolved and escaped, every filter already written.
 struct HostRules {
     trees: Vec<String>,
+    /// The filter denying each of `trees`, less the granted paths that name a
+    /// location inside it.
+    tree_filters: Vec<String>,
     /// Complete filters for the entries found beneath any directory.
     anywhere: Vec<String>,
     /// Complete filters for the directories that contain those entries.
@@ -78,8 +177,9 @@ struct HostRules {
 
 impl HostRules {
     /// Render `resolved`, leaving the any-directory entries alone beneath each
-    /// of its exemptions.
-    fn new(resolved: &Resolved) -> Result<Self> {
+    /// of its exemptions and each tree alone where a granted path names a
+    /// location inside it.
+    fn new(resolved: &Resolved, openings: &Openings) -> Result<Self> {
         let exemptions = resolved
             .exempt
             .iter()
@@ -89,13 +189,12 @@ impl HostRules {
                     escape_path(path)?
                 ))
             })
-            .collect::<Result<Vec<_>>>()?
-            .join(" ");
+            .collect::<Result<Vec<_>>>()?;
         let guard = |pattern: &Pattern, filter: String| {
-            if exemptions.is_empty() || !pattern.is_anywhere() {
-                filter
+            if pattern.is_anywhere() {
+                excluding(filter, &exemptions)
             } else {
-                format!("(require-all {filter} {exemptions})")
+                filter
             }
         };
 
@@ -116,12 +215,26 @@ impl HostRules {
             }
         }
 
+        let trees = resolved
+            .trees
+            .iter()
+            .map(|path| escape_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        let tree_filters = resolved
+            .trees
+            .iter()
+            .zip(&trees)
+            .map(|(tree, escaped)| {
+                excluding(
+                    format!("(subpath \"{escaped}\")"),
+                    &openings.opened_by_name(|path| path.starts_with(tree)),
+                )
+            })
+            .collect();
+
         Ok(Self {
-            trees: resolved
-                .trees
-                .iter()
-                .map(|path| escape_path(path))
-                .collect::<Result<_>>()?,
+            trees,
+            tree_filters,
             anywhere,
             anywhere_parents,
             sockets: resolved
@@ -154,12 +267,6 @@ struct SandboxProfile {
     // Security protection flags
     protect_user_home: bool,
     allow_tcc_prompts: bool,
-    protect_credentials: bool,
-    protect_cloud_config: bool,
-    protect_browser_data: bool,
-    protect_keychain: bool,
-    protect_shell_history: bool,
-    protect_package_credentials: bool,
     // Hardware access flags
     allow_gpu: bool,
     allow_npu: bool,
@@ -171,6 +278,7 @@ struct SandboxProfile {
     // Host protection
     audit: String,
     deny_keychain_services: bool,
+    protected: Vec<String>,
     read_rules: Option<HostRules>,
     write_rules: Option<HostRules>,
 }
@@ -181,9 +289,11 @@ struct SandboxProfile {
 /// is `None` the profile denies all outbound connections in the kernel.
 pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<String> {
     let security = config.security();
+    let grants = grant_rules(config.grants())?;
+    let openings = openings(config, &grants)?;
 
-    let mut template = SandboxProfile {
-        grants: grant_rules(config.grants())?,
+    let template = SandboxProfile {
+        grants,
         working_dir: sbpl_path(config.working_dir())?,
         ipc_bin_dir: config.ipc_bin_dir().map(sbpl_path).transpose()?,
         ipc_socket_dir: config
@@ -219,12 +329,6 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
         filesystem_strict: config.filesystem_strict(),
         protect_user_home: security.protect_user_home(),
         allow_tcc_prompts: security.allow_tcc_prompts(),
-        protect_credentials: security.protect_credentials(),
-        protect_cloud_config: security.protect_cloud_config(),
-        protect_browser_data: security.protect_browser_data(),
-        protect_keychain: security.protect_keychain(),
-        protect_shell_history: security.protect_shell_history(),
-        protect_package_credentials: security.protect_package_credentials(),
         allow_gpu: security.allow_gpu(),
         allow_npu: security.allow_npu(),
         allow_hardware: security.allow_hardware(),
@@ -235,17 +339,21 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
             escape_str(&denial_tag(config.working_dir()))
         ),
         deny_keychain_services: security.protect_keychain() || config.read_denylist().is_some(),
+        protected: protected_rules(security, &openings),
         read_rules: config
             .read_denylist()
-            .map(|denylist| HostRules::new(&denylist.resolve()?))
+            .map(|denylist| HostRules::new(&denylist.resolve()?, &openings))
             .transpose()?,
         write_rules: config
             .write_denylist()
-            .map(|denylist| HostRules::new(&denylist.resolve()?))
+            .map(|denylist| HostRules::new(&denylist.resolve()?, &Openings::none()))
             .transpose()?,
-        traversal_paths: Vec::new(),
+        traversal_paths: openings
+            .ancestors
+            .iter()
+            .map(|ancestor| ancestor.escaped.clone())
+            .collect(),
     };
-    template.traversal_paths = traversal_paths(&template);
 
     let profile = template.render()?;
 
@@ -260,37 +368,42 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
     Ok(profile)
 }
 
-/// Every ancestor directory of every granted path.
+/// Every path the profile allows: the configured grants, and the directories
+/// the sandbox itself needs.
 ///
 /// A protection rule that covers an ancestor of a granted path makes that path
 /// unreachable even though the path itself is allowed: the kernel refuses to
 /// resolve through the denied component, so `chdir` into an allowed directory
-/// fails. Re-allowing each ancestor as a literal restores traversal while
-/// leaving its other children denied.
-fn traversal_paths(profile: &SandboxProfile) -> Vec<String> {
-    let granted = profile
-        .grants
-        .iter()
-        .map(|grant| &grant.path)
-        .chain(std::iter::once(&profile.working_dir))
-        .chain(profile.ipc_bin_dir.iter())
-        .chain(profile.ipc_socket_dir.iter())
-        .chain(profile.python_venv.iter().map(|venv| &venv.path));
+/// fails. [`Openings`] therefore also carries the ancestors, which the profile
+/// re-allows as literals, leaving their other children denied.
+fn openings(config: &SandboxConfigData, grants: &[GrantRules]) -> Result<Openings> {
+    let subpath = |path: &Path| -> Result<Opening> {
+        let path = canonical_path(path)?;
+        Ok(Opening {
+            filter: PathFilter::Subpath,
+            escaped: escape_path(&path)?,
+            path,
+        })
+    };
 
-    let mut ancestors: Vec<String> = granted
-        .flat_map(|path| {
-            Path::new(path)
-                .ancestors()
-                .skip(1)
-                .filter(|ancestor| !ancestor.as_os_str().is_empty())
-                .map(|ancestor| ancestor.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
+    let mut granted: Vec<Opening> = grants
+        .iter()
+        .map(|grant| Opening {
+            filter: grant.filter,
+            path: grant.canonical.clone(),
+            escaped: grant.path.clone(),
         })
         .collect();
-
-    ancestors.sort_unstable();
-    ancestors.dedup();
-    ancestors
+    granted.push(subpath(config.working_dir())?);
+    for path in config
+        .ipc_bin_dir()
+        .into_iter()
+        .chain(config.ipc_socket().and_then(Path::parent))
+        .chain(config.python().map(|python| python.venv().path()))
+    {
+        granted.push(subpath(path)?);
+    }
+    Openings::new(granted)
 }
 
 /// Canonicalize a path and escape it for an SBPL string literal.
@@ -322,6 +435,7 @@ fn grant_rules(grants: &[Grant]) -> Result<Vec<GrantRules>> {
             Ok(GrantRules {
                 filter: PathFilter::for_path(&canonical)?,
                 path: escape_path(&canonical)?,
+                canonical,
                 writable: grant.access().can_write(),
                 executable: grant.access().can_execute(),
             })
@@ -670,6 +784,32 @@ mod tests {
         assert!(
             grant < zshrc,
             "the write denial must follow the grants:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn a_credential_rule_is_narrowed_only_by_a_grant_that_names_the_credential() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir(&ssh).expect("creates");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+
+        let (enclosing, _dir) = prepared_config(SandboxConfig::builder().readable(&root).build());
+        let profile = generate_profile(&enclosing, None).unwrap();
+        assert!(
+            profile.contains(r#"(deny file-read* (regex #"/\.ssh(/|$)") (with message"#),
+            "a grant of the enclosing directory must not narrow the rule:\n{profile}"
+        );
+
+        let (named, _dir) = prepared_config(SandboxConfig::builder().readable(&ssh).build());
+        let profile = generate_profile(&named, None).unwrap();
+        let ssh = std::fs::canonicalize(&ssh).unwrap();
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-read* (require-all (regex #"/\.ssh(/|$)") (require-not (subpath "{0}")))"#,
+                ssh.display()
+            )),
+            "the grant naming the store must be left out of its rule:\n{profile}"
         );
     }
 

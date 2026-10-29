@@ -107,6 +107,67 @@ security_toggles! {
     allow_hardware,
 }
 
+/// A protection toggle and the locations it protects.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+type Protection = (fn(&SecurityConfig) -> bool, &'static [&'static str]);
+
+/// The sensitive locations each protection toggle closes to reads, found
+/// beneath any directory (`Library/Keychains` is `<anything>/Library/Keychains`).
+///
+/// This is the one table behind the toggles; each backend that enforces them
+/// reads it through [`SecurityConfig::protected_locations`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PROTECTIONS: &[Protection] = &[
+    (SecurityConfig::protect_credentials, &[".ssh", ".gnupg"]),
+    (
+        SecurityConfig::protect_cloud_config,
+        &[".aws", ".kube", ".docker", ".gcloud", ".azure"],
+    ),
+    (
+        SecurityConfig::protect_browser_data,
+        &[
+            "Library/Application Support/Google/Chrome",
+            "Library/Application Support/Firefox",
+            "Library/Application Support/Microsoft Edge",
+            "Library/Safari",
+            "Library/Cookies",
+        ],
+    ),
+    (SecurityConfig::protect_keychain, &["Library/Keychains"]),
+    (
+        SecurityConfig::protect_shell_history,
+        &[
+            ".bash_history",
+            ".zsh_history",
+            ".fish_history",
+            ".local/share/fish/fish_history",
+        ],
+    ),
+    (
+        SecurityConfig::protect_package_credentials,
+        &[
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+            ".gem/credentials",
+        ],
+    ),
+];
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl SecurityConfig {
+    /// The locations the enabled protections close to reads, as relative paths
+    /// found beneath any directory.
+    pub(crate) fn protected_locations(&self) -> impl Iterator<Item = &'static str> + '_ {
+        PROTECTIONS
+            .iter()
+            .filter(|(enabled, _)| enabled(self))
+            .flat_map(|(_, locations)| locations.iter().copied())
+    }
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self::strict()

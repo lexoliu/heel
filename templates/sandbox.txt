@@ -10,10 +10,14 @@
 ; profile is therefore laid out in three passes:
 ;
 ;   1. baseline    - broad allows that make a process able to run at all
-;   2. protections - denies for sensitive data and for writable-then-executable
+;   2. protections - denies for user data and for writable-then-executable
 ;                    locations
 ;   3. user rules  - explicitly configured paths, which come last so that an
-;                    explicit allow always beats a default protection
+;                    explicit allow beats the protections of pass 2
+;   4. host        - credential stores and keys, and persistence locations. They
+;                    follow every grant, so a grant of a directory that merely
+;                    contains one cannot reopen it. For a credential location
+;                    only, a grant naming it, or a path inside it, does.
 ;
 ; Moving a rule between passes changes what the sandbox enforces.
 ; =============================================================================
@@ -151,7 +155,8 @@
 ; PASS 2: PROTECTIONS
 ;
 ; Patterns are anchored to directory or file boundaries so that "/\.ssh(/|$)"
-; matches "/.ssh/" and a trailing "/.ssh" but not "not.ssh.txt".
+; matches "/.ssh/" and a trailing "/.ssh" but not "not.ssh.txt". The protections
+; of the credential toggles are in pass 4.
 ; =============================================================================
 
 ; --- No exec from anywhere the sandboxed process can write ---
@@ -192,50 +197,13 @@
 (deny file-read* (regex #"/Users/[^/]+/Music(/|$)") {{ audit }})
 {% endif %}
 {% endif %}
-{% if protect_credentials %}
-; SSH/GPG credentials
-(deny file-read* (regex #"/\.ssh(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.gnupg(/|$)") {{ audit }})
-{% endif %}
-{% if protect_cloud_config %}
-; Cloud provider configuration
-(deny file-read* (regex #"/\.aws(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.kube(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.docker(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.gcloud(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.azure(/|$)") {{ audit }})
-{% endif %}
-{% if protect_browser_data %}
-; Browser cookies, history and passwords
-(deny file-read* (regex #"/Library/Application Support/Google/Chrome(/|$)") {{ audit }})
-(deny file-read* (regex #"/Library/Application Support/Firefox(/|$)") {{ audit }})
-(deny file-read* (regex #"/Library/Application Support/Microsoft Edge(/|$)") {{ audit }})
-(deny file-read* (regex #"/Library/Safari(/|$)") {{ audit }})
-(deny file-read* (regex #"/Library/Cookies(/|$)") {{ audit }})
-{% endif %}
-{% if protect_keychain %}
-; System keychain
-(deny file-read* (regex #"/Library/Keychains(/|$)") {{ audit }})
-{% endif %}
-{% if protect_shell_history %}
-; Shell history files
-(deny file-read* (regex #"/\.(bash_history|zsh_history|fish_history)$") {{ audit }})
-(deny file-read* (regex #"/\.local/share/fish/fish_history$") {{ audit }})
-{% endif %}
-{% if protect_package_credentials %}
-; Package manager credentials
-(deny file-read* (regex #"/\.netrc$") {{ audit }})
-(deny file-read* (regex #"/\.npmrc$") {{ audit }})
-(deny file-read* (regex #"/\.pypirc$") {{ audit }})
-(deny file-read* (regex #"/\.cargo/credentials(\.toml)?$") {{ audit }})
-(deny file-read* (regex #"/\.gem/credentials$") {{ audit }})
-{% endif %}
 
 ; =============================================================================
 ; PASS 3: USER-CONFIGURED PATHS
 ;
-; These come last so that an explicitly configured path always wins over the
-; protections above. Every path here has been canonicalized by the profile
+; These come last so that an explicitly configured path wins over the
+; protections above. The credential and persistence protections of pass 4 still
+; follow them. Every path here has been canonicalized by the profile
 ; generator: SBPL matches resolved paths, so "/tmp/x" would never match the
 ; kernel's "/private/tmp/x".
 ; =============================================================================
@@ -312,14 +280,23 @@
 ; =============================================================================
 ; PASS 4: HOST PROTECTION
 ;
-; These come after every grant, so nothing a caller grants can reopen them, and
-; the denials are the tagged kind so that they are reported.
+; These come after every grant, so a grant of a directory that contains one
+; cannot reopen it. A granted path that is, or lies inside, a credential location
+; is the exception: it is left out of the rule that protects the location. The
+; denials are the tagged kind so that they are reported.
 ; =============================================================================
+
+; Sensitive locations the security toggles protect, wherever they are found.
+{% for filter in protected %}
+(deny file-read* {{ filter }} {{ audit }})
+{% endfor %}
 {% if let Some(read) = read_rules %}
 ; Credential stores and keys: not readable, and not movable out of the way, since
 ; a directory renamed to a new name would be readable again under it.
+{% for filter in read.tree_filters %}
+(deny file-read* {{ filter }} {{ audit }})
+{% endfor %}
 {% for tree in read.trees %}
-(deny file-read* (subpath "{{ tree }}") {{ audit }})
 (deny file-write-unlink (subpath "{{ tree }}") {{ audit }})
 {% endfor %}
 {% for parent in read.guarded_parents %}

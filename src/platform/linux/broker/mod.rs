@@ -331,7 +331,10 @@ impl Broker {
         proxy_port: Option<u16>,
         sink: Arc<DenialSink>,
     ) -> Result<Option<(Self, PreparedRuleset)>> {
-        let denylists = config.read_denylist().is_some() || config.write_denylist().is_some();
+        let protected = landlock_rules::protected_patterns(config);
+        let denylists = config.read_denylist().is_some()
+            || config.write_denylist().is_some()
+            || !protected.is_empty();
         if !denylists && proxy_port.is_none() {
             return Ok(None);
         }
@@ -341,7 +344,7 @@ impl Broker {
         let abi = REQUIRED_ABI;
         let (sandbox_ruleset, guard, pool, broker_rules, coverage) = if denylists {
             let plan = landlock_rules::plan(config);
-            let denied: Vec<PathBuf> = match config.read_denylist() {
+            let mut denied: Vec<PathBuf> = match config.read_denylist() {
                 Some(read) => {
                     let resolved = read.resolve()?;
                     resolved
@@ -352,6 +355,7 @@ impl Broker {
                 }
                 None => Vec::new(),
             };
+            denied.extend(landlock_rules::find_protected(&plan, &protected));
             let carved = landlock_rules::carve(plan.clone(), &denied, abi)?;
             let sandbox_rules = without_writes(&carved.rules, abi);
             let mut sandbox_ruleset = landlock_rules::instantiate(&sandbox_rules, proxy_port, abi)?;
@@ -386,6 +390,7 @@ impl Broker {
                     path: directory,
                     access: landlock::AccessFs::from_all(abi),
                     required: true,
+                    grant: false,
                 });
             }
             let coverage = Coverage {
