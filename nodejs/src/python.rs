@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use heel::ResolvedPath;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -9,7 +10,8 @@ use napi_derive::napi;
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct VenvConfigJs {
-    /// Where the environment lives.
+    /// Where the environment lives. It must exist; the path is resolved once, when the sandbox is created,
+    /// and a path crossing a link that a sandbox could have planted is refused.
     pub path: Option<String>,
     /// Interpreter used to create the environment.
     pub python: Option<String>,
@@ -22,12 +24,9 @@ pub struct VenvConfigJs {
 }
 
 impl VenvConfigJs {
-    pub fn into_rust(self) -> Result<heel::VenvConfig> {
-        let mut builder = heel::VenvConfig::builder();
-
-        if let Some(path) = self.path {
-            builder = builder.path(PathBuf::from(path));
-        }
+    /// Build the configuration around `path`, the environment's resolved location.
+    pub fn into_rust(self, path: &ResolvedPath) -> Result<heel::VenvConfig> {
+        let mut builder = heel::VenvConfig::builder().path(path.as_path());
         if let Some(python) = self.python {
             builder = builder.python(PathBuf::from(python));
         }
@@ -65,12 +64,29 @@ pub struct PythonConfigJs {
 }
 
 impl PythonConfigJs {
-    pub fn into_rust(self) -> Result<heel::PythonConfig> {
+    /// Where the environment lives, before resolution: the configured path, or
+    /// the library's default when none is given.
+    pub fn venv_path(&self) -> PathBuf {
+        self.venv
+            .as_ref()
+            .and_then(|venv| venv.path.clone())
+            .map_or_else(
+                || heel::VenvConfig::default().path().to_path_buf(),
+                PathBuf::from,
+            )
+    }
+
+    /// Whether the sandbox may write the environment.
+    pub fn writes_environment(&self) -> bool {
+        self.allow_pip_install
+            .unwrap_or_else(|| heel::PythonConfig::default().allow_pip_install())
+    }
+
+    /// Build the configuration around `venv_path`, the environment's resolved location.
+    pub fn into_rust(self, venv_path: &ResolvedPath) -> Result<heel::PythonConfig> {
         let mut builder = heel::PythonConfig::builder();
 
-        if let Some(venv) = self.venv {
-            builder = builder.venv(venv.into_rust()?);
-        }
+        builder = builder.venv(self.venv.unwrap_or_default().into_rust(venv_path)?);
         if let Some(enabled) = self.allow_pip_install {
             builder = builder.allow_pip_install(enabled);
         }

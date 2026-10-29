@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use heel::{Access, Grant, SecurityOverrides};
+use heel::{Access, SecurityOverrides};
 use serde::Deserialize;
 
 use crate::error::CliError;
@@ -400,12 +400,6 @@ impl FromStr for GrantArg {
                 source,
             })?,
         })
-    }
-}
-
-impl From<&GrantArg> for Grant {
-    fn from(arg: &GrantArg) -> Self {
-        Self::new(&arg.path, arg.access)
     }
 }
 

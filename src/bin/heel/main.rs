@@ -81,11 +81,13 @@ async fn run(cli: Cli) -> CliResult<i32> {
     match cli.command {
         Commands::Run(args) => {
             let config = configure(&args.common)?;
-            commands::run::execute(args, config).await
+            let paths = config.resolve_paths().await?;
+            commands::run::execute(args, config, paths).await
         }
         Commands::Shell(args) => {
             let config = configure(&args.common)?;
-            commands::shell::execute(args, config).await
+            let paths = config.resolve_paths().await?;
+            commands::shell::execute(args, config, paths).await
         }
         Commands::Python(args) => {
             let config = configure(&args.common)?;

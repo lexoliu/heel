@@ -33,6 +33,8 @@ pub mod linux;
 
 pub(crate) mod child;
 
+pub(crate) mod unresolved;
+
 #[cfg(unix)]
 pub(crate) mod preexec;
 

@@ -85,7 +85,7 @@ pub(crate) fn ensure_persistent_grants(
     let mut declared = Vec::<RecordedGrant>::new();
 
     for grant in identity.persistent_grants() {
-        let path = acl::resolve(grant.path()).map_err(Win32Failure::io_at(
+        let path = acl::unredirected_name(grant.path()).map_err(Win32Failure::grant_at(
             "resolve persistent grant",
             grant.path(),
         ))?;
@@ -106,7 +106,7 @@ pub(crate) fn ensure_persistent_grants(
             if ancestor.parent().is_none() {
                 continue;
             }
-            let name = acl::resolve(ancestor).map_err(Win32Failure::io_at(
+            let name = acl::unredirected_name(ancestor).map_err(Win32Failure::grant_at(
                 "resolve persistent grant ancestor",
                 ancestor,
             ))?;
@@ -180,7 +180,7 @@ pub(crate) fn ensure_persistent_grants(
             if ancestor.parent().is_none() {
                 continue;
             }
-            let name = acl::resolve(ancestor).map_err(Win32Failure::io_at(
+            let name = acl::unredirected_name(ancestor).map_err(Win32Failure::grant_at(
                 "resolve persistent grant ancestor",
                 ancestor,
             ))?;
@@ -195,7 +195,7 @@ pub(crate) fn ensure_persistent_grants(
                 write_records(&record_path, &record)?;
             }
             container::grant_persistent_ancestor(profile, ancestor_path).map_err(
-                Win32Failure::io_at("grant persistent ancestor", ancestor_path),
+                Win32Failure::grant_at("grant persistent ancestor", ancestor_path),
             )?;
         }
 
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn json_record_round_trips() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
+        let directory = crate::platform::unresolved::resolved_tempdir();
         let path = directory.path().join(RECORD_NAME);
         let record = Record {
             grants: vec![RecordedGrant {
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn malformed_json_record_names_its_file() {
-        let directory = tempfile::tempdir().expect("a temporary directory");
+        let directory = crate::platform::unresolved::resolved_tempdir();
         let path = directory.path().join(RECORD_NAME);
         fs::write(&path, b"{").expect("the malformed record is written");
 

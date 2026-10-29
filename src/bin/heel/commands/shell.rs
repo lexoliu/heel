@@ -1,11 +1,15 @@
 use crate::cli::ShellArgs;
-use crate::config::MergedConfig;
+use crate::config::{MergedConfig, ResolvedPaths};
 use crate::error::CliResult;
 use crate::sandbox::create_sandbox;
 
 /// Start an interactive shell in the sandbox, returning its exit code.
-pub async fn execute(args: ShellArgs, config: MergedConfig) -> CliResult<i32> {
-    let mut sandbox = create_sandbox(&config).await?;
+pub async fn execute(
+    args: ShellArgs,
+    config: MergedConfig,
+    paths: ResolvedPaths,
+) -> CliResult<i32> {
+    let mut sandbox = create_sandbox(&config, &paths).await?;
     if config.keep_working_dir {
         sandbox.keep_working_dir();
     }

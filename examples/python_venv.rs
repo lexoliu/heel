@@ -12,8 +12,11 @@ use heel::{PythonConfig, Sandbox, SandboxConfig, VenvConfig, VenvManager};
 async fn main() -> heel::Result<()> {
     tracing_subscriber::fmt::init();
 
+    // The sandbox takes a resolved path, and the temporary directory is a link
+    // on some systems, so resolve it before naming the environment.
+    let temp = std::fs::canonicalize(std::env::temp_dir())?;
     let venv = VenvConfig::builder()
-        .path(std::env::temp_dir().join("heel-example-venv"))
+        .path(temp.join("heel-example-venv"))
         .build();
     VenvManager::create(&venv).await?;
 

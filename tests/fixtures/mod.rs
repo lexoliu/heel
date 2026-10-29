@@ -2,6 +2,22 @@
 
 use std::path::{Path, PathBuf};
 
+/// A temporary directory at the path a test must grant: already resolved.
+///
+/// The sandbox never resolves a grant, so a platform whose temp directory sits
+/// behind a link (`/var` on macOS) hands it the resolved path.
+pub fn tempdir() -> tempfile::TempDir {
+    let root = dunce::canonicalize(std::env::temp_dir()).expect("the temp directory resolves");
+    tempfile::Builder::new()
+        .tempdir_in(root)
+        .expect("a temporary directory")
+}
+
+/// A path the test has just made, as the resolved path a grant takes.
+pub fn resolved(path: impl AsRef<Path>) -> heel::ResolvedPath {
+    heel::ResolvedPath::new(path).expect("the path is resolved")
+}
+
 pub fn compile(dir: &Path, source: &str, name: &str) -> PathBuf {
     let binary = dir
         .join(name)
@@ -87,7 +103,7 @@ pub mod host {
 
     /// A home directory holding a file at each of `relative`.
     pub fn home_with(relative: &[&str]) -> tempfile::TempDir {
-        let home = tempfile::tempdir().unwrap();
+        let home = super::tempdir();
         for path in relative {
             let path = home.path().join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
