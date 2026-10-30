@@ -309,6 +309,7 @@
 ; moved or removed, and nothing is made under its name at all — a prepared tree
 ; renamed into one is a create SBPL cannot tell from a plain `mkdir`.
 {% for parent in guarded %}
+(deny file-write* (literal "{{ parent }}") {{ audit }})
 (deny file-write-unlink (literal "{{ parent }}") {{ audit }})
 (deny file-write-create (literal "{{ parent }}") {{ audit }})
 {% endfor %}
@@ -334,11 +335,13 @@
 (deny file-write-unlink {{ filter }} {{ audit }})
 {% endfor %}
 {% for parent in write.guarded_parents %}
+(deny file-write* (literal "{{ parent }}") {{ audit }})
 (deny file-write-unlink (literal "{{ parent }}") {{ audit }})
 (deny file-write-create (literal "{{ parent }}") {{ audit }})
 {% endfor %}
 {% for filter in write.anywhere_parents %}
 (deny file-write-unlink {{ filter }} {{ audit }})
+(deny file-write-create {{ filter }} {{ audit }})
 {% endfor %}
 {% endif %}
 

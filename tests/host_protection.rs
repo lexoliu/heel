@@ -1146,6 +1146,84 @@ mod macos_protections {
     }
 
     #[tokio::test]
+    async fn a_prepared_git_directory_cannot_be_moved_into_a_repo() {
+        // `.git` and the directories above the user-site packages are guarded
+        // names too: a prepared tree moved into one is a create at the name.
+        let home = home_with(&["repo/src/lib.rs"]);
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir(root.join(".local")).unwrap();
+        let sandbox = start(
+            SandboxConfigBuilder::default()
+                .writable(fixtures::resolved(&root))
+                .write_denylist(WriteDenylist::persistence().home(&root)),
+        )
+        .await;
+        let at = root.display();
+
+        for script in [
+            format!("mkdir '{at}/z' && mkdir '{at}/z/hooks' && mv '{at}/z' '{at}/repo/.git'"),
+            format!("mkdir '{at}/prepared' && mv '{at}/prepared' '{at}/.local/lib'"),
+        ] {
+            let output = sh(&sandbox, &script).await;
+            assert!(!output.status.success(), "{script}");
+        }
+        assert!(!root.join("repo/.git").exists());
+        assert!(!root.join(".local/lib").exists());
+    }
+
+    #[tokio::test]
+    async fn a_read_only_grant_inside_a_store_does_not_open_it_for_writing() {
+        // A grant that reads a credential store opens exactly that: writes,
+        // renames and new entries under it stay denied.
+        let home = home_with(&[".ssh/id_ed25519"]);
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let sandbox = start(
+            toggled(false, true)
+                .readable(fixtures::resolved(root.join(".ssh")))
+                .read_denylist(ReadDenylist::credentials().home(&root)),
+        )
+        .await;
+        let at = root.display();
+
+        cat(&sandbox, &root, ".ssh/id_ed25519")
+            .await
+            .expect("the readable grant opens the file");
+
+        for script in [
+            format!("echo x > '{at}/.ssh/new_key'"),
+            format!("echo x >> '{at}/.ssh/id_ed25519'"),
+            format!("mv '{at}/.ssh' '{at}/x'"),
+        ] {
+            is_refused(&sandbox, &script, "read-only grant").await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join(".ssh/id_ed25519")).unwrap(),
+            "secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guarded_directory_cannot_have_its_attributes_changed() {
+        // Renames and creates are not the whole of a change: flags and modes
+        // on a guarded directory are refused as well.
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&[".ssh/id_ed25519"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            for script in [
+                format!("chmod 777 '{at}'"),
+                format!("chflags uchg '{at}/.ssh'"),
+                format!("xattr -w k v '{at}/.ssh'"),
+            ] {
+                is_refused(&sandbox, &script, &what).await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn the_same_name_outside_the_configured_home_stays_ordinary() {
         // Reads stay protected wherever a name matches, but a project's `.cargo`
         // or `.npmrc` is the sandbox's to create, change, remove and rename.

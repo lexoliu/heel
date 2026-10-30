@@ -75,6 +75,9 @@ struct Opening {
     path: PathBuf,
     /// The path escaped for an SBPL string.
     escaped: String,
+    /// Whether the opening also permits writing; a read-only grant does not
+    /// reopen a protected location to changes.
+    writable: bool,
 }
 
 /// Every path the profile allows, which is what the protections may not
@@ -109,6 +112,7 @@ impl Openings {
                     filter: PathFilter::Literal,
                     escaped: escape_path(&path)?,
                     path,
+                    writable: false,
                 })
             })
             .collect::<Result<_>>()?;
@@ -130,13 +134,14 @@ impl Openings {
             .collect()
     }
 
-    /// The same clauses for the granted paths alone, which is what leaves a
-    /// protected location open to being changed: the directories on the way to a
-    /// grant are only walked through.
+    /// The same clauses for the writable granted paths alone, which is what
+    /// leaves a protected location open to being changed: a grant that only
+    /// reads the location does not reopen it, and the directories on the way to
+    /// a grant are only walked through.
     fn opened_by_grant(&self, names: impl Fn(&Path) -> bool) -> Vec<String> {
         self.granted
             .iter()
-            .filter(|opening| names(&opening.path))
+            .filter(|opening| opening.writable && names(&opening.path))
             .map(Opening::exemption)
             .collect()
     }
@@ -373,24 +378,27 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
 
     // The planting and move rules anchor at the configured home: the read
     // denylist's when it names one, the write denylist's otherwise, and the
-    // invoking user's home when neither says.
-    let home = crate::policy::resolved_home(
-        config
-            .read_denylist()
-            .and_then(|denylist| denylist.configured_home())
-            .or_else(|| {
-                config
-                    .write_denylist()
-                    .and_then(|denylist| denylist.configured_home())
-            }),
-    )?;
-
-    let mut protected = Vec::new();
+    // invoking user's home when neither says. It is resolved only when a
+    // toggle protects a location, so a home-less environment fails only the
+    // configurations that needed it.
     let mut anchored = Vec::new();
-    for location in security.protected_locations() {
-        let path = crate::policy::resolve_lenient(&home.join(location))?;
-        protected.push(ProtectedRule::for_toggle(location, &path, &openings)?);
-        anchored.push(path);
+    let mut protected = Vec::new();
+    if security.protected_locations().next().is_some() {
+        let home = crate::policy::resolved_home(
+            config
+                .read_denylist()
+                .and_then(|denylist| denylist.configured_home())
+                .or_else(|| {
+                    config
+                        .write_denylist()
+                        .and_then(|denylist| denylist.configured_home())
+                }),
+        )?;
+        for location in security.protected_locations() {
+            let path = crate::policy::resolve_lenient(&home.join(location))?;
+            protected.push(ProtectedRule::for_toggle(location, &path, &openings)?);
+            anchored.push(path);
+        }
     }
     if let Some(resolved) = &read_resolved {
         for tree in &resolved.trees {
@@ -488,6 +496,7 @@ fn openings(config: &SandboxConfigData, grants: &[GrantRules]) -> Result<Opening
             filter: PathFilter::Subpath,
             escaped: escape_path(path)?,
             path: path.to_path_buf(),
+            writable: true,
         })
     };
 
@@ -497,6 +506,7 @@ fn openings(config: &SandboxConfigData, grants: &[GrantRules]) -> Result<Opening
             filter: grant.filter,
             path: grant.resolved.clone(),
             escaped: grant.path.clone(),
+            writable: grant.writable,
         })
         .collect();
     granted.push(subpath(config.working_dir())?);
