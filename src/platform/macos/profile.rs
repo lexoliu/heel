@@ -88,14 +88,6 @@ struct Openings {
 }
 
 impl Openings {
-    /// No path is allowed, so nothing is opened by name.
-    fn none() -> Self {
-        Self {
-            granted: Vec::new(),
-            ancestors: Vec::new(),
-        }
-    }
-
     fn new(granted: Vec<Opening>) -> Result<Self> {
         let mut paths: Vec<PathBuf> = granted
             .iter()
@@ -135,8 +127,43 @@ impl Openings {
             .iter()
             .chain(&self.ancestors)
             .filter(|opening| names(&opening.path))
-            .map(|opening| format!("(require-not ({} \"{}\"))", opening.filter, opening.escaped))
+            .map(Opening::exemption)
             .collect()
+    }
+
+    /// The same clauses for the granted paths alone, which is what leaves a
+    /// protected location open to being changed: the directories on the way to a
+    /// grant are only walked through.
+    fn opened_by_grant(&self, names: impl Fn(&Path) -> bool) -> Vec<String> {
+        self.granted
+            .iter()
+            .filter(|opening| names(&opening.path))
+            .map(Opening::exemption)
+            .collect()
+    }
+
+    /// The directories on the way to a grant inside a protected location. They
+    /// can be walked through and not listed, so a grant of `.ssh/keys` does not
+    /// show the other names in `.ssh`.
+    fn walked_through(&self, names: impl Fn(&Path) -> bool) -> Vec<String> {
+        self.ancestors
+            .iter()
+            .filter(|ancestor| {
+                names(&ancestor.path)
+                    && !self
+                        .granted
+                        .iter()
+                        .any(|opening| ancestor.path.starts_with(&opening.path))
+            })
+            .map(|ancestor| ancestor.escaped.clone())
+            .collect()
+    }
+}
+
+impl Opening {
+    /// The clause that leaves this path out of a rule.
+    fn exemption(&self) -> String {
+        format!("(require-not ({} \"{}\"))", self.filter, self.escaped)
     }
 }
 
@@ -149,27 +176,66 @@ fn excluding(filter: String, exemptions: &[String]) -> String {
     }
 }
 
-/// The deny filters for the locations the enabled toggles protect.
-fn protected_rules(security: &SecurityConfig, openings: &Openings) -> Vec<String> {
+/// The denials of one protected location, as the template sees them.
+struct ProtectedRule {
+    /// What is not readable: the location and everything in it, less the
+    /// granted paths that name it or lie inside it, and the ways to them.
+    reads: String,
+    /// What is not created, replaced, linked or removed: the same, less the
+    /// granted paths alone. A name planted in the location, or the location moved
+    /// out of its name, would be readable under another one.
+    changes: String,
+    /// The directories on the way to a grant inside the location, whose entries
+    /// are not listed.
+    listings: Vec<String>,
+    /// Filters for the directories that lead to the location. They are not moved
+    /// or removed, and nothing but a plain directory is made under their names.
+    parents: Vec<String>,
+}
+
+impl ProtectedRule {
+    /// The rule for a location `pattern` names.
+    fn for_pattern(pattern: &Pattern, openings: &Openings) -> Self {
+        let names = |path: &Path| pattern.matches(path);
+        let location = format!("(regex #\"{}\")", quote_regex(&pattern.regex(true)));
+        Self {
+            reads: excluding(location.clone(), &openings.opened_by_name(names)),
+            changes: excluding(location, &openings.opened_by_grant(names)),
+            listings: openings.walked_through(names),
+            parents: pattern
+                .guarded_parents()
+                .iter()
+                .map(|parent| format!("(regex #\"{}\")", quote_regex(&parent.regex(false))))
+                .collect(),
+        }
+    }
+
+    /// The rule for a tree an embedder's denylist names.
+    fn for_tree(tree: &Path, escaped: &str, openings: &Openings) -> Self {
+        let names = |path: &Path| path.starts_with(tree);
+        let location = format!("(subpath \"{escaped}\")");
+        Self {
+            reads: excluding(location.clone(), &openings.opened_by_name(names)),
+            changes: excluding(location, &openings.opened_by_grant(names)),
+            listings: openings.walked_through(names),
+            parents: Vec::new(),
+        }
+    }
+}
+
+/// The rules for the locations the enabled toggles protect.
+fn protected_rules(security: &SecurityConfig, openings: &Openings) -> Vec<ProtectedRule> {
     security
         .protected_locations()
-        .map(|location| {
-            let pattern = Pattern::anywhere(location);
-            excluding(
-                format!("(regex #\"{}\")", quote_regex(&pattern.regex(true))),
-                &openings.opened_by_name(|path| pattern.matches(path)),
-            )
-        })
+        .map(|location| ProtectedRule::for_pattern(&Pattern::anywhere(location), openings))
         .collect()
 }
 
 /// A host protection policy as the template sees it: every path already
 /// resolved and escaped, every filter already written.
 struct HostRules {
+    /// The escaped path of each tree, which is a path and everything beneath it.
     trees: Vec<String>,
-    /// The filter denying each of `trees`, less the granted paths that name a
-    /// location inside it.
-    tree_filters: Vec<String>,
     /// Complete filters for the entries found beneath any directory.
     anywhere: Vec<String>,
     /// Complete filters for the directories that contain those entries.
@@ -180,9 +246,8 @@ struct HostRules {
 
 impl HostRules {
     /// Render `resolved`, leaving the any-directory entries alone beneath each
-    /// of its exemptions and each tree alone where a granted path names a
-    /// location inside it.
-    fn new(resolved: &Resolved, openings: &Openings) -> Result<Self> {
+    /// of its exemptions.
+    fn new(resolved: &Resolved) -> Result<Self> {
         let exemptions = resolved
             .exempt
             .iter()
@@ -218,26 +283,12 @@ impl HostRules {
             }
         }
 
-        let trees = resolved
-            .trees
-            .iter()
-            .map(|path| escape_path(path))
-            .collect::<Result<Vec<_>>>()?;
-        let tree_filters = resolved
-            .trees
-            .iter()
-            .zip(&trees)
-            .map(|(tree, escaped)| {
-                excluding(
-                    format!("(subpath \"{escaped}\")"),
-                    &openings.opened_by_name(|path| path.starts_with(tree)),
-                )
-            })
-            .collect();
-
         Ok(Self {
-            trees,
-            tree_filters,
+            trees: resolved
+                .trees
+                .iter()
+                .map(|path| escape_path(path))
+                .collect::<Result<_>>()?,
             anywhere,
             anywhere_parents,
             sockets: resolved
@@ -281,7 +332,7 @@ struct SandboxProfile {
     // Host protection
     audit: String,
     deny_keychain_services: bool,
-    protected: Vec<String>,
+    protected: Vec<ProtectedRule>,
     read_rules: Option<HostRules>,
     write_rules: Option<HostRules>,
 }
@@ -294,6 +345,22 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
     let security = config.security();
     let grants = grant_rules(config.grants())?;
     let openings = openings(config, &grants)?;
+
+    let mut protected = protected_rules(security, &openings);
+    let read_rules = match config.read_denylist() {
+        Some(denylist) => {
+            let resolved = denylist.resolve()?;
+            for tree in &resolved.trees {
+                protected.push(ProtectedRule::for_tree(
+                    tree,
+                    &escape_path(tree)?,
+                    &openings,
+                ));
+            }
+            Some(HostRules::new(&resolved)?)
+        }
+        None => None,
+    };
 
     let template = SandboxProfile {
         grants,
@@ -338,14 +405,11 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
             escape_str(&denial_tag(config.working_dir()))
         ),
         deny_keychain_services: security.protect_keychain() || config.read_denylist().is_some(),
-        protected: protected_rules(security, &openings),
-        read_rules: config
-            .read_denylist()
-            .map(|denylist| HostRules::new(&denylist.resolve()?, &openings))
-            .transpose()?,
+        protected,
+        read_rules,
         write_rules: config
             .write_denylist()
-            .map(|denylist| HostRules::new(&denylist.resolve()?, &Openings::none()))
+            .map(|denylist| HostRules::new(&denylist.resolve()?))
             .transpose()?,
         traversal_paths: openings
             .ancestors
@@ -898,6 +962,112 @@ mod tests {
             )),
             "the grant naming the store must be left out of its rule:\n{profile}"
         );
+    }
+
+    #[test]
+    fn a_protected_location_cannot_be_planted_linked_or_moved_unless_a_grant_names_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let ssh = root.join(".ssh");
+        std::fs::create_dir(&ssh).expect("creates");
+
+        let (enclosing, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(root.clone()))
+                .build(),
+        );
+        let profile = generate_profile(&enclosing, None).unwrap();
+        for operation in ["file-write-create", "file-write-unlink"] {
+            assert!(
+                profile.contains(&format!(
+                    r#"(deny {operation} (regex #"/\.ssh(/|$)") (with message"#
+                )),
+                "a writable grant of the enclosing directory must not reopen {operation}:\n{profile}"
+            );
+        }
+        // The directories that lead to a multi-component location are not moved or
+        // removed, and no link is made under their names.
+        assert!(
+            profile.contains(r#"(deny file-write-unlink (regex #"/\.cargo$") (with message"#),
+            "{profile}"
+        );
+        assert!(
+            profile.contains(
+                r#"(deny file-write-create (require-all (regex #"/\.cargo$") (require-not (vnode-type DIRECTORY)))"#
+            ),
+            "{profile}"
+        );
+
+        let (named, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(root.clone()))
+                .writable(grant_path(ssh.clone()))
+                .build(),
+        );
+        let profile = generate_profile(&named, None).unwrap();
+        for operation in ["file-write-create", "file-write-unlink"] {
+            assert!(
+                profile.contains(&format!(
+                    r#"(deny {operation} (require-all (regex #"/\.ssh(/|$)") (require-not (subpath "{0}")))"#,
+                    ssh.display()
+                )),
+                "the grant naming the store must be left out of {operation}:\n{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grant_inside_a_store_walks_through_the_store_without_listing_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let keys = root.join(".ssh/keys");
+        std::fs::create_dir_all(&keys).expect("creates");
+
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .readable(grant_path(keys.clone()))
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        let listing = format!(
+            "(deny file-read-data (literal \"{}\") (with message",
+            root.join(".ssh").display()
+        );
+        assert!(profile.contains(&listing), "{profile}");
+        assert!(
+            !profile.contains(&format!(
+                "(deny file-read-data (literal \"{}\")",
+                root.display()
+            )),
+            "the directories above the store are listed as before"
+        );
+        // Neither the grant nor a path under it loses its listing.
+        assert!(!profile.contains(&format!(
+            "(deny file-read-data (literal \"{}\")",
+            keys.display()
+        )));
+    }
+
+    #[test]
+    fn a_denylist_tree_is_protected_from_planting_like_a_toggle_location() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(root.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        for operation in ["file-write-create", "file-write-unlink"] {
+            assert!(
+                profile.contains(&format!(
+                    "(deny {operation} (subpath \"{}/.netrc\") (with message",
+                    root.display()
+                )),
+                "{operation}:\n{profile}"
+            );
+        }
     }
 
     #[test]

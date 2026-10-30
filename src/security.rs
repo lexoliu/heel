@@ -108,7 +108,7 @@ security_toggles! {
 }
 
 /// A protection toggle and the locations it protects.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 type Protection = (fn(&SecurityConfig) -> bool, &'static [&'static str]);
 
 /// The sensitive locations each protection toggle closes to reads, found
@@ -116,7 +116,7 @@ type Protection = (fn(&SecurityConfig) -> bool, &'static [&'static str]);
 ///
 /// This is the one table behind the toggles; each backend that enforces them
 /// reads it through [`SecurityConfig::protected_locations`].
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const PROTECTIONS: &[Protection] = &[
     (SecurityConfig::protect_credentials, &[".ssh", ".gnupg"]),
     (
@@ -156,7 +156,7 @@ const PROTECTIONS: &[Protection] = &[
     ),
 ];
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 impl SecurityConfig {
     /// The locations the enabled protections close to reads, as relative paths
     /// found beneath any directory.

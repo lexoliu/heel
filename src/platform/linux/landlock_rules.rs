@@ -20,7 +20,6 @@ use landlock::{
 use crate::config::SandboxConfigData;
 use crate::error::{Error, Result};
 use crate::grant::Access;
-use crate::policy::Pattern;
 
 /// The Landlock ABI this backend requires.
 ///
@@ -125,10 +124,6 @@ pub(crate) struct Planned {
     /// Whether a missing path is an error. A system path that a distribution
     /// lacks is skipped; a path the caller configured is not.
     pub(crate) required: bool,
-    /// Whether the configuration names this path: a grant, or a directory the
-    /// sandbox is given to work in. Such a rule naming a denied path, or a path
-    /// inside one, keeps its rights there; a system rule loses them.
-    pub(crate) grant: bool,
 }
 
 /// Build the ruleset for a sandbox configuration.
@@ -163,7 +158,6 @@ pub(crate) fn plan(config: &SandboxConfigData) -> Vec<Planned> {
                 path: rule.path,
                 access: rule.access,
                 required: true,
-                grant: true,
             }),
     );
     rules
@@ -243,58 +237,6 @@ pub(crate) struct Carved {
     pub(crate) ancestors: Vec<Ancestor>,
 }
 
-/// The patterns of the locations the configuration's security toggles protect,
-/// when there is a grant for them to be carved out of.
-///
-/// Without a grant nothing the sandbox may read can contain one, so no
-/// protection is needed and none is enforced.
-pub(crate) fn protected_patterns(config: &SandboxConfigData) -> Vec<Pattern> {
-    if config.grants().is_empty() {
-        return Vec::new();
-    }
-    config
-        .security()
-        .protected_locations()
-        .map(Pattern::anywhere)
-        .collect()
-}
-
-/// Every existing path beneath a granted rule that one of `patterns` matches.
-///
-/// A matched path is not searched further, and a symbolic link is not followed.
-/// A grant path arrives resolved and verified, and one that cannot be inspected
-/// is an error. A directory below it that cannot be listed is skipped: it cannot
-/// be listed from the sandbox either. Paths the sandbox creates later are the
-/// broker's to judge.
-pub(crate) fn find_protected(rules: &[Planned], patterns: &[Pattern]) -> Result<Vec<PathBuf>> {
-    fn walk(path: &Path, patterns: &[Pattern], found: &mut Vec<PathBuf>) {
-        let Ok(metadata) = std::fs::symlink_metadata(path) else {
-            return;
-        };
-        if patterns.iter().any(|pattern| pattern.matches_exactly(path)) {
-            if !found.iter().any(|known| known == path) {
-                found.push(path.to_path_buf());
-            }
-        } else if metadata.is_dir()
-            && let Ok(entries) = std::fs::read_dir(path)
-        {
-            for entry in entries.flatten() {
-                walk(&entry.path(), patterns, found);
-            }
-        }
-    }
-
-    let mut found = Vec::new();
-    if patterns.is_empty() {
-        return Ok(found);
-    }
-    for rule in rules.iter().filter(|rule| rule.grant) {
-        std::fs::symlink_metadata(&rule.path).map_err(|error| Error::path(&rule.path, error))?;
-        walk(&rule.path, patterns, &mut found);
-    }
-    Ok(found)
-}
-
 /// Remove the right to read, list and execute below each of `denied`.
 ///
 /// Landlock grants and never denies, and a path has the union of the rights of
@@ -303,10 +245,6 @@ pub(crate) fn find_protected(rules: &[Planned], patterns: &[Pattern]) -> Result<
 /// are not on the way to the denied path, and so on down to it. The directories
 /// on the way keep nothing: the entries created in them later have no rule, which
 /// is what the broker's inode pool makes up for.
-///
-/// A grant that names a denied path, or a path inside one, is the exception: it
-/// keeps its rights, and so opens exactly the part of the denied tree it names.
-/// A denied path inside such a grant is carved out of it as usual.
 ///
 /// Symbolic links get no rule of their own, because a rule on one grants its
 /// target. A denied path that does not exist is not carved: nothing can be read
@@ -322,23 +260,17 @@ pub(crate) fn carve(rules: Vec<Planned>, denied: &[PathBuf], abi: ABI) -> Result
         ancestors: Vec::new(),
     };
     for rule in rules {
-        // Denied paths are real paths and rule paths arrive resolved, so they
-        // compare as they are.
-        let location = rule.path.clone();
-        let inside = denied.iter().any(|path| location.starts_with(path));
-        if inside && !rule.grant {
+        if denied.iter().any(|path| rule.path.starts_with(path)) {
             let access = rule.access & !withheld;
             if !access.is_empty() {
                 carved.rules.push(Planned { access, ..rule });
             }
             continue;
         }
-        // A grant inside a denied path opens it, and with it every denied path
-        // it is the path of.
         let below: Vec<&PathBuf> = denied
             .iter()
             .copied()
-            .filter(|path| path.starts_with(&location) && !(inside && **path == location))
+            .filter(|path| path.starts_with(&rule.path))
             .collect();
         if below.is_empty() {
             carved.rules.push(rule);
@@ -351,7 +283,7 @@ pub(crate) fn carve(rules: Vec<Planned>, denied: &[PathBuf], abi: ABI) -> Result
                 ..rule.clone()
             });
         }
-        carve_directory(&location, rule.access, &below, &mut carved)?;
+        carve_directory(&rule.path, rule.access, &below, &mut carved)?;
     }
     Ok(carved)
 }
@@ -399,7 +331,6 @@ fn carve_directory(
                 path,
                 access,
                 required: false,
-                grant: false,
             });
         } else {
             carve_directory(&path, access, &inside, carved)?;
@@ -415,7 +346,6 @@ fn plan_system_rules(rules: &mut Vec<Planned>, config: &SandboxConfigData, abi: 
             path: PathBuf::from(path),
             access,
             required: false,
-            grant: false,
         });
     };
 
@@ -488,14 +418,12 @@ fn plan_system_rules(rules: &mut Vec<Planned>, config: &SandboxConfigData, abi: 
                 path: PathBuf::from(home),
                 access: AccessFs::from_all(abi),
                 required: false,
-                grant: false,
             });
         }
         rules.push(Planned {
             path: PathBuf::from("/home"),
             access: AccessFs::from_all(abi),
             required: false,
-            grant: false,
         });
     }
 }
@@ -507,7 +435,6 @@ fn plan_device_rules(rules: &mut Vec<Planned>, config: &SandboxConfigData, abi: 
             path: PathBuf::from(path),
             access,
             required: false,
-            grant: false,
         });
     };
 
@@ -1016,120 +943,6 @@ mod tests {
                 .iter()
                 .any(|rule| rule.path == directory.path()),
             "the persistent grant is present in the Landlock rules"
-        );
-    }
-
-    fn rule(path: &Path, grant: bool) -> Planned {
-        Planned {
-            path: path.to_path_buf(),
-            access: read_rights(ABI::V4),
-            required: true,
-            grant,
-        }
-    }
-
-    /// The paths of `carved` that keep the right to read.
-    fn readable(carved: &Carved) -> Vec<PathBuf> {
-        carved
-            .rules
-            .iter()
-            .filter(|rule| rule.access.contains(AccessFs::ReadFile))
-            .map(|rule| rule.path.clone())
-            .collect()
-    }
-
-    #[test]
-    fn a_rule_over_a_store_loses_it_but_a_grant_naming_the_store_keeps_it() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let home = fs::canonicalize(home.path()).expect("canonical");
-        fs::create_dir_all(home.join(".ssh/keys")).expect("creates");
-        File::create(home.join("notes.txt")).expect("creates");
-        let ssh = home.join(".ssh");
-
-        // A grant of the directory holding the store reads everything else.
-        let enclosing =
-            carve(vec![rule(&home, true)], std::slice::from_ref(&ssh), ABI::V4).expect("carves");
-        let readable_paths = readable(&enclosing);
-        assert!(readable_paths.contains(&home.join("notes.txt")));
-        assert!(
-            !readable_paths
-                .iter()
-                .any(|path| path.starts_with(&ssh) || ssh.starts_with(path)),
-            "{readable_paths:?}"
-        );
-
-        // A grant naming the store keeps it, and so does one inside it.
-        for named in [ssh.clone(), ssh.join("keys")] {
-            let carved = carve(
-                vec![rule(&home, true), rule(&named, true)],
-                std::slice::from_ref(&ssh),
-                ABI::V4,
-            )
-            .expect("carves");
-            assert!(readable(&carved).contains(&named), "{named:?}");
-        }
-
-        // A system rule over the same path is not a grant and loses it.
-        let system =
-            carve(vec![rule(&ssh, false)], std::slice::from_ref(&ssh), ABI::V4).expect("carves");
-        assert!(readable(&system).is_empty());
-    }
-
-    #[test]
-    fn protected_locations_are_found_beneath_a_grant_and_not_searched_further() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let home = fs::canonicalize(home.path()).expect("canonical");
-        fs::create_dir_all(home.join("project/.ssh/.ssh")).expect("creates");
-        File::create(home.join(".npmrc")).expect("creates");
-        File::create(home.join("notes.txt")).expect("creates");
-        let patterns: Vec<Pattern> = [".ssh", ".npmrc"]
-            .into_iter()
-            .map(Pattern::anywhere)
-            .collect();
-
-        let mut found = find_protected(&[rule(&home, true)], &patterns).expect("finds");
-        found.sort();
-        assert_eq!(found, [home.join(".npmrc"), home.join("project/.ssh")]);
-        assert!(
-            find_protected(&[rule(&home, false)], &patterns)
-                .expect("finds")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn a_grant_that_cannot_be_inspected_is_an_error_not_a_skip() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let home = fs::canonicalize(home.path()).expect("canonical");
-        let patterns = vec![Pattern::anywhere(".ssh")];
-
-        let result = find_protected(&[rule(&home.join("missing"), true)], &patterns);
-        assert!(result.is_err(), "{result:?}");
-    }
-
-    #[test]
-    fn a_denied_path_inside_a_granted_store_is_still_carved_out() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let home = fs::canonicalize(home.path()).expect("canonical");
-        fs::create_dir_all(home.join(".ssh/inner")).expect("creates");
-        File::create(home.join(".ssh/id")).expect("creates");
-        let ssh = home.join(".ssh");
-        let inner = ssh.join("inner");
-
-        let carved = carve(
-            vec![rule(&ssh, true)],
-            &[ssh.clone(), inner.clone()],
-            ABI::V4,
-        )
-        .expect("carves");
-        let readable_paths = readable(&carved);
-        assert!(
-            readable_paths.contains(&ssh.join("id")),
-            "{readable_paths:?}"
-        );
-        assert!(
-            !readable_paths.iter().any(|path| path.starts_with(&inner)),
-            "{readable_paths:?}"
         );
     }
 

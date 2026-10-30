@@ -7,7 +7,7 @@
 ; RULE ORDER MATTERS
 ;
 ; SBPL resolves an operation with the LAST matching rule, not the first. This
-; profile is therefore laid out in three passes:
+; profile is therefore laid out in four passes:
 ;
 ;   1. baseline    - broad allows that make a process able to run at all
 ;   2. protections - denies for user data and for writable-then-executable
@@ -286,21 +286,28 @@
 ; denials are the tagged kind so that they are reported.
 ; =============================================================================
 
-; Sensitive locations the security toggles protect, wherever they are found.
-{% for filter in protected %}
-(deny file-read* {{ filter }} {{ audit }})
+; Credential stores and keys, whether a toggle protects them wherever they are
+; found or the embedder's denylist names them. They are not readable, and they
+; are not created, linked, replaced or moved either: a name planted before the
+; host writes there, or a store renamed out of its name, would be readable under
+; the name the sandbox holds. A directory that leads to one is neither moved nor
+; removed, and only a plain directory is made under its name.
+{% for rule in protected %}
+(deny file-read* {{ rule.reads }} {{ audit }})
+(deny file-write-create {{ rule.changes }} {{ audit }})
+(deny file-write-unlink {{ rule.changes }} {{ audit }})
+{% for listing in rule.listings %}
+(deny file-read-data (literal "{{ listing }}") {{ audit }})
+{% endfor %}
+{% for parent in rule.parents %}
+(deny file-write-unlink {{ parent }} {{ audit }})
+(deny file-write-create (require-all {{ parent }} (require-not (vnode-type DIRECTORY))) {{ audit }})
+{% endfor %}
 {% endfor %}
 {% if let Some(read) = read_rules %}
-; Credential stores and keys: not readable, and not movable out of the way, since
-; a directory renamed to a new name would be readable again under it.
-{% for filter in read.tree_filters %}
-(deny file-read* {{ filter }} {{ audit }})
-{% endfor %}
-{% for tree in read.trees %}
-(deny file-write-unlink (subpath "{{ tree }}") {{ audit }})
-{% endfor %}
 {% for parent in read.guarded_parents %}
 (deny file-write-unlink (literal "{{ parent }}") {{ audit }})
+(deny file-write-create (require-all (literal "{{ parent }}") (require-not (vnode-type DIRECTORY))) {{ audit }})
 {% endfor %}
 ; Agent sockets: not readable and not connectable, whatever the network policy.
 (deny file-read* (regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$") {{ audit }})
