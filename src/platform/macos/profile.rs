@@ -10,7 +10,6 @@ use crate::error::{Error, Result};
 use crate::grant::Grant;
 use crate::platform::unresolved;
 use crate::policy::{Pattern, Resolved};
-use crate::security::SecurityConfig;
 
 /// A Python virtual environment as the template sees it.
 struct VenvRules {
@@ -181,33 +180,37 @@ struct ProtectedRule {
     /// What is not readable: the location and everything in it, less the
     /// granted paths that name it or lie inside it, and the ways to them.
     reads: String,
-    /// What is not created, replaced, linked or removed: the same, less the
-    /// granted paths alone. A name planted in the location, or the location moved
-    /// out of its name, would be readable under another one.
+    /// What is not created, changed, replaced, linked or removed: the location
+    /// under the configured home, less the granted paths alone. A name planted
+    /// in the location, or the location moved out of its name, would be
+    /// readable under another one.
     changes: String,
     /// The directories on the way to a grant inside the location, whose entries
     /// are not listed.
     listings: Vec<String>,
-    /// Filters for the directories that lead to the location. They are not moved
-    /// or removed, and nothing but a plain directory is made under their names.
-    parents: Vec<String>,
 }
 
 impl ProtectedRule {
-    /// The rule for a location `pattern` names.
-    fn for_pattern(pattern: &Pattern, openings: &Openings) -> Self {
-        let names = |path: &Path| pattern.matches(path);
-        let location = format!("(regex #\"{}\")", quote_regex(&pattern.regex(true)));
-        Self {
-            reads: excluding(location.clone(), &openings.opened_by_name(names)),
-            changes: excluding(location, &openings.opened_by_grant(names)),
+    /// The rule for a location a security toggle protects.
+    ///
+    /// Reads are denied wherever the name appears; the planting and move rules
+    /// reach only the location under the configured home, so a project's
+    /// `.cargo` or `.npmrc` stays the sandbox's to create, change and remove.
+    fn for_toggle(location: &str, anchored: &Path, openings: &Openings) -> Result<Self> {
+        let anywhere = Pattern::anywhere(location);
+        let names = |path: &Path| anywhere.matches(path);
+        let granted = |path: &Path| path.starts_with(anchored);
+        Ok(Self {
+            reads: excluding(
+                format!("(regex #\"{}\")", quote_regex(&anywhere.regex(true))),
+                &openings.opened_by_name(names),
+            ),
+            changes: excluding(
+                format!("(subpath \"{}\")", escape_path(anchored)?),
+                &openings.opened_by_grant(granted),
+            ),
             listings: openings.walked_through(names),
-            parents: pattern
-                .guarded_parents()
-                .iter()
-                .map(|parent| format!("(regex #\"{}\")", quote_regex(&parent.regex(false))))
-                .collect(),
-        }
+        })
     }
 
     /// The rule for a tree an embedder's denylist names.
@@ -218,17 +221,31 @@ impl ProtectedRule {
             reads: excluding(location.clone(), &openings.opened_by_name(names)),
             changes: excluding(location, &openings.opened_by_grant(names)),
             listings: openings.walked_through(names),
-            parents: Vec::new(),
         }
     }
 }
 
-/// The rules for the locations the enabled toggles protect.
-fn protected_rules(security: &SecurityConfig, openings: &Openings) -> Vec<ProtectedRule> {
-    security
-        .protected_locations()
-        .map(|location| ProtectedRule::for_pattern(&Pattern::anywhere(location), openings))
-        .collect()
+/// Every directory above `paths` up to the root, escaped for an SBPL literal.
+///
+/// A protected path's rule names the path itself, so it is only as strong as
+/// the names above it: renaming any ancestor puts the denied location under a
+/// name the rules do not cover. Each is therefore refused as a rename or delete
+/// source and as a create destination — a prepared tree moved into a guarded
+/// name is a create SBPL cannot tell from a plain `mkdir`.
+fn ancestors(paths: &[PathBuf]) -> Result<Vec<String>> {
+    let mut all: Vec<PathBuf> = paths
+        .iter()
+        .flat_map(|path| {
+            path.ancestors()
+                .skip(1)
+                .take_while(|ancestor| ancestor.parent().is_some())
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    all.iter().map(|path| escape_path(path)).collect()
 }
 
 /// A host protection policy as the template sees it: every path already
@@ -296,11 +313,7 @@ impl HostRules {
                 .iter()
                 .map(|path| escape_path(path))
                 .collect::<Result<_>>()?,
-            guarded_parents: resolved
-                .guarded_parents
-                .iter()
-                .map(|path| escape_path(path))
-                .collect::<Result<_>>()?,
+            guarded_parents: ancestors(&resolved.trees)?,
         })
     }
 }
@@ -333,6 +346,9 @@ struct SandboxProfile {
     audit: String,
     deny_keychain_services: bool,
     protected: Vec<ProtectedRule>,
+    /// The ancestors of the protected locations, guarded against renames and
+    /// prepared trees moved into their names.
+    guarded: Vec<String>,
     read_rules: Option<HostRules>,
     write_rules: Option<HostRules>,
 }
@@ -346,21 +362,49 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
     let grants = grant_rules(config.grants())?;
     let openings = openings(config, &grants)?;
 
-    let mut protected = protected_rules(security, &openings);
-    let read_rules = match config.read_denylist() {
-        Some(denylist) => {
-            let resolved = denylist.resolve()?;
-            for tree in &resolved.trees {
-                protected.push(ProtectedRule::for_tree(
-                    tree,
-                    &escape_path(tree)?,
-                    &openings,
-                ));
-            }
-            Some(HostRules::new(&resolved)?)
+    let read_resolved = config
+        .read_denylist()
+        .map(|denylist| denylist.resolve())
+        .transpose()?;
+    let write_resolved = config
+        .write_denylist()
+        .map(|denylist| denylist.resolve())
+        .transpose()?;
+
+    // The planting and move rules anchor at the configured home: the read
+    // denylist's when it names one, the write denylist's otherwise, and the
+    // invoking user's home when neither says.
+    let home = crate::policy::resolved_home(
+        config
+            .read_denylist()
+            .and_then(|denylist| denylist.configured_home())
+            .or_else(|| {
+                config
+                    .write_denylist()
+                    .and_then(|denylist| denylist.configured_home())
+            }),
+    )?;
+
+    let mut protected = Vec::new();
+    let mut anchored = Vec::new();
+    for location in security.protected_locations() {
+        let path = crate::policy::resolve_lenient(&home.join(location))?;
+        protected.push(ProtectedRule::for_toggle(location, &path, &openings)?);
+        anchored.push(path);
+    }
+    if let Some(resolved) = &read_resolved {
+        for tree in &resolved.trees {
+            protected.push(ProtectedRule::for_tree(
+                tree,
+                &escape_path(tree)?,
+                &openings,
+            ));
         }
-        None => None,
-    };
+        anchored.extend(resolved.trees.iter().cloned());
+    }
+    let guarded = ancestors(&anchored)?;
+
+    let read_rules = read_resolved.as_ref().map(HostRules::new).transpose()?;
 
     let template = SandboxProfile {
         grants,
@@ -406,11 +450,9 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
         ),
         deny_keychain_services: security.protect_keychain() || config.read_denylist().is_some(),
         protected,
+        guarded,
         read_rules,
-        write_rules: config
-            .write_denylist()
-            .map(|denylist| HostRules::new(&denylist.resolve()?))
-            .transpose()?,
+        write_rules: write_resolved.as_ref().map(HostRules::new).transpose()?,
         traversal_paths: openings
             .ancestors
             .iter()
@@ -971,49 +1013,58 @@ mod tests {
         let ssh = root.join(".ssh");
         std::fs::create_dir(&ssh).expect("creates");
 
+        // The denylist points the configured home at the stand-in, which is
+        // where the planting and move rules apply.
         let (enclosing, _dir) = prepared_config(
             SandboxConfig::builder()
                 .writable(grant_path(root.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
                 .build(),
         );
         let profile = generate_profile(&enclosing, None).unwrap();
-        for operation in ["file-write-create", "file-write-unlink"] {
-            assert!(
-                profile.contains(&format!(
-                    r#"(deny {operation} (regex #"/\.ssh(/|$)") (with message"#
-                )),
-                "a writable grant of the enclosing directory must not reopen {operation}:\n{profile}"
-            );
+        // Reads are denied wherever the name matches; changes are denied at the
+        // location under the configured home.
+        assert!(
+            profile.contains(r#"(deny file-read* (regex #"/\.ssh(/|$)") (with message"#),
+            "a grant of the enclosing directory must not reopen reads:\n{profile}"
+        );
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-write* (subpath "{}/.ssh") (with message"#,
+                root.display()
+            )),
+            "the location under the configured home is not writable:\n{profile}"
+        );
+        // The directories that lead to a multi-component location are not moved,
+        // removed or created, and neither is home itself.
+        for parent in [root.join(".cargo"), root.clone()] {
+            for operation in ["file-write-unlink", "file-write-create"] {
+                assert!(
+                    profile.contains(&format!(
+                        r#"(deny {operation} (literal "{}") (with message"#,
+                        parent.display()
+                    )),
+                    "{operation} on {} is not refused:\n{profile}",
+                    parent.display()
+                );
+            }
         }
-        // The directories that lead to a multi-component location are not moved or
-        // removed, and no link is made under their names.
-        assert!(
-            profile.contains(r#"(deny file-write-unlink (regex #"/\.cargo$") (with message"#),
-            "{profile}"
-        );
-        assert!(
-            profile.contains(
-                r#"(deny file-write-create (require-all (regex #"/\.cargo$") (require-not (vnode-type DIRECTORY)))"#
-            ),
-            "{profile}"
-        );
 
         let (named, _dir) = prepared_config(
             SandboxConfig::builder()
                 .writable(grant_path(root.clone()))
                 .writable(grant_path(ssh.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
                 .build(),
         );
         let profile = generate_profile(&named, None).unwrap();
-        for operation in ["file-write-create", "file-write-unlink"] {
-            assert!(
-                profile.contains(&format!(
-                    r#"(deny {operation} (require-all (regex #"/\.ssh(/|$)") (require-not (subpath "{0}")))"#,
-                    ssh.display()
-                )),
-                "the grant naming the store must be left out of {operation}:\n{profile}"
-            );
-        }
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-write* (require-all (subpath "{0}") (require-not (subpath "{0}")))"#,
+                ssh.display()
+            )),
+            "the grant naming the store must be left out of the write rule:\n{profile}"
+        );
     }
 
     #[test]
@@ -1059,13 +1110,22 @@ mod tests {
                 .build(),
         );
         let profile = generate_profile(&data, None).unwrap();
-        for operation in ["file-write-create", "file-write-unlink"] {
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (subpath \"{}/.netrc\") (with message",
+                root.display()
+            )),
+            "file-write*:\n{profile}"
+        );
+        // Every directory above the tree, home included, is guarded against
+        // renames and creates.
+        for parent in [root.clone(), root.parent().unwrap().to_path_buf()] {
             assert!(
                 profile.contains(&format!(
-                    "(deny {operation} (subpath \"{}/.netrc\") (with message",
-                    root.display()
+                    r#"(deny file-write-unlink (literal "{}") (with message"#,
+                    parent.display()
                 )),
-                "{operation}:\n{profile}"
+                "an ancestor of the tree is not guarded:\n{profile}"
             );
         }
     }

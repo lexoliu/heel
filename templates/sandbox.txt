@@ -287,28 +287,32 @@
 ; =============================================================================
 
 ; Credential stores and keys, whether a toggle protects them wherever they are
-; found or the embedder's denylist names them. They are not readable, and they
-; are not created, linked, replaced or moved either: a name planted before the
-; host writes there, or a store renamed out of its name, would be readable under
-; the name the sandbox holds. A directory that leads to one is neither moved nor
-; removed, and only a plain directory is made under its name.
+; found or the embedder's denylist names them. They are not readable, and under
+; the configured home they are not created, changed, linked, replaced or moved
+; either: a name planted before the host writes there, a store renamed out of
+; its name, or a file's contents overwritten would each be a credential the
+; sandbox made or read. The same names outside the configured home stay
+; ordinary — a project's `.cargo` or `.npmrc` is the sandbox's own — while reads
+; of them stay denied wherever the name matches. `file-write-create` and
+; `file-write-unlink` are their own operations, outside what `file-write*`
+; matches, so each location carries all three denials.
 {% for rule in protected %}
 (deny file-read* {{ rule.reads }} {{ audit }})
+(deny file-write* {{ rule.changes }} {{ audit }})
 (deny file-write-create {{ rule.changes }} {{ audit }})
 (deny file-write-unlink {{ rule.changes }} {{ audit }})
 {% for listing in rule.listings %}
 (deny file-read-data (literal "{{ listing }}") {{ audit }})
 {% endfor %}
-{% for parent in rule.parents %}
-(deny file-write-unlink {{ parent }} {{ audit }})
-(deny file-write-create (require-all {{ parent }} (require-not (vnode-type DIRECTORY))) {{ audit }})
 {% endfor %}
+; The directories above a protected location, home and above included: none is
+; moved or removed, and nothing is made under its name at all — a prepared tree
+; renamed into one is a create SBPL cannot tell from a plain `mkdir`.
+{% for parent in guarded %}
+(deny file-write-unlink (literal "{{ parent }}") {{ audit }})
+(deny file-write-create (literal "{{ parent }}") {{ audit }})
 {% endfor %}
 {% if let Some(read) = read_rules %}
-{% for parent in read.guarded_parents %}
-(deny file-write-unlink (literal "{{ parent }}") {{ audit }})
-(deny file-write-create (require-all (literal "{{ parent }}") (require-not (vnode-type DIRECTORY))) {{ audit }})
-{% endfor %}
 ; Agent sockets: not readable and not connectable, whatever the network policy.
 (deny file-read* (regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$") {{ audit }})
 (deny network-outbound (remote unix-socket (path-regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$")) {{ audit }})
@@ -321,12 +325,17 @@
 ; removable, since a prepared lookalike moved into their name would stand in.
 {% for tree in write.trees %}
 (deny file-write* (subpath "{{ tree }}") {{ audit }})
+(deny file-write-create (subpath "{{ tree }}") {{ audit }})
+(deny file-write-unlink (subpath "{{ tree }}") {{ audit }})
 {% endfor %}
 {% for filter in write.anywhere %}
 (deny file-write* {{ filter }} {{ audit }})
+(deny file-write-create {{ filter }} {{ audit }})
+(deny file-write-unlink {{ filter }} {{ audit }})
 {% endfor %}
 {% for parent in write.guarded_parents %}
 (deny file-write-unlink (literal "{{ parent }}") {{ audit }})
+(deny file-write-create (literal "{{ parent }}") {{ audit }})
 {% endfor %}
 {% for filter in write.anywhere_parents %}
 (deny file-write-unlink {{ filter }} {{ audit }})

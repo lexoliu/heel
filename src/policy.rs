@@ -30,6 +30,8 @@ use std::path::PathBuf;
 mod resolve;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use resolve::{Pattern, Resolved};
+#[cfg(target_os = "macos")]
+pub(crate) use resolve::{resolve_lenient, resolved_home};
 
 /// Paths a sandbox must not read: credential stores and keys.
 ///
@@ -103,6 +105,12 @@ impl ReadDenylist {
     pub fn extra(&self) -> &[PathBuf] {
         &self.extra
     }
+
+    /// The home the table resolves against, when the embedder set one.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn configured_home(&self) -> Option<&std::path::Path> {
+        self.home.as_deref()
+    }
 }
 
 /// Paths a sandbox must not write: places where a write persists as code that
@@ -112,9 +120,10 @@ impl ReadDenylist {
 /// [`WriteDenylist::deny`]. Pass it to
 /// [`SandboxConfigBuilder::write_denylist`](crate::SandboxConfigBuilder::write_denylist).
 ///
-/// The denial covers creating, changing, renaming and removing, and the
-/// directories that contain a denied location cannot be renamed away and
-/// replaced with a lookalike either. Everything else keeps the writability the
+/// The denial covers creating, changing, renaming and removing, and every
+/// directory above a denied location, home and above included, cannot be
+/// renamed away and replaced with a lookalike either. Everything else keeps the
+/// writability the
 /// grants and [`SandboxConfigBuilder::writable_file_system`](crate::SandboxConfigBuilder::writable_file_system)
 /// give it.
 ///
@@ -191,5 +200,11 @@ impl WriteDenylist {
     /// The directories the `.git/hooks` rule leaves alone.
     pub fn exempt(&self) -> &[PathBuf] {
         &self.exempt
+    }
+
+    /// The home the table resolves against, when the embedder set one.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn configured_home(&self) -> Option<&std::path::Path> {
+        self.home.as_deref()
     }
 }
