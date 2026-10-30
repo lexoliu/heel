@@ -15,10 +15,12 @@
 //! Both tables are fixed in code. An embedder can add paths to a policy, never
 //! remove one: a policy that could be narrowed from configuration would be a
 //! setting rather than a boundary. Both are enforced after every grant, so a
-//! grant of a directory that contains a denied location does not reopen it. The
-//! one exception is on the read side: a grant that names a credential store, or a
-//! path inside one, opens what it names, because the embedder that wrote it
-//! asked for exactly that. Persistence locations are never reopened.
+//! grant of a directory that contains a denied location does not reopen it. On
+//! macOS a grant that names a credential store, or a path inside one, opens
+//! what it names, because the embedder that wrote it asked for exactly that —
+//! and only a writable grant opens it to changes; Linux keeps every denied
+//! location denied, grant or not. Persistence locations are never reopened on
+//! either platform.
 //!
 //! The macOS and Linux backends enforce them. A sandbox configured with either
 //! policy on a platform whose backend cannot (Windows) fails when it is

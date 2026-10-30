@@ -490,13 +490,13 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
 /// fails. [`Openings`] therefore also carries the ancestors, which the profile
 /// re-allows as literals, leaving their other children denied.
 fn openings(config: &SandboxConfigData, grants: &[GrantRules]) -> Result<Openings> {
-    let subpath = |path: &Path| -> Result<Opening> {
+    let subpath = |path: &Path, writable: bool| -> Result<Opening> {
         unresolved::verify(path)?;
         Ok(Opening {
             filter: PathFilter::Subpath,
             escaped: escape_path(path)?,
             path: path.to_path_buf(),
-            writable: true,
+            writable,
         })
     };
 
@@ -509,14 +509,16 @@ fn openings(config: &SandboxConfigData, grants: &[GrantRules]) -> Result<Opening
             writable: grant.writable,
         })
         .collect();
-    granted.push(subpath(config.working_dir())?);
+    granted.push(subpath(config.working_dir(), true)?);
     for path in config
         .ipc_bin_dir()
         .into_iter()
         .chain(config.ipc_socket().and_then(Path::parent))
-        .chain(config.python().map(|python| python.venv().path()))
     {
-        granted.push(subpath(path)?);
+        granted.push(subpath(path, true)?);
+    }
+    if let Some(python) = config.python() {
+        granted.push(subpath(python.venv().path(), python.allow_pip_install())?);
     }
     Openings::new(granted)
 }
@@ -1204,6 +1206,34 @@ mod tests {
         assert!(
             !profile.contains(&format!("(subpath \"{}\") (with message", clones.display())),
             "an exemption must not turn into a rule of its own"
+        );
+    }
+
+    #[test]
+    fn a_read_only_venv_does_not_narrow_a_change_denial() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let venv = root.join(".ssh/venv");
+        std::fs::create_dir_all(&venv).unwrap();
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(root.clone()))
+                .python(
+                    crate::PythonConfig::builder()
+                        .venv(crate::config::VenvConfig::builder().path(&venv).build())
+                        .build(),
+                )
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        let changes = profile
+            .lines()
+            .find(|line| line.contains("file-write*") && line.contains(".ssh"))
+            .expect("the .ssh change denial");
+        assert!(
+            !changes.contains("require-not"),
+            "a read-only venv must not exempt the store: {changes}"
         );
     }
 
