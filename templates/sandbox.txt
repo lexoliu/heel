@@ -7,13 +7,17 @@
 ; RULE ORDER MATTERS
 ;
 ; SBPL resolves an operation with the LAST matching rule, not the first. This
-; profile is therefore laid out in three passes:
+; profile is therefore laid out in four passes:
 ;
 ;   1. baseline    - broad allows that make a process able to run at all
-;   2. protections - denies for sensitive data and for writable-then-executable
+;   2. protections - denies for user data and for writable-then-executable
 ;                    locations
 ;   3. user rules  - explicitly configured paths, which come last so that an
-;                    explicit allow always beats a default protection
+;                    explicit allow beats the protections of pass 2
+;   4. host        - credential stores and keys, and persistence locations. They
+;                    follow every grant, so a grant of a directory that merely
+;                    contains one cannot reopen it. For a credential location
+;                    only, a grant naming it, or a path inside it, does.
 ;
 ; Moving a rule between passes changes what the sandbox enforces.
 ; =============================================================================
@@ -151,7 +155,8 @@
 ; PASS 2: PROTECTIONS
 ;
 ; Patterns are anchored to directory or file boundaries so that "/\.ssh(/|$)"
-; matches "/.ssh/" and a trailing "/.ssh" but not "not.ssh.txt".
+; matches "/.ssh/" and a trailing "/.ssh" but not "not.ssh.txt". The protections
+; of the credential toggles are in pass 4.
 ; =============================================================================
 
 ; --- No exec from anywhere the sandboxed process can write ---
@@ -192,51 +197,14 @@
 (deny file-read* (regex #"/Users/[^/]+/Music(/|$)") {{ audit }})
 {% endif %}
 {% endif %}
-{% if protect_credentials %}
-; SSH/GPG credentials
-(deny file-read* (regex #"/\.ssh(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.gnupg(/|$)") {{ audit }})
-{% endif %}
-{% if protect_cloud_config %}
-; Cloud provider configuration
-(deny file-read* (regex #"/\.aws(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.kube(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.docker(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.gcloud(/|$)") {{ audit }})
-(deny file-read* (regex #"/\.azure(/|$)") {{ audit }})
-{% endif %}
-{% if protect_browser_data %}
-; Browser cookies, history and passwords
-(deny file-read* (regex #"/Library/Application Support/Google/Chrome(/|$)") {{ audit }})
-(deny file-read* (regex #"/Library/Application Support/Firefox(/|$)") {{ audit }})
-(deny file-read* (regex #"/Library/Application Support/Microsoft Edge(/|$)") {{ audit }})
-(deny file-read* (regex #"/Library/Safari(/|$)") {{ audit }})
-(deny file-read* (regex #"/Library/Cookies(/|$)") {{ audit }})
-{% endif %}
-{% if protect_keychain %}
-; System keychain
-(deny file-read* (regex #"/Library/Keychains(/|$)") {{ audit }})
-{% endif %}
-{% if protect_shell_history %}
-; Shell history files
-(deny file-read* (regex #"/\.(bash_history|zsh_history|fish_history)$") {{ audit }})
-(deny file-read* (regex #"/\.local/share/fish/fish_history$") {{ audit }})
-{% endif %}
-{% if protect_package_credentials %}
-; Package manager credentials
-(deny file-read* (regex #"/\.netrc$") {{ audit }})
-(deny file-read* (regex #"/\.npmrc$") {{ audit }})
-(deny file-read* (regex #"/\.pypirc$") {{ audit }})
-(deny file-read* (regex #"/\.cargo/credentials(\.toml)?$") {{ audit }})
-(deny file-read* (regex #"/\.gem/credentials$") {{ audit }})
-{% endif %}
 
 ; =============================================================================
 ; PASS 3: USER-CONFIGURED PATHS
 ;
-; These come last so that an explicitly configured path always wins over the
-; protections above. Every path here is absolute, already resolved and verified
-; by the profile generator to contain no link: SBPL matches resolved paths, so
+; These come last so that an explicitly configured path wins over the
+; protections above. The credential and persistence protections of pass 4 still
+; follow them. Every path here is absolute, already resolved and verified by the
+; profile generator to contain no link: SBPL matches resolved paths, so
 ; "/tmp/x" would never match the kernel's "/private/tmp/x".
 ; =============================================================================
 
@@ -312,18 +280,54 @@
 ; =============================================================================
 ; PASS 4: HOST PROTECTION
 ;
-; These come after every grant, so nothing a caller grants can reopen them, and
-; the denials are the tagged kind so that they are reported.
+; These come after every grant, so a grant of a directory that contains one
+; cannot reopen it. A granted path that is, or lies inside, a credential location
+; is the exception: it is left out of the rule that protects the location. The
+; denials are the tagged kind so that they are reported.
 ; =============================================================================
-{% if let Some(read) = read_rules %}
-; Credential stores and keys: not readable, and not movable out of the way, since
-; a directory renamed to a new name would be readable again under it.
-{% for tree in read.trees %}
-(deny file-read* (subpath "{{ tree }}") {{ audit }})
-(deny file-write-unlink (subpath "{{ tree }}") {{ audit }})
+
+; Credential stores and keys, each anchored to a real location: a security
+; toggle protects only the place under the configured home — `~/.ssh`, never
+; every `.ssh` the sandbox meets — and an embedder's denylist protects the
+; trees it names. Each is not readable, and not created, changed, linked,
+; replaced or moved either: a name planted before the host writes there, a
+; store renamed out of its name, or a file's contents overwritten would each
+; be a credential the sandbox made or read. The same names everywhere else
+; stay ordinary — a project's `.cargo`, `.docker` or `.npmrc` is the sandbox's
+; own. `file-write-create` and `file-write-unlink` are their own operations,
+; outside what `file-write*` matches, so each location carries all three
+; denials.
+{% for rule in protected %}
+(deny file-read* {{ rule.reads }} {{ audit }})
+(deny file-write* {{ rule.changes }} {{ audit }})
+(deny file-write-create {{ rule.changes }} {{ audit }})
+(deny file-write-unlink {{ rule.changes }} {{ audit }})
+{% for listing in rule.listings %}
+(deny file-read-data (literal "{{ listing }}") {{ audit }})
 {% endfor %}
-{% for parent in read.guarded_parents %}
+{% endfor %}
+; The directories above a protected location, home and above included: none is
+; moved or removed, and nothing is made under its name at all — a prepared tree
+; renamed into one is a create SBPL cannot tell from a plain `mkdir`.
+{% for parent in guarded %}
+(deny file-write* (literal "{{ parent }}") {{ audit }})
 (deny file-write-unlink (literal "{{ parent }}") {{ audit }})
+(deny file-write-create (literal "{{ parent }}") {{ audit }})
+{% endfor %}
+{% if let Some(read) = read_rules %}
+; Denylist patterns are not anchored to the home: an embedder that denies
+; `.git/hooks` or `.env` names it wherever it is found, so its reads and
+; changes are refused at any path, and the directories above it cannot be
+; renamed out from under the pattern.
+{% for filter in read.anywhere %}
+(deny file-read* {{ filter }} {{ audit }})
+(deny file-write* {{ filter }} {{ audit }})
+(deny file-write-create {{ filter }} {{ audit }})
+(deny file-write-unlink {{ filter }} {{ audit }})
+{% endfor %}
+{% for filter in read.anywhere_parents %}
+(deny file-write-unlink {{ filter }} {{ audit }})
+(deny file-write-create {{ filter }} {{ audit }})
 {% endfor %}
 ; Agent sockets: not readable and not connectable, whatever the network policy.
 (deny file-read* (regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$") {{ audit }})
@@ -337,15 +341,22 @@
 ; removable, since a prepared lookalike moved into their name would stand in.
 {% for tree in write.trees %}
 (deny file-write* (subpath "{{ tree }}") {{ audit }})
+(deny file-write-create (subpath "{{ tree }}") {{ audit }})
+(deny file-write-unlink (subpath "{{ tree }}") {{ audit }})
 {% endfor %}
 {% for filter in write.anywhere %}
 (deny file-write* {{ filter }} {{ audit }})
+(deny file-write-create {{ filter }} {{ audit }})
+(deny file-write-unlink {{ filter }} {{ audit }})
 {% endfor %}
 {% for parent in write.guarded_parents %}
+(deny file-write* (literal "{{ parent }}") {{ audit }})
 (deny file-write-unlink (literal "{{ parent }}") {{ audit }})
+(deny file-write-create (literal "{{ parent }}") {{ audit }})
 {% endfor %}
 {% for filter in write.anywhere_parents %}
 (deny file-write-unlink {{ filter }} {{ audit }})
+(deny file-write-create {{ filter }} {{ audit }})
 {% endfor %}
 {% endif %}
 
