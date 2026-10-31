@@ -286,16 +286,17 @@
 ; denials are the tagged kind so that they are reported.
 ; =============================================================================
 
-; Credential stores and keys, whether a toggle protects them wherever they are
-; found or the embedder's denylist names them. They are not readable, and under
-; the configured home they are not created, changed, linked, replaced or moved
-; either: a name planted before the host writes there, a store renamed out of
-; its name, or a file's contents overwritten would each be a credential the
-; sandbox made or read. The same names outside the configured home stay
-; ordinary — a project's `.cargo` or `.npmrc` is the sandbox's own — while reads
-; of them stay denied wherever the name matches. `file-write-create` and
-; `file-write-unlink` are their own operations, outside what `file-write*`
-; matches, so each location carries all three denials.
+; Credential stores and keys, each anchored to a real location: a security
+; toggle protects only the place under the configured home — `~/.ssh`, never
+; every `.ssh` the sandbox meets — and an embedder's denylist protects the
+; trees it names. Each is not readable, and not created, changed, linked,
+; replaced or moved either: a name planted before the host writes there, a
+; store renamed out of its name, or a file's contents overwritten would each
+; be a credential the sandbox made or read. The same names everywhere else
+; stay ordinary — a project's `.cargo`, `.docker` or `.npmrc` is the sandbox's
+; own. `file-write-create` and `file-write-unlink` are their own operations,
+; outside what `file-write*` matches, so each location carries all three
+; denials.
 {% for rule in protected %}
 (deny file-read* {{ rule.reads }} {{ audit }})
 (deny file-write* {{ rule.changes }} {{ audit }})
@@ -314,6 +315,20 @@
 (deny file-write-create (literal "{{ parent }}") {{ audit }})
 {% endfor %}
 {% if let Some(read) = read_rules %}
+; Denylist patterns are not anchored to the home: an embedder that denies
+; `.git/hooks` or `.env` names it wherever it is found, so its reads and
+; changes are refused at any path, and the directories above it cannot be
+; renamed out from under the pattern.
+{% for filter in read.anywhere %}
+(deny file-read* {{ filter }} {{ audit }})
+(deny file-write* {{ filter }} {{ audit }})
+(deny file-write-create {{ filter }} {{ audit }})
+(deny file-write-unlink {{ filter }} {{ audit }})
+{% endfor %}
+{% for filter in read.anywhere_parents %}
+(deny file-write-unlink {{ filter }} {{ audit }})
+(deny file-write-create {{ filter }} {{ audit }})
+{% endfor %}
 ; Agent sockets: not readable and not connectable, whatever the network policy.
 (deny file-read* (regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$") {{ audit }})
 (deny network-outbound (remote unix-socket (path-regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$")) {{ audit }})

@@ -196,29 +196,16 @@ struct ProtectedRule {
 }
 
 impl ProtectedRule {
-    /// The rule for a location a security toggle protects.
+    /// The rule for one protected location: a real path and everything beneath
+    /// it, less the openings that name it or lie inside it.
     ///
-    /// Reads are denied wherever the name appears; the planting and move rules
-    /// reach only the location under the configured home, so a project's
-    /// `.cargo` or `.npmrc` stays the sandbox's to create, change and remove.
-    fn for_toggle(location: &str, anchored: &Path, openings: &Openings) -> Result<Self> {
-        let anywhere = Pattern::anywhere(location);
-        let names = |path: &Path| anywhere.matches(path);
-        let granted = |path: &Path| path.starts_with(anchored);
-        Ok(Self {
-            reads: excluding(
-                format!("(regex #\"{}\")", quote_regex(&anywhere.regex(true))),
-                &openings.opened_by_name(names),
-            ),
-            changes: excluding(
-                format!("(subpath \"{}\")", escape_path(anchored)?),
-                &openings.opened_by_grant(granted),
-            ),
-            listings: openings.walked_through(names),
-        })
-    }
-
-    /// The rule for a tree an embedder's denylist names.
+    /// A security toggle protects only the location under the configured home —
+    /// `~/.ssh`, not every `.ssh` the sandbox meets — and an embedder's deny
+    /// list protects the trees it names, so the same denial serves both. Reads
+    /// are denied less the granted paths that name the location or lie inside
+    /// it and the ways to them; changes are denied less the writable granted
+    /// paths alone, since a name planted in the location, or the location moved
+    /// out of its name, would be readable under another one.
     fn for_tree(tree: &Path, escaped: &str, openings: &Openings) -> Self {
         let names = |path: &Path| path.starts_with(tree);
         let location = format!("(subpath \"{escaped}\")");
@@ -396,7 +383,11 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
         )?;
         for location in security.protected_locations() {
             let path = crate::policy::resolve_lenient(&home.join(location))?;
-            protected.push(ProtectedRule::for_toggle(location, &path, &openings)?);
+            protected.push(ProtectedRule::for_tree(
+                &path,
+                &escape_path(&path)?,
+                &openings,
+            ));
             anchored.push(path);
         }
     }
@@ -995,23 +986,28 @@ mod tests {
         let (enclosing, _dir) = prepared_config(
             SandboxConfig::builder()
                 .readable(grant_path(root.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
                 .build(),
         );
         let profile = generate_profile(&enclosing, None).unwrap();
         assert!(
-            profile.contains(r#"(deny file-read* (regex #"/\.ssh(/|$)") (with message"#),
+            profile.contains(&format!(
+                r#"(deny file-read* (subpath "{0}") (with message"#,
+                ssh.display()
+            )),
             "a grant of the enclosing directory must not narrow the rule:\n{profile}"
         );
 
         let (named, _dir) = prepared_config(
             SandboxConfig::builder()
                 .readable(grant_path(ssh.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
                 .build(),
         );
         let profile = generate_profile(&named, None).unwrap();
         assert!(
             profile.contains(&format!(
-                r#"(deny file-read* (require-all (regex #"/\.ssh(/|$)") (require-not (subpath "{0}")))"#,
+                r#"(deny file-read* (require-all (subpath "{0}") (require-not (subpath "{0}")))"#,
                 ssh.display()
             )),
             "the grant naming the store must be left out of its rule:\n{profile}"
@@ -1034,10 +1030,13 @@ mod tests {
                 .build(),
         );
         let profile = generate_profile(&enclosing, None).unwrap();
-        // Reads are denied wherever the name matches; changes are denied at the
-        // location under the configured home.
+        // Reads and changes are denied at the location under the configured
+        // home; the enclosing grant narrows neither.
         assert!(
-            profile.contains(r#"(deny file-read* (regex #"/\.ssh(/|$)") (with message"#),
+            profile.contains(&format!(
+                r#"(deny file-read* (subpath "{}/.ssh") (with message"#,
+                root.display()
+            )),
             "a grant of the enclosing directory must not reopen reads:\n{profile}"
         );
         assert!(
@@ -1089,6 +1088,7 @@ mod tests {
         let (data, _dir) = prepared_config(
             SandboxConfig::builder()
                 .readable(grant_path(keys.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
                 .build(),
         );
         let profile = generate_profile(&data, None).unwrap();

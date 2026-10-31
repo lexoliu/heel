@@ -226,6 +226,7 @@ impl Segment {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn accepts(&self, name: &[u8]) -> bool {
         match self {
             Self::Name(expected) => expected.as_bytes() == name,
@@ -236,6 +237,7 @@ impl Segment {
 }
 
 /// Whether `text` matches `glob`, in which `*` stands for any run of bytes.
+#[cfg(target_os = "linux")]
 fn glob_matches(glob: &[u8], text: &[u8]) -> bool {
     let (mut g, mut t) = (0, 0);
     let mut resume: Option<(usize, usize)> = None;
@@ -358,6 +360,7 @@ impl Pattern {
     }
 
     /// Whether `path` is a match or lies beneath one.
+    #[cfg(target_os = "linux")]
     pub(crate) fn matches(&self, path: &Path) -> bool {
         self.matches_with(path, true)
     }
@@ -368,6 +371,7 @@ impl Pattern {
         self.matches_with(path, false)
     }
 
+    #[cfg(target_os = "linux")]
     fn matches_with(&self, path: &Path, tree: bool) -> bool {
         let relative = match &self.anchor {
             Some(anchor) => match path.strip_prefix(anchor) {
@@ -389,6 +393,7 @@ impl Pattern {
         (0..=names.len()).any(|start| Self::match_names(&self.segments, &names[start..], tree))
     }
 
+    #[cfg(target_os = "linux")]
     fn match_names(segments: &[Segment], names: &[&[u8]], tree: bool) -> bool {
         match segments.split_first() {
             None => tree || names.is_empty(),

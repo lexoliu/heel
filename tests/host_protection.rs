@@ -730,8 +730,12 @@ mod macos_protections {
             files.push("notes.txt");
             let home = home_with(&files);
             let root = std::fs::canonicalize(home.path()).unwrap();
-            let sandbox =
-                start(toggled(strict, writable).readable(fixtures::resolved(&root))).await;
+            let sandbox = start(
+                toggled(strict, writable)
+                    .readable(fixtures::resolved(&root))
+                    .read_denylist(ReadDenylist::credentials().home(&root)),
+            )
+            .await;
 
             for protected in TOGGLED_FILES {
                 cat(&sandbox, &root, protected).await.expect_err(&format!(
@@ -755,7 +759,8 @@ mod macos_protections {
                 "Library/Keychains",
                 "Library/Application Support/Google/Chrome/Default",
             ];
-            let mut builder = toggled(strict, writable);
+            let mut builder =
+                toggled(strict, writable).read_denylist(ReadDenylist::credentials().home(&root));
             for path in named {
                 builder = builder.readable(fixtures::resolved(root.join(path)));
             }
@@ -871,8 +876,12 @@ mod macos_protections {
         for (strict, writable) in TOGGLE_MODES {
             let home = home_with(&["notes.txt"]);
             let root = std::fs::canonicalize(home.path()).unwrap();
-            let sandbox =
-                start(toggled(strict, writable).readable(fixtures::resolved(&root))).await;
+            let sandbox = start(
+                toggled(strict, writable)
+                    .readable(fixtures::resolved(&root))
+                    .read_denylist(ReadDenylist::credentials().home(&root)),
+            )
+            .await;
             let what = format!("strict={strict} writable={writable}");
 
             // What the host does while the sandbox runs: it makes the stores and
@@ -913,7 +922,9 @@ mod macos_protections {
     }
 
     #[tokio::test]
-    async fn a_store_under_a_directory_the_sandbox_cannot_list_is_unreadable() {
+    async fn a_same_named_store_under_a_directory_the_sandbox_cannot_list_is_ordinary() {
+        // `~/unlisted/.ssh` is not `~/.ssh`: a toggle protects the location
+        // under the configured home, not every directory that shares its name.
         for (strict, writable) in TOGGLE_MODES {
             let home = home_with(&["unlisted/.ssh/id_ed25519", "unlisted/open.txt"]);
             let root = std::fs::canonicalize(home.path()).unwrap();
@@ -927,9 +938,7 @@ mod macos_protections {
                 .unwrap_or_else(|error| panic!("{what}: the directory is not reachable: {error}"));
             cat(&sandbox, &root, "unlisted/.ssh/id_ed25519")
                 .await
-                .expect_err(&format!(
-                    "{what}: a store under an unlisted directory was read"
-                ));
+                .unwrap_or_else(|error| panic!("{what}: a same-named store was denied: {error}"));
         }
     }
 
@@ -1250,11 +1259,12 @@ mod macos_protections {
                 "{what}"
             );
 
-            // A same-named file still cannot be read back wherever it sits.
+            // A same-named file inside the home but off the protected path is
+            // ordinary too: `~/project/.netrc` is not `~/.netrc`.
             std::fs::write(root.join("project/.netrc"), "secret").unwrap();
             cat(&sandbox, &root, "project/.netrc")
                 .await
-                .expect_err(&format!("{what}: a same-named file was readable"));
+                .unwrap_or_else(|error| panic!("{what}: a same-named file was denied: {error}"));
         }
     }
 
