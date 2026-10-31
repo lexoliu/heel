@@ -148,7 +148,10 @@ impl Openings {
 
     /// The directories on the way to a grant inside a protected location. They
     /// can be walked through and not listed, so a grant of `.ssh/keys` does not
-    /// show the other names in `.ssh`.
+    /// show the other names in `.ssh` — only a directory that is itself
+    /// granted opens its listing; being inside a granted directory does not,
+    /// because a containing grant must not expose the names a protection
+    /// denies.
     fn walked_through(&self, names: impl Fn(&Path) -> bool) -> Vec<String> {
         self.ancestors
             .iter()
@@ -157,7 +160,7 @@ impl Openings {
                     && !self
                         .granted
                         .iter()
-                        .any(|opening| ancestor.path.starts_with(&opening.path))
+                        .any(|opening| ancestor.path == opening.path)
             })
             .map(|ancestor| ancestor.escaped.clone())
             .collect()
@@ -1206,6 +1209,34 @@ mod tests {
         assert!(
             !profile.contains(&format!("(subpath \"{}\") (with message", clones.display())),
             "an exemption must not turn into a rule of its own"
+        );
+    }
+
+    #[test]
+    fn a_toggle_alone_protects_the_location_under_the_environment_home() {
+        // Without a denylist the toggles anchor at the invoking user's home,
+        // so a bare strict sandbox still protects its credentials.
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .filesystem_strict(false)
+                .writable_file_system(true)
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        let home = crate::policy::resolved_home(None).unwrap();
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-read* (subpath "{}/.ssh") (with message"#,
+                home.display()
+            )),
+            "the toggles alone did not anchor at the environment home:\n{profile}"
+        );
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-write* (subpath "{}/.ssh") (with message"#,
+                home.display()
+            )),
+            "the toggles alone did not anchor at the environment home:\n{profile}"
         );
     }
 

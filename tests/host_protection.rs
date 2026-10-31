@@ -1155,6 +1155,40 @@ mod macos_protections {
     }
 
     #[tokio::test]
+    async fn a_grant_inside_a_store_does_not_expose_the_other_names() {
+        // A grant inside `.ssh` opens what it names; the store's directory
+        // itself stays unlisted even when a wider grant also reads the home.
+        let home = home_with(&[".ssh/id_ed25519", ".ssh/keys/k", "notes.txt"]);
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let sandbox = start(
+            toggled(false, true)
+                .readable(fixtures::resolved(&root))
+                .readable(fixtures::resolved(root.join(".ssh/keys")))
+                .read_denylist(ReadDenylist::credentials().home(&root)),
+        )
+        .await;
+
+        cat(&sandbox, &root, ".ssh/keys/k")
+            .await
+            .unwrap_or_else(|error| panic!("the grant inside the store was not opened: {error}"));
+        is_refused(
+            &sandbox,
+            &format!("ls '{}/.ssh'", root.display()),
+            "the store's other names",
+        )
+        .await;
+        is_refused(
+            &sandbox,
+            &format!("cat '{}/.ssh/id_ed25519'", root.display()),
+            "the store's other entries",
+        )
+        .await;
+        cat(&sandbox, &root, "notes.txt")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[tokio::test]
     async fn a_prepared_git_directory_cannot_be_moved_into_a_repo() {
         // `.git` and the directories above the user-site packages are guarded
         // names too: a prepared tree moved into one is a create at the name.
