@@ -315,20 +315,6 @@
 (deny file-write-create (literal "{{ parent }}") {{ audit }})
 {% endfor %}
 {% if let Some(read) = read_rules %}
-; Denylist patterns are not anchored to the home: an embedder that denies
-; `.git/hooks` or `.env` names it wherever it is found, so its reads and
-; changes are refused at any path, and the directories above it cannot be
-; renamed out from under the pattern.
-{% for filter in read.anywhere %}
-(deny file-read* {{ filter }} {{ audit }})
-(deny file-write* {{ filter }} {{ audit }})
-(deny file-write-create {{ filter }} {{ audit }})
-(deny file-write-unlink {{ filter }} {{ audit }})
-{% endfor %}
-{% for filter in read.anywhere_parents %}
-(deny file-write-unlink {{ filter }} {{ audit }})
-(deny file-write-create {{ filter }} {{ audit }})
-{% endfor %}
 ; Agent sockets: not readable and not connectable, whatever the network policy.
 (deny file-read* (regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$") {{ audit }})
 (deny network-outbound (remote unix-socket (path-regex #"^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$")) {{ audit }})

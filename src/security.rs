@@ -111,8 +111,8 @@ security_toggles! {
 #[cfg(target_os = "macos")]
 type Protection = (fn(&SecurityConfig) -> bool, &'static [&'static str]);
 
-/// The sensitive locations each protection toggle closes to reads, found
-/// beneath any directory (`Library/Keychains` is `<anything>/Library/Keychains`).
+/// The sensitive locations each protection toggle closes, relative to the
+/// configured home (`.ssh` is `~/.ssh`; a project's own `.ssh` is ordinary).
 ///
 /// This is the one table behind the toggles; each backend that enforces them
 /// reads it through [`SecurityConfig::protected_locations`].
@@ -158,8 +158,8 @@ const PROTECTIONS: &[Protection] = &[
 
 #[cfg(target_os = "macos")]
 impl SecurityConfig {
-    /// The locations the enabled protections close to reads, as relative paths
-    /// found beneath any directory.
+    /// The locations the enabled protections close, as paths relative to the
+    /// configured home.
     pub(crate) fn protected_locations(&self) -> impl Iterator<Item = &'static str> + '_ {
         PROTECTIONS
             .iter()
