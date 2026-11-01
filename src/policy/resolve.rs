@@ -444,6 +444,14 @@ fn home_directory(configured: Option<&Path>) -> Result<PathBuf> {
         })
 }
 
+/// The resolved home directory a denylist resolves against, which is where the
+/// macOS profile anchors its planting rules. The read denylist's configured
+/// home wins over the write denylist's when the two differ.
+#[cfg(target_os = "macos")]
+pub(crate) fn resolved_home(configured: Option<&Path>) -> Result<PathBuf> {
+    resolve_lenient(&home_directory(configured)?)
+}
+
 /// Resolve `path` to the form the kernel matches rules against.
 ///
 /// A denied location usually does not exist yet (that is the point of denying

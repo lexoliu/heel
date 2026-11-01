@@ -1,6 +1,6 @@
 //! SBPL profile generation using compile-time templates.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use askama::Template;
 
@@ -61,14 +61,192 @@ impl std::fmt::Display for PathFilter {
 /// loop rather than of how three separate loops happen to be arranged.
 struct GrantRules {
     path: String,
+    /// The path as the caller resolved it, verified and never followed.
+    resolved: PathBuf,
     filter: PathFilter,
     writable: bool,
     executable: bool,
 }
 
+/// A path the profile allows, as the protections have to see it.
+struct Opening {
+    filter: PathFilter,
+    /// The path as the caller resolved it.
+    path: PathBuf,
+    /// The path escaped for an SBPL string.
+    escaped: String,
+    /// Whether the opening also permits writing; a read-only grant does not
+    /// reopen a protected location to changes.
+    writable: bool,
+}
+
+/// Every path the profile allows, which is what the protections may not
+/// swallow when a path names the thing they protect.
+struct Openings {
+    granted: Vec<Opening>,
+    /// The directories above the granted paths, allowed as literals so that
+    /// resolving into a granted path works.
+    ancestors: Vec<Opening>,
+}
+
+impl Openings {
+    fn new(granted: Vec<Opening>) -> Result<Self> {
+        let mut paths: Vec<PathBuf> = granted
+            .iter()
+            .flat_map(|opening| {
+                opening
+                    .path
+                    .ancestors()
+                    .skip(1)
+                    .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let ancestors = paths
+            .into_iter()
+            .map(|path| {
+                Ok(Opening {
+                    filter: PathFilter::Literal,
+                    escaped: escape_path(&path)?,
+                    path,
+                    writable: false,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { granted, ancestors })
+    }
+
+    /// The `require-not` clauses that leave a protection of `names` open where
+    /// a granted path is, or lies inside, a protected location, and the
+    /// directories on the way to it.
+    ///
+    /// A grant of a directory that only contains a protected location is not
+    /// among them.
+    fn opened_by_name(&self, names: impl Fn(&Path) -> bool) -> Vec<String> {
+        self.granted
+            .iter()
+            .chain(&self.ancestors)
+            .filter(|opening| names(&opening.path))
+            .map(Opening::exemption)
+            .collect()
+    }
+
+    /// The same clauses for the writable granted paths alone, which is what
+    /// leaves a protected location open to being changed: a grant that only
+    /// reads the location does not reopen it, and the directories on the way to
+    /// a grant are only walked through.
+    fn opened_by_grant(&self, names: impl Fn(&Path) -> bool) -> Vec<String> {
+        self.granted
+            .iter()
+            .filter(|opening| opening.writable && names(&opening.path))
+            .map(Opening::exemption)
+            .collect()
+    }
+
+    /// The directories on the way to a grant inside a protected location. They
+    /// can be walked through and not listed, so a grant of `.ssh/keys` does not
+    /// show the other names in `.ssh` — only a directory that is itself
+    /// granted opens its listing; being inside a granted directory does not,
+    /// because a containing grant must not expose the names a protection
+    /// denies.
+    fn walked_through(&self, names: impl Fn(&Path) -> bool) -> Vec<String> {
+        self.ancestors
+            .iter()
+            .filter(|ancestor| {
+                names(&ancestor.path)
+                    && !self
+                        .granted
+                        .iter()
+                        .any(|opening| ancestor.path == opening.path)
+            })
+            .map(|ancestor| ancestor.escaped.clone())
+            .collect()
+    }
+}
+
+impl Opening {
+    /// The clause that leaves this path out of a rule.
+    fn exemption(&self) -> String {
+        format!("(require-not ({} \"{}\"))", self.filter, self.escaped)
+    }
+}
+
+/// `filter` without the places `exemptions` name.
+fn excluding(filter: String, exemptions: &[String]) -> String {
+    if exemptions.is_empty() {
+        filter
+    } else {
+        format!("(require-all {filter} {})", exemptions.join(" "))
+    }
+}
+
+/// The denials of one protected location, as the template sees them.
+struct ProtectedRule {
+    /// What is not readable: the location and everything in it, less the
+    /// granted paths that name it or lie inside it, and the ways to them.
+    reads: String,
+    /// What is not created, changed, replaced, linked or removed: the location
+    /// under the configured home, less the granted paths alone. A name planted
+    /// in the location, or the location moved out of its name, would be
+    /// readable under another one.
+    changes: String,
+    /// The directories on the way to a grant inside the location, whose entries
+    /// are not listed.
+    listings: Vec<String>,
+}
+
+impl ProtectedRule {
+    /// The rule for one protected location: a real path and everything beneath
+    /// it, less the openings that name it or lie inside it.
+    ///
+    /// A security toggle protects only the location under the configured home —
+    /// `~/.ssh`, not every `.ssh` the sandbox meets — and an embedder's deny
+    /// list protects the trees it names, so the same denial serves both. Reads
+    /// are denied less the granted paths that name the location or lie inside
+    /// it and the ways to them; changes are denied less the writable granted
+    /// paths alone, since a name planted in the location, or the location moved
+    /// out of its name, would be readable under another one.
+    fn for_tree(tree: &Path, escaped: &str, openings: &Openings) -> Self {
+        let names = |path: &Path| path.starts_with(tree);
+        let location = format!("(subpath \"{escaped}\")");
+        Self {
+            reads: excluding(location.clone(), &openings.opened_by_name(names)),
+            changes: excluding(location, &openings.opened_by_grant(names)),
+            listings: openings.walked_through(names),
+        }
+    }
+}
+
+/// Every directory above `paths` up to the root, escaped for an SBPL literal.
+///
+/// A protected path's rule names the path itself, so it is only as strong as
+/// the names above it: renaming any ancestor puts the denied location under a
+/// name the rules do not cover. Each is therefore refused as a rename or delete
+/// source and as a create destination — a prepared tree moved into a guarded
+/// name is a create SBPL cannot tell from a plain `mkdir`.
+fn ancestors(paths: &[PathBuf]) -> Result<Vec<String>> {
+    let mut all: Vec<PathBuf> = paths
+        .iter()
+        .flat_map(|path| {
+            path.ancestors()
+                .skip(1)
+                .take_while(|ancestor| ancestor.parent().is_some())
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    all.iter().map(|path| escape_path(path)).collect()
+}
+
 /// A host protection policy as the template sees it: every path already
 /// resolved and escaped, every filter already written.
 struct HostRules {
+    /// The escaped path of each tree, which is a path and everything beneath it.
     trees: Vec<String>,
     /// Complete filters for the entries found beneath any directory.
     anywhere: Vec<String>,
@@ -91,13 +269,12 @@ impl HostRules {
                     escape_path(path)?
                 ))
             })
-            .collect::<Result<Vec<_>>>()?
-            .join(" ");
+            .collect::<Result<Vec<_>>>()?;
         let guard = |pattern: &Pattern, filter: String| {
-            if exemptions.is_empty() || !pattern.is_anywhere() {
-                filter
+            if pattern.is_anywhere() {
+                excluding(filter, &exemptions)
             } else {
-                format!("(require-all {filter} {exemptions})")
+                filter
             }
         };
 
@@ -131,11 +308,7 @@ impl HostRules {
                 .iter()
                 .map(|path| escape_path(path))
                 .collect::<Result<_>>()?,
-            guarded_parents: resolved
-                .guarded_parents
-                .iter()
-                .map(|path| escape_path(path))
-                .collect::<Result<_>>()?,
+            guarded_parents: ancestors(&resolved.trees)?,
         })
     }
 }
@@ -156,12 +329,6 @@ struct SandboxProfile {
     // Security protection flags
     protect_user_home: bool,
     allow_tcc_prompts: bool,
-    protect_credentials: bool,
-    protect_cloud_config: bool,
-    protect_browser_data: bool,
-    protect_keychain: bool,
-    protect_shell_history: bool,
-    protect_package_credentials: bool,
     // Hardware access flags
     allow_gpu: bool,
     allow_npu: bool,
@@ -173,6 +340,10 @@ struct SandboxProfile {
     // Host protection
     audit: String,
     deny_keychain_services: bool,
+    protected: Vec<ProtectedRule>,
+    /// The ancestors of the protected locations, guarded against renames and
+    /// prepared trees moved into their names.
+    guarded: Vec<String>,
     read_rules: Option<HostRules>,
     write_rules: Option<HostRules>,
 }
@@ -183,9 +354,62 @@ struct SandboxProfile {
 /// is `None` the profile denies all outbound connections in the kernel.
 pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<String> {
     let security = config.security();
+    let grants = grant_rules(config.grants())?;
+    let openings = openings(config, &grants)?;
 
-    let mut template = SandboxProfile {
-        grants: grant_rules(config.grants())?,
+    let read_resolved = config
+        .read_denylist()
+        .map(|denylist| denylist.resolve())
+        .transpose()?;
+    let write_resolved = config
+        .write_denylist()
+        .map(|denylist| denylist.resolve())
+        .transpose()?;
+
+    // The planting and move rules anchor at the configured home: the read
+    // denylist's when it names one, the write denylist's otherwise, and the
+    // invoking user's home when neither says. It is resolved only when a
+    // toggle protects a location, so a home-less environment fails only the
+    // configurations that needed it.
+    let mut anchored = Vec::new();
+    let mut protected = Vec::new();
+    if security.protected_locations().next().is_some() {
+        let home = crate::policy::resolved_home(
+            config
+                .read_denylist()
+                .and_then(|denylist| denylist.configured_home())
+                .or_else(|| {
+                    config
+                        .write_denylist()
+                        .and_then(|denylist| denylist.configured_home())
+                }),
+        )?;
+        for location in security.protected_locations() {
+            let path = crate::policy::resolve_lenient(&home.join(location))?;
+            protected.push(ProtectedRule::for_tree(
+                &path,
+                &escape_path(&path)?,
+                &openings,
+            ));
+            anchored.push(path);
+        }
+    }
+    if let Some(resolved) = &read_resolved {
+        for tree in &resolved.trees {
+            protected.push(ProtectedRule::for_tree(
+                tree,
+                &escape_path(tree)?,
+                &openings,
+            ));
+        }
+        anchored.extend(resolved.trees.iter().cloned());
+    }
+    let guarded = ancestors(&anchored)?;
+
+    let read_rules = read_resolved.as_ref().map(HostRules::new).transpose()?;
+
+    let template = SandboxProfile {
+        grants,
         working_dir: sbpl_path(config.working_dir())?,
         ipc_bin_dir: config.ipc_bin_dir().map(sbpl_path).transpose()?,
         ipc_socket_dir: config
@@ -217,12 +441,6 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
         filesystem_strict: config.filesystem_strict(),
         protect_user_home: security.protect_user_home(),
         allow_tcc_prompts: security.allow_tcc_prompts(),
-        protect_credentials: security.protect_credentials(),
-        protect_cloud_config: security.protect_cloud_config(),
-        protect_browser_data: security.protect_browser_data(),
-        protect_keychain: security.protect_keychain(),
-        protect_shell_history: security.protect_shell_history(),
-        protect_package_credentials: security.protect_package_credentials(),
         allow_gpu: security.allow_gpu(),
         allow_npu: security.allow_npu(),
         allow_hardware: security.allow_hardware(),
@@ -233,17 +451,16 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
             escape_str(&denial_tag(config.working_dir()))
         ),
         deny_keychain_services: security.protect_keychain() || config.read_denylist().is_some(),
-        read_rules: config
-            .read_denylist()
-            .map(|denylist| HostRules::new(&denylist.resolve()?))
-            .transpose()?,
-        write_rules: config
-            .write_denylist()
-            .map(|denylist| HostRules::new(&denylist.resolve()?))
-            .transpose()?,
-        traversal_paths: Vec::new(),
+        protected,
+        guarded,
+        read_rules,
+        write_rules: write_resolved.as_ref().map(HostRules::new).transpose()?,
+        traversal_paths: openings
+            .ancestors
+            .iter()
+            .map(|ancestor| ancestor.escaped.clone())
+            .collect(),
     };
-    template.traversal_paths = traversal_paths(&template);
 
     let profile = template.render()?;
 
@@ -258,37 +475,46 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
     Ok(profile)
 }
 
-/// Every ancestor directory of every granted path.
+/// Every path the profile allows: the configured grants, and the directories
+/// the sandbox itself needs.
 ///
 /// A protection rule that covers an ancestor of a granted path makes that path
 /// unreachable even though the path itself is allowed: the kernel refuses to
 /// resolve through the denied component, so `chdir` into an allowed directory
-/// fails. Re-allowing each ancestor as a literal restores traversal while
-/// leaving its other children denied.
-fn traversal_paths(profile: &SandboxProfile) -> Vec<String> {
-    let granted = profile
-        .grants
-        .iter()
-        .map(|grant| &grant.path)
-        .chain(std::iter::once(&profile.working_dir))
-        .chain(profile.ipc_bin_dir.iter())
-        .chain(profile.ipc_socket_dir.iter())
-        .chain(profile.python_venv.iter().map(|venv| &venv.path));
+/// fails. [`Openings`] therefore also carries the ancestors, which the profile
+/// re-allows as literals, leaving their other children denied.
+fn openings(config: &SandboxConfigData, grants: &[GrantRules]) -> Result<Openings> {
+    let subpath = |path: &Path, writable: bool| -> Result<Opening> {
+        unresolved::verify(path)?;
+        Ok(Opening {
+            filter: PathFilter::Subpath,
+            escaped: escape_path(path)?,
+            path: path.to_path_buf(),
+            writable,
+        })
+    };
 
-    let mut ancestors: Vec<String> = granted
-        .flat_map(|path| {
-            Path::new(path)
-                .ancestors()
-                .skip(1)
-                .filter(|ancestor| !ancestor.as_os_str().is_empty())
-                .map(|ancestor| ancestor.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
+    let mut granted: Vec<Opening> = grants
+        .iter()
+        .map(|grant| Opening {
+            filter: grant.filter,
+            path: grant.resolved.clone(),
+            escaped: grant.path.clone(),
+            writable: grant.writable,
         })
         .collect();
-
-    ancestors.sort_unstable();
-    ancestors.dedup();
-    ancestors
+    granted.push(subpath(config.working_dir(), true)?);
+    for path in config
+        .ipc_bin_dir()
+        .into_iter()
+        .chain(config.ipc_socket().and_then(Path::parent))
+    {
+        granted.push(subpath(path, true)?);
+    }
+    if let Some(python) = config.python() {
+        granted.push(subpath(python.venv().path(), python.allow_pip_install())?);
+    }
+    Openings::new(granted)
 }
 
 /// Verify a granted path and escape it for an SBPL string literal.
@@ -313,6 +539,7 @@ fn grant_rules(grants: &[Grant]) -> Result<Vec<GrantRules>> {
             Ok(GrantRules {
                 filter: PathFilter::for_path(grant.path())?,
                 path: escape_path(grant.path())?,
+                resolved: grant.path().to_path_buf(),
                 writable: grant.access().can_write(),
                 executable: grant.access().can_execute(),
             })
@@ -753,6 +980,172 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_rule_is_narrowed_only_by_a_grant_that_names_the_credential() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let ssh = std::fs::canonicalize(home.path()).unwrap().join(".ssh");
+        std::fs::create_dir(&ssh).expect("creates");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+
+        let (enclosing, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .readable(grant_path(root.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&enclosing, None).unwrap();
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-read* (subpath "{0}") (with message"#,
+                ssh.display()
+            )),
+            "a grant of the enclosing directory must not narrow the rule:\n{profile}"
+        );
+
+        let (named, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .readable(grant_path(ssh.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&named, None).unwrap();
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-read* (require-all (subpath "{0}") (require-not (subpath "{0}")))"#,
+                ssh.display()
+            )),
+            "the grant naming the store must be left out of its rule:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn a_protected_location_cannot_be_planted_linked_or_moved_unless_a_grant_names_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let ssh = root.join(".ssh");
+        std::fs::create_dir(&ssh).expect("creates");
+
+        // The denylist points the configured home at the stand-in, which is
+        // where the planting and move rules apply.
+        let (enclosing, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(root.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&enclosing, None).unwrap();
+        // Reads and changes are denied at the location under the configured
+        // home; the enclosing grant narrows neither.
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-read* (subpath "{}/.ssh") (with message"#,
+                root.display()
+            )),
+            "a grant of the enclosing directory must not reopen reads:\n{profile}"
+        );
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-write* (subpath "{}/.ssh") (with message"#,
+                root.display()
+            )),
+            "the location under the configured home is not writable:\n{profile}"
+        );
+        // The directories that lead to a multi-component location are not moved,
+        // removed or created, and neither is home itself.
+        for parent in [root.join(".cargo"), root.clone()] {
+            for operation in ["file-write-unlink", "file-write-create"] {
+                assert!(
+                    profile.contains(&format!(
+                        r#"(deny {operation} (literal "{}") (with message"#,
+                        parent.display()
+                    )),
+                    "{operation} on {} is not refused:\n{profile}",
+                    parent.display()
+                );
+            }
+        }
+
+        let (named, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(root.clone()))
+                .writable(grant_path(ssh.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&named, None).unwrap();
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-write* (require-all (subpath "{0}") (require-not (subpath "{0}")))"#,
+                ssh.display()
+            )),
+            "the grant naming the store must be left out of the write rule:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn a_grant_inside_a_store_walks_through_the_store_without_listing_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let keys = root.join(".ssh/keys");
+        std::fs::create_dir_all(&keys).expect("creates");
+
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .readable(grant_path(keys.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        let listing = format!(
+            "(deny file-read-data (literal \"{}\") (with message",
+            root.join(".ssh").display()
+        );
+        assert!(profile.contains(&listing), "{profile}");
+        assert!(
+            !profile.contains(&format!(
+                "(deny file-read-data (literal \"{}\")",
+                root.display()
+            )),
+            "the directories above the store are listed as before"
+        );
+        // Neither the grant nor a path under it loses its listing.
+        assert!(!profile.contains(&format!(
+            "(deny file-read-data (literal \"{}\")",
+            keys.display()
+        )));
+    }
+
+    #[test]
+    fn a_denylist_tree_is_protected_from_planting_like_a_toggle_location() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(root.clone()))
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (subpath \"{}/.netrc\") (with message",
+                root.display()
+            )),
+            "file-write*:\n{profile}"
+        );
+        // Every directory above the tree, home included, is guarded against
+        // renames and creates.
+        for parent in [root.clone(), root.parent().unwrap().to_path_buf()] {
+            assert!(
+                profile.contains(&format!(
+                    r#"(deny file-write-unlink (literal "{}") (with message"#,
+                    parent.display()
+                )),
+                "an ancestor of the tree is not guarded:\n{profile}"
+            );
+        }
+    }
+
+    #[test]
     fn every_denial_is_tagged_so_it_can_be_attributed_to_the_sandbox() {
         let (data, dir) = prepared_config(SandboxConfig::new());
         let profile = generate_profile(&data, None).unwrap();
@@ -816,6 +1209,62 @@ mod tests {
         assert!(
             !profile.contains(&format!("(subpath \"{}\") (with message", clones.display())),
             "an exemption must not turn into a rule of its own"
+        );
+    }
+
+    #[test]
+    fn a_toggle_alone_protects_the_location_under_the_environment_home() {
+        // Without a denylist the toggles anchor at the invoking user's home,
+        // so a bare strict sandbox still protects its credentials.
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .filesystem_strict(false)
+                .writable_file_system(true)
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        let home = crate::policy::resolved_home(None).unwrap();
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-read* (subpath "{}/.ssh") (with message"#,
+                home.display()
+            )),
+            "the toggles alone did not anchor at the environment home:\n{profile}"
+        );
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-write* (subpath "{}/.ssh") (with message"#,
+                home.display()
+            )),
+            "the toggles alone did not anchor at the environment home:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_venv_does_not_narrow_a_change_denial() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let venv = root.join(".ssh/venv");
+        std::fs::create_dir_all(&venv).unwrap();
+        let (data, _dir) = prepared_config(
+            SandboxConfig::builder()
+                .writable(grant_path(root.clone()))
+                .python(
+                    crate::PythonConfig::builder()
+                        .venv(crate::config::VenvConfig::builder().path(&venv).build())
+                        .build(),
+                )
+                .read_denylist(crate::ReadDenylist::credentials().home(&root))
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+        let changes = profile
+            .lines()
+            .find(|line| line.contains("file-write*") && line.contains(".ssh"))
+            .expect("the .ssh change denial");
+        assert!(
+            !changes.contains("require-not"),
+            "a read-only venv must not exempt the store: {changes}"
         );
     }
 

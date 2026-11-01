@@ -152,6 +152,8 @@ mod enforced {
         assert!(stderr(&output).contains(&path.display().to_string()));
     }
 
+    // On macOS a grant naming a store opens it; `macos_protections` covers that.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_grant_does_not_reopen_a_credential_store() {
         let home = home_with(&[".ssh/id_ed25519"]);
@@ -503,9 +505,7 @@ mod enforced {
             "notes.txt",
             "work/repo/src/lib.rs",
             "work/repo/.git/index",
-            ".cargo/registry/index/entry",
             ".cache/stow/entry",
-            "Library/Caches/tool/entry",
         ] {
             let path = root.join(relative);
             let output = sh(
@@ -594,6 +594,775 @@ mod enforced {
             "no denial names {}: {denials:#?}",
             path.display()
         );
+    }
+}
+
+/// What the macOS profile enforces beyond the denylists: the security toggles
+/// beat an enclosing grant, nothing is planted at or moved out of a protected
+/// location, and a grant naming a store opens exactly it. The Linux backend
+/// enforces the denylists only.
+#[cfg(target_os = "macos")]
+mod macos_protections {
+    use super::*;
+    use fixtures::host::{home_with, open_security, sh, start, stderr, stdout};
+
+    /// Every sandbox that reads outside its grants and one that reads only
+    /// inside them, the two shapes a host that grants a directory runs in.
+    const READ_POLICIES: [bool; 2] = [false, true];
+
+    fn denylisted(strict: bool, home: &Path) -> SandboxConfigBuilder<DenyAll> {
+        SandboxConfigBuilder::default()
+            .filesystem_strict(strict)
+            .security(open_security())
+            .read_denylist(ReadDenylist::credentials().home(home))
+    }
+
+    /// Whether `cat` of `relative` under `root` succeeded and printed the
+    /// stand-in's content, with the failure's message when it did not.
+    async fn cat<N: heel::NetworkPolicy>(
+        sandbox: &heel::Sandbox<N>,
+        root: &Path,
+        relative: &str,
+    ) -> Result<(), String> {
+        let path = root.join(relative);
+        let output = sh(sandbox, &format!("cat '{}'", path.display())).await;
+        if output.status.success() {
+            assert_eq!(stdout(&output), "secret", "{relative}");
+            Ok(())
+        } else {
+            Err(stderr(&output))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_of_a_directory_holding_a_credential_store_does_not_open_it() {
+        // The directory a host starts a session in is granted whole, and may be
+        // the home directory or one above it.
+        for strict in READ_POLICIES {
+            let home = home_with(&[".ssh/id_ed25519", ".aws/credentials", "notes.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox =
+                start(denylisted(strict, &root).readable(fixtures::resolved(&root))).await;
+
+            for store in [".ssh/id_ed25519", ".aws/credentials"] {
+                let error = cat(&sandbox, &root, store)
+                    .await
+                    .expect_err("the grant reopened a credential store");
+                assert!(
+                    error.contains(&root.join(store).display().to_string()),
+                    "strict={strict}: the failure does not name {store}: {error}"
+                );
+            }
+            cat(&sandbox, &root, "notes.txt")
+                .await
+                .unwrap_or_else(|error| panic!("strict={strict}: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_naming_a_credential_store_opens_it_and_only_it() {
+        for strict in READ_POLICIES {
+            let home = home_with(&[".ssh/id_ed25519", ".aws/credentials"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox =
+                start(denylisted(strict, &root).readable(fixtures::resolved(root.join(".ssh"))))
+                    .await;
+
+            cat(&sandbox, &root, ".ssh/id_ed25519")
+                .await
+                .unwrap_or_else(|error| panic!("strict={strict}: {error}"));
+            cat(&sandbox, &root, ".aws/credentials")
+                .await
+                .expect_err("a grant of one store opened another");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_inside_a_credential_store_opens_what_it_names() {
+        for strict in READ_POLICIES {
+            let home = home_with(&[".ssh/id_ed25519", ".ssh/keys/deploy"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(
+                denylisted(strict, &root)
+                    .readable(fixtures::resolved(&root))
+                    .readable(fixtures::resolved(root.join(".ssh/keys"))),
+            )
+            .await;
+
+            cat(&sandbox, &root, ".ssh/keys/deploy")
+                .await
+                .unwrap_or_else(|error| panic!("strict={strict}: {error}"));
+            cat(&sandbox, &root, ".ssh/id_ed25519")
+                .await
+                .expect_err("a grant inside a store opened the rest of it");
+        }
+    }
+
+    /// The files the security toggles protect, one in each group.
+    const TOGGLED_FILES: &[&str] = &[
+        ".ssh/id_ed25519",
+        ".gnupg/private-keys-v1.d/key.key",
+        ".aws/credentials",
+        ".kube/config",
+        ".npmrc",
+        ".cargo/credentials.toml",
+        ".zsh_history",
+        "Library/Keychains/login.keychain-db",
+        "Library/Application Support/Google/Chrome/Default/Cookies",
+    ];
+
+    /// A sandbox with the strict toggles and no denylist, in the three shapes of
+    /// filesystem policy: reads only inside grants, reads everywhere, and
+    /// writes everywhere.
+    const TOGGLE_MODES: [(bool, bool); 3] = [(true, false), (false, false), (false, true)];
+
+    fn toggled(strict: bool, writable: bool) -> SandboxConfigBuilder<DenyAll> {
+        SandboxConfigBuilder::default()
+            .filesystem_strict(strict)
+            .writable_file_system(writable)
+            .security(SecurityConfig::strict())
+    }
+
+    #[tokio::test]
+    async fn a_grant_of_a_directory_does_not_open_what_the_security_toggles_protect() {
+        for (strict, writable) in TOGGLE_MODES {
+            let mut files = TOGGLED_FILES.to_vec();
+            files.push("notes.txt");
+            let home = home_with(&files);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(
+                toggled(strict, writable)
+                    .readable(fixtures::resolved(&root))
+                    .read_denylist(ReadDenylist::credentials().home(&root)),
+            )
+            .await;
+
+            for protected in TOGGLED_FILES {
+                cat(&sandbox, &root, protected).await.expect_err(&format!(
+                    "strict={strict} writable={writable}: a grant reopened {protected}"
+                ));
+            }
+            cat(&sandbox, &root, "notes.txt")
+                .await
+                .unwrap_or_else(|error| panic!("strict={strict} writable={writable}: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_naming_what_the_security_toggles_protect_opens_it() {
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(TOGGLED_FILES);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let named = [
+                ".ssh",
+                ".aws/credentials",
+                "Library/Keychains",
+                "Library/Application Support/Google/Chrome/Default",
+            ];
+            let mut builder =
+                toggled(strict, writable).read_denylist(ReadDenylist::credentials().home(&root));
+            for path in named {
+                builder = builder.readable(fixtures::resolved(root.join(path)));
+            }
+            let sandbox = start(builder).await;
+
+            for opened in [
+                ".ssh/id_ed25519",
+                ".aws/credentials",
+                "Library/Keychains/login.keychain-db",
+                "Library/Application Support/Google/Chrome/Default/Cookies",
+            ] {
+                cat(&sandbox, &root, opened).await.unwrap_or_else(|error| {
+                    panic!("strict={strict} writable={writable}: {opened}: {error}")
+                });
+            }
+            for still_protected in [".gnupg/private-keys-v1.d/key.key", ".kube/config", ".npmrc"] {
+                cat(&sandbox, &root, still_protected)
+                    .await
+                    .expect_err("a grant opened a location it does not name");
+            }
+        }
+    }
+
+    /// A sandbox over a home directory stand-in that grants it writably, in each
+    /// shape of filesystem policy. The denylist points the configured home at
+    /// the stand-in, which is where the planting rules apply.
+    fn home_granted(strict: bool, writable: bool, root: &Path) -> SandboxConfigBuilder<DenyAll> {
+        toggled(strict, writable)
+            .writable(fixtures::resolved(root))
+            .read_denylist(ReadDenylist::credentials().home(root))
+    }
+
+    /// Run `script` in a shell and return its output, which must have succeeded.
+    async fn succeeds<N: heel::NetworkPolicy>(sandbox: &heel::Sandbox<N>, script: &str) -> String {
+        let output = sh(sandbox, script).await;
+        assert!(output.status.success(), "{script}: {}", stderr(&output));
+        stdout(&output)
+    }
+
+    /// Run `script` in a shell and require it to fail without printing a secret.
+    async fn is_refused<N: heel::NetworkPolicy>(
+        sandbox: &heel::Sandbox<N>,
+        script: &str,
+        what: &str,
+    ) {
+        let output = sh(sandbox, script).await;
+        assert!(
+            !output.status.success() && !stdout(&output).contains("secret"),
+            "{what}: `{script}` succeeded: {}",
+            stdout(&output)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_to_a_store_does_not_read_it() {
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&[".ssh/id_ed25519", "notes.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            // Links the host made before the sandbox started.
+            std::os::unix::fs::symlink(root.join(".ssh/id_ed25519"), root.join("file-link"))
+                .unwrap();
+            std::os::unix::fs::symlink(root.join(".ssh"), root.join("directory-link")).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let what = format!("strict={strict} writable={writable}");
+
+            is_refused(
+                &sandbox,
+                &format!("cat '{}/file-link'", root.display()),
+                &what,
+            )
+            .await;
+            is_refused(
+                &sandbox,
+                &format!("cat '{}/directory-link/id_ed25519'", root.display()),
+                &what,
+            )
+            .await;
+
+            // Links the sandbox makes itself.
+            let made = sh(
+                &sandbox,
+                &format!(
+                    "ln -s '{0}/.ssh/id_ed25519' '{0}/made-link'; ln '{0}/.ssh/id_ed25519' '{0}/made-hard'; \
+                     cat '{0}/made-link'",
+                    root.display()
+                ),
+            )
+            .await;
+            assert!(
+                !stdout(&made).contains("secret"),
+                "{what}: {}",
+                stdout(&made)
+            );
+            assert!(
+                !root.join("made-hard").exists(),
+                "{what}: a hard link to a store was made"
+            );
+            cat(&sandbox, &root, "notes.txt")
+                .await
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_created_after_the_sandbox_started_is_unreadable() {
+        const LATER: &[&str] = &[
+            ".ssh/id_ed25519",
+            ".aws/credentials",
+            ".netrc",
+            ".cargo/credentials.toml",
+            "Library/Keychains/login.keychain-db",
+        ];
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&["notes.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(
+                toggled(strict, writable)
+                    .readable(fixtures::resolved(&root))
+                    .read_denylist(ReadDenylist::credentials().home(&root)),
+            )
+            .await;
+            let what = format!("strict={strict} writable={writable}");
+
+            // What the host does while the sandbox runs: it makes the stores and
+            // an ordinary file next to them.
+            for relative in LATER.iter().chain(&["later.txt"]) {
+                let path = root.join(relative);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "secret").unwrap();
+            }
+
+            for relative in LATER {
+                cat(&sandbox, &root, relative)
+                    .await
+                    .expect_err(&format!("{what}: {relative} was readable"));
+            }
+            cat(&sandbox, &root, "later.txt")
+                .await
+                .unwrap_or_else(|error| panic!("{what}: a file the host made later: {error}"));
+        }
+    }
+
+    /// A directory the sandbox can pass through and cannot list.
+    struct Unlisted(std::path::PathBuf);
+
+    impl Unlisted {
+        fn new(path: std::path::PathBuf) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o111)).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Unlisted {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_same_named_store_under_a_directory_the_sandbox_cannot_list_is_ordinary() {
+        // `~/unlisted/.ssh` is not `~/.ssh`: a toggle protects the location
+        // under the configured home, not every directory that shares its name.
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&["unlisted/.ssh/id_ed25519", "unlisted/open.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let _unlisted = Unlisted::new(root.join("unlisted"));
+            let sandbox =
+                start(toggled(strict, writable).readable(fixtures::resolved(&root))).await;
+            let what = format!("strict={strict} writable={writable}");
+
+            cat(&sandbox, &root, "unlisted/open.txt")
+                .await
+                .unwrap_or_else(|error| panic!("{what}: the directory is not reachable: {error}"));
+            cat(&sandbox, &root, "unlisted/.ssh/id_ed25519")
+                .await
+                .unwrap_or_else(|error| panic!("{what}: a same-named store was denied: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_and_the_directory_leading_to_it_cannot_be_renamed_to_a_readable_name() {
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&[
+                ".ssh/id_ed25519",
+                ".cargo/credentials.toml",
+                ".netrc",
+                "notes.txt",
+            ]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            for script in [
+                format!("mv '{at}/.ssh' '{at}/x' && cat '{at}/x/id_ed25519'"),
+                format!("mv '{at}/.cargo' '{at}/c' && cat '{at}/c/credentials.toml'"),
+                format!("mv '{at}/.cargo/credentials.toml' '{at}/c.toml' && cat '{at}/c.toml'"),
+                format!("mv '{at}/.netrc' '{at}/n' && cat '{at}/n'"),
+                format!("rm -r '{at}/.ssh' && cat '{at}/.ssh/id_ed25519'"),
+            ] {
+                is_refused(&sandbox, &script, &what).await;
+            }
+            for kept in [".ssh/id_ed25519", ".cargo/credentials.toml", ".netrc"] {
+                assert!(
+                    root.join(kept).exists(),
+                    "{what}: {kept} was moved or removed"
+                );
+            }
+            assert!(
+                !root.join("x").exists() && !root.join("c").exists(),
+                "{what}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_cannot_be_planted_at_a_protected_name() {
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&["notes.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            for (plant, script) in [
+                (".netrc", format!("ln -s notes.txt '{at}/.netrc'")),
+                (".npmrc", format!("echo x > '{at}/.npmrc'")),
+                (".pypirc", format!("ln '{at}/notes.txt' '{at}/.pypirc'")),
+                (".aws", format!("mkdir '{at}/.aws'")),
+                (".ssh", format!("ln -s '{at}' '{at}/.ssh'")),
+                (".gem", format!("ln -s '{at}' '{at}/.gem'")),
+                (".gem", format!("echo x > '{at}/.gem'")),
+                (
+                    ".netrc",
+                    format!("cp '{at}/notes.txt' '{at}/n' && mv '{at}/n' '{at}/.netrc'"),
+                ),
+            ] {
+                let output = sh(&sandbox, &script).await;
+                assert!(
+                    !output.status.success(),
+                    "{what}: `{script}` planted {plant}"
+                );
+                assert!(
+                    std::fs::symlink_metadata(root.join(plant)).is_err(),
+                    "{what}: `{script}` left {plant} behind"
+                );
+                std::fs::remove_file(root.join("n")).ok();
+            }
+
+            // A directory above a store cannot be made at all: SBPL cannot tell
+            // a `mkdir` from a prepared tree moved into the name, so the name
+            // itself is closed under the configured home.
+            is_refused(&sandbox, &format!("mkdir '{at}/.cargo'"), &what).await;
+            is_refused(
+                &sandbox,
+                &format!("echo x > '{at}/.cargo/credentials.toml'"),
+                &what,
+            )
+            .await;
+            assert!(!root.join(".cargo/credentials.toml").exists(), "{what}");
+
+            // What the host then writes at those names is not readable.
+            std::fs::write(root.join(".netrc"), "secret").unwrap();
+            cat(&sandbox, &root, ".netrc")
+                .await
+                .expect_err(&format!("{what}: the host's .netrc was readable"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prepared_directory_cannot_be_moved_into_a_guarded_name() {
+        // The directory was populated under an ordinary name; renaming it into
+        // the guarded name plants its entries at the protected name without a
+        // single create the rules could refuse.
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&["seed.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            for plant in [
+                format!(
+                    "mkdir '{at}/z' && ln '{at}/seed.txt' '{at}/z/credentials.toml' \
+                     && mv '{at}/z' '{at}/.cargo'"
+                ),
+                format!(
+                    "mkdir '{at}/z' && ln -s '{at}/seed.txt' '{at}/z/credentials.toml' \
+                     && mv '{at}/z' '{at}/.cargo'"
+                ),
+            ] {
+                is_refused(&sandbox, &plant, &what).await;
+            }
+            assert!(!root.join(".cargo").exists(), "{what}");
+            assert!(root.join("z").exists(), "{what}");
+
+            // And the store the host then makes itself is still not readable.
+            std::fs::create_dir(root.join(".cargo")).unwrap();
+            std::fs::write(root.join(".cargo/credentials.toml"), "secret").unwrap();
+            cat(&sandbox, &root, ".cargo/credentials.toml")
+                .await
+                .expect_err(&format!("{what}: the host's store was readable"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_protected_location_cannot_escape_by_renaming_an_ancestor() {
+        // Home and every directory above a denied path are guarded, so none of
+        // them can be moved out from under a rule that names a descendant.
+        for (strict, writable) in TOGGLE_MODES {
+            // `.config/gh` and the embedder's `secrets` are denied trees only:
+            // unlike a toggle name, their rule matches by absolute path, so a
+            // renamed ancestor is the whole bypass.
+            let home = home_with(&[".config/gh/hosts.yml", "work/config/secrets/token"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(
+                home_granted(strict, writable, &root).read_denylist(
+                    ReadDenylist::credentials()
+                        .home(&root)
+                        .deny(root.join("work/config/secrets")),
+                ),
+            )
+            .await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            for script in [
+                // The home directory stand-in itself, an ancestor of every
+                // denied path.
+                format!("mv '{at}' '{at}2' && cat '{at}2/.config/gh/hosts.yml'"),
+                // The directories above the embedder's denied path: the granted
+                // tree's root, then the denied path's own parent.
+                format!("mv '{at}/work' '{at}/w' && cat '{at}/w/config/secrets/token'"),
+                format!("mv '{at}/work/config' '{at}/work/c' && cat '{at}/work/c/secrets/token'"),
+            ] {
+                is_refused(&sandbox, &script, &what).await;
+            }
+
+            // An ancestor above the configured home is guarded too: moving the
+            // stand-in's parent would put the whole table under a new name. Only
+            // the fully-writable shape can even attempt it.
+            if writable {
+                let parent = root.parent().unwrap().display();
+                let name = root.file_name().unwrap().to_string_lossy();
+                is_refused(
+                    &sandbox,
+                    &format!(
+                        "mv '{parent}' '{parent}2' && cat '{parent}2/{name}/.config/gh/hosts.yml'"
+                    ),
+                    &what,
+                )
+                .await;
+            }
+
+            assert!(
+                root.join(".config/gh/hosts.yml").exists()
+                    && root.join("work/config/secrets/token").exists(),
+                "{what}: an ancestor was moved"
+            );
+            assert!(!root.join("work/c").exists(), "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_existing_protected_file_cannot_be_overwritten() {
+        // Planting is not the only change: writing into a file the store already
+        // holds replaces its contents just as surely.
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&[".ssh/id_ed25519", ".netrc", ".docker/config.json"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            for script in [
+                format!("echo evil >> '{at}/.ssh/id_ed25519'"),
+                format!("echo x > '{at}/.netrc'"),
+                format!("echo x > '{at}/.docker/config.json'"),
+            ] {
+                is_refused(&sandbox, &script, &what).await;
+            }
+            for kept in [".ssh/id_ed25519", ".netrc", ".docker/config.json"] {
+                assert_eq!(
+                    std::fs::read_to_string(root.join(kept)).unwrap(),
+                    "secret",
+                    "{what}: {kept} was changed"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_inside_a_store_does_not_expose_the_other_names() {
+        // A grant inside `.ssh` opens what it names; the store's directory
+        // itself stays unlisted even when a wider grant also reads the home.
+        let home = home_with(&[".ssh/id_ed25519", ".ssh/keys/k", "notes.txt"]);
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let sandbox = start(
+            toggled(false, true)
+                .readable(fixtures::resolved(&root))
+                .readable(fixtures::resolved(root.join(".ssh/keys")))
+                .read_denylist(ReadDenylist::credentials().home(&root)),
+        )
+        .await;
+
+        cat(&sandbox, &root, ".ssh/keys/k")
+            .await
+            .unwrap_or_else(|error| panic!("the grant inside the store was not opened: {error}"));
+        is_refused(
+            &sandbox,
+            &format!("ls '{}/.ssh'", root.display()),
+            "the store's other names",
+        )
+        .await;
+        is_refused(
+            &sandbox,
+            &format!("cat '{}/.ssh/id_ed25519'", root.display()),
+            "the store's other entries",
+        )
+        .await;
+        cat(&sandbox, &root, "notes.txt")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[tokio::test]
+    async fn a_prepared_git_directory_cannot_be_moved_into_a_repo() {
+        // `.git` and the directories above the user-site packages are guarded
+        // names too: a prepared tree moved into one is a create at the name.
+        let home = home_with(&["repo/src/lib.rs"]);
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir(root.join(".local")).unwrap();
+        let sandbox = start(
+            SandboxConfigBuilder::default()
+                .writable(fixtures::resolved(&root))
+                .write_denylist(WriteDenylist::persistence().home(&root)),
+        )
+        .await;
+        let at = root.display();
+
+        for script in [
+            format!("mkdir '{at}/z' && mkdir '{at}/z/hooks' && mv '{at}/z' '{at}/repo/.git'"),
+            format!("mkdir '{at}/prepared' && mv '{at}/prepared' '{at}/.local/lib'"),
+        ] {
+            let output = sh(&sandbox, &script).await;
+            assert!(!output.status.success(), "{script}");
+        }
+        assert!(!root.join("repo/.git").exists());
+        assert!(!root.join(".local/lib").exists());
+    }
+
+    #[tokio::test]
+    async fn a_read_only_grant_inside_a_store_does_not_open_it_for_writing() {
+        // A grant that reads a credential store opens exactly that: writes,
+        // renames and new entries under it stay denied.
+        let home = home_with(&[".ssh/id_ed25519"]);
+        let root = std::fs::canonicalize(home.path()).unwrap();
+        let sandbox = start(
+            toggled(false, true)
+                .readable(fixtures::resolved(root.join(".ssh")))
+                .read_denylist(ReadDenylist::credentials().home(&root)),
+        )
+        .await;
+        let at = root.display();
+
+        cat(&sandbox, &root, ".ssh/id_ed25519")
+            .await
+            .expect("the readable grant opens the file");
+
+        for script in [
+            format!("echo x > '{at}/.ssh/new_key'"),
+            format!("echo x >> '{at}/.ssh/id_ed25519'"),
+            format!("mv '{at}/.ssh' '{at}/x'"),
+        ] {
+            is_refused(&sandbox, &script, "read-only grant").await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join(".ssh/id_ed25519")).unwrap(),
+            "secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guarded_directory_cannot_have_its_attributes_changed() {
+        // Renames and creates are not the whole of a change: flags and modes
+        // on a guarded directory are refused as well.
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&[".ssh/id_ed25519"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            for script in [
+                format!("chmod 777 '{at}'"),
+                format!("chflags uchg '{at}/.ssh'"),
+                format!("xattr -w k v '{at}/.ssh'"),
+            ] {
+                is_refused(&sandbox, &script, &what).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_name_outside_the_configured_home_stays_ordinary() {
+        // Reads stay protected wherever a name matches, but a project's `.cargo`
+        // or `.npmrc` is the sandbox's to create, change, remove and rename.
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&["project/src/lib.rs"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            succeeds(
+                &sandbox,
+                &format!(
+                    "mkdir '{at}/project/.cargo' && echo x > '{at}/project/.npmrc' \
+                     && mkdir '{at}/project/.docker' && mv '{at}/project/.docker' '{at}/project/d' \
+                     && echo x > '{at}/project/.cargo/config.toml' \
+                     && rm '{at}/project/.npmrc' && rmdir '{at}/project/.cargo' 2>/dev/null; \
+                     rm -r '{at}/project/.cargo' '{at}/project/d'"
+                ),
+            )
+            .await;
+            assert!(
+                !root.join("project/.cargo").exists() && !root.join("project/d").exists(),
+                "{what}"
+            );
+
+            // A same-named file inside the home but off the protected path is
+            // ordinary too: `~/project/.netrc` is not `~/.netrc`.
+            std::fs::write(root.join("project/.netrc"), "secret").unwrap();
+            cat(&sandbox, &root, "project/.netrc")
+                .await
+                .unwrap_or_else(|error| panic!("{what}: a same-named file was denied: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_naming_a_store_opens_exactly_it_for_reading_and_writing() {
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&[".ssh/id_ed25519", ".aws/credentials", "notes.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(
+                toggled(strict, writable)
+                    .readable(fixtures::resolved(&root))
+                    .writable(fixtures::resolved(root.join(".ssh")))
+                    .read_denylist(ReadDenylist::credentials().home(&root)),
+            )
+            .await;
+            let what = format!("strict={strict} writable={writable}");
+            let at = root.display();
+
+            let printed = succeeds(
+                &sandbox,
+                &format!(
+                    "cat '{at}/.ssh/id_ed25519' && echo made > '{at}/.ssh/known_hosts' \
+                     && cat '{at}/.ssh/known_hosts' && mv '{at}/.ssh/known_hosts' '{at}/.ssh/kept' \
+                     && cat '{at}/.ssh/kept'"
+                ),
+            )
+            .await;
+            assert_eq!(printed, "secretmade\nmade", "{what}");
+            cat(&sandbox, &root, ".aws/credentials")
+                .await
+                .expect_err(&format!("{what}: the grant opened another store"));
+            is_refused(
+                &sandbox,
+                &format!("mv '{at}/.aws' '{at}/x' && cat '{at}/x/credentials'"),
+                &what,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn files_the_sandbox_creates_under_a_granted_directory_stay_readable_and_writable() {
+        for (strict, writable) in TOGGLE_MODES {
+            let home = home_with(&[".ssh/id_ed25519", "notes.txt"]);
+            let root = std::fs::canonicalize(home.path()).unwrap();
+            let sandbox = start(home_granted(strict, writable, &root)).await;
+            let at = root.display();
+
+            let printed = succeeds(
+                &sandbox,
+                &format!(
+                    "mkdir '{at}/made' && echo a > '{at}/made/f' && echo b >> '{at}/made/f' \
+                     && cat '{at}/made/f' && echo c > '{at}/top.txt' && cat '{at}/top.txt' \
+                     && mv '{at}/top.txt' '{at}/moved.txt' && cat '{at}/moved.txt' \
+                     && ln -s moved.txt '{at}/alias' && cat '{at}/alias' && ls '{at}' > /dev/null \
+                     && rm '{at}/alias' '{at}/moved.txt'"
+                ),
+            )
+            .await;
+            assert_eq!(
+                printed, "a\nb\nc\nc\nc",
+                "strict={strict} writable={writable}"
+            );
+        }
     }
 }
 
