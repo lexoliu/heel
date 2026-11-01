@@ -15,7 +15,12 @@
 //! Both tables are fixed in code. An embedder can add paths to a policy, never
 //! remove one: a policy that could be narrowed from configuration would be a
 //! setting rather than a boundary. Both are enforced after every grant, so a
-//! grant naming a denied location does not reopen it.
+//! grant of a directory that contains a denied location does not reopen it. On
+//! macOS a grant that names a credential store, or a path inside one, opens
+//! what it names, because the embedder that wrote it asked for exactly that —
+//! and only a writable grant opens it to changes; Linux keeps every denied
+//! location denied, grant or not. Persistence locations are never reopened on
+//! either platform.
 //!
 //! The macOS and Linux backends enforce them. A sandbox configured with either
 //! policy on a platform whose backend cannot (Windows) fails when it is
@@ -27,12 +32,18 @@ use std::path::PathBuf;
 mod resolve;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use resolve::{Pattern, Resolved};
+#[cfg(target_os = "macos")]
+pub(crate) use resolve::{resolve_lenient, resolved_home};
 
 /// Paths a sandbox must not read: credential stores and keys.
 ///
 /// Built with [`ReadDenylist::credentials`], which names the fixed table, and
 /// extended with [`ReadDenylist::deny`] for the embedder's own secrets. Pass it
 /// to [`SandboxConfigBuilder::read_denylist`](crate::SandboxConfigBuilder::read_denylist).
+///
+/// A grant of a directory that contains a denied path leaves it denied. A grant
+/// naming the denied path itself, or a path inside it, opens that path and what
+/// is beneath it, and nothing else of the store.
 ///
 /// A denied read fails with `EPERM` (macOS) or `EACCES` (Linux) against the path
 /// it was made on, which every ordinary tool reports by name. On macOS the keychain is also closed at the
@@ -96,6 +107,12 @@ impl ReadDenylist {
     pub fn extra(&self) -> &[PathBuf] {
         &self.extra
     }
+
+    /// The home the table resolves against, when the embedder set one.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn configured_home(&self) -> Option<&std::path::Path> {
+        self.home.as_deref()
+    }
 }
 
 /// Paths a sandbox must not write: places where a write persists as code that
@@ -105,9 +122,10 @@ impl ReadDenylist {
 /// [`WriteDenylist::deny`]. Pass it to
 /// [`SandboxConfigBuilder::write_denylist`](crate::SandboxConfigBuilder::write_denylist).
 ///
-/// The denial covers creating, changing, renaming and removing, and the
-/// directories that contain a denied location cannot be renamed away and
-/// replaced with a lookalike either. Everything else keeps the writability the
+/// The denial covers creating, changing, renaming and removing, and every
+/// directory above a denied location, home and above included, cannot be
+/// renamed away and replaced with a lookalike either. Everything else keeps the
+/// writability the
 /// grants and [`SandboxConfigBuilder::writable_file_system`](crate::SandboxConfigBuilder::writable_file_system)
 /// give it.
 ///
@@ -184,5 +202,11 @@ impl WriteDenylist {
     /// The directories the `.git/hooks` rule leaves alone.
     pub fn exempt(&self) -> &[PathBuf] {
         &self.exempt
+    }
+
+    /// The home the table resolves against, when the embedder set one.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn configured_home(&self) -> Option<&std::path::Path> {
+        self.home.as_deref()
     }
 }
