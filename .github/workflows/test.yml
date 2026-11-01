@@ -20,7 +20,7 @@ jobs:
         # per architecture: a rule compiled in on x86_64 and compiled out on
         # aarch64 leaves a hole that nothing else here would show. That is not
         # hypothetical -- `clone3` went unfiltered on aarch64 exactly that way.
-        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-26]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
