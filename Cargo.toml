@@ -30,7 +30,7 @@ version = "0.7.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform native sandboxing library for running untrusted code"
-repository = "https://github.com/lexoliu/heel"
+repository = "https://github.com/May-Agent/heel"
 keywords = ["sandbox", "security", "isolation", "python", "venv"]
 categories = ["os", "development-tools"]
 
