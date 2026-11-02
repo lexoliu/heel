@@ -669,6 +669,13 @@ mod tests {
 
         assert!(
             profile.contains(&format!(
+                "(allow file-map-executable (subpath \"{}\"))",
+                dir.path().display()
+            )),
+            "a native binary in the working dir maps"
+        );
+        assert!(
+            profile.contains(&format!(
                 "(allow process-exec (subpath \"{}\"))",
                 dir.path().display()
             )),

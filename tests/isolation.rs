@@ -137,6 +137,31 @@ async fn an_executable_working_dir_runs_what_it_holds() {
         "a script in an executable working dir runs: {}",
         stderr(&output)
     );
+
+    // A native binary — `cargo test`'s output is one — must map and exec
+    // too; a script passing alone says nothing about `file-map-executable`.
+    // The probe is this test binary: copying an Apple platform binary gets it
+    // killed at exec for signature reasons outside any sandbox.
+    let workdir = sandbox.working_dir().to_path_buf();
+    let probe = workdir.join("native-probe");
+    std::fs::copy(std::env::current_exe().expect("test binary"), &probe).expect("copy binary");
+    let probe = probe.display().to_string();
+    let output = sh(
+        &sandbox,
+        &format!("chmod +x {probe} && {probe} --list | head -1"),
+    )
+    .await;
+
+    assert!(
+        output.status.success(),
+        "a native binary in an executable working dir runs: {}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(": test"),
+        "the probe listed its tests: {}",
+        stdout(&output)
+    );
 }
 
 #[tokio::test]

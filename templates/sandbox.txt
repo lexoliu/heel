@@ -248,6 +248,9 @@
 (allow file-write-create (subpath "{{ working_dir }}"))
 (allow file-write-unlink (subpath "{{ working_dir }}"))
 {% if executable_working_dir %}
+; A native binary must map into memory before the kernel execs it — allow
+; the map too, or exec dies with a bare SIGKILL.
+(allow file-map-executable (subpath "{{ working_dir }}"))
 (allow process-exec (subpath "{{ working_dir }}"))
 {% else %}
 (deny process-exec (subpath "{{ working_dir }}"))
