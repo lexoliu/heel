@@ -116,6 +116,30 @@ async fn an_explicit_allow_beats_a_default_protection() {
 }
 
 #[tokio::test]
+async fn an_executable_working_dir_runs_what_it_holds() {
+    let config = SandboxConfigBuilder::default()
+        .executable_working_dir(true)
+        .build();
+    let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .expect("sandbox starts");
+
+    let output = sh(
+        &sandbox,
+        "printf '#!/bin/sh\necho executed\n' > run.sh \
+         && chmod +x run.sh && ./run.sh",
+    )
+    .await;
+
+    assert_eq!(
+        stdout(&output),
+        "executed",
+        "a script in an executable working dir runs: {}",
+        stderr(&output)
+    );
+}
+
+#[tokio::test]
 async fn a_program_written_to_shared_temp_cannot_be_executed() {
     // Permissive makes the whole filesystem writable, which is exactly when
     // shared temp needs the same no-exec protection as the working directory.

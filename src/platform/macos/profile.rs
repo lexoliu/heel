@@ -319,6 +319,7 @@ impl HostRules {
 struct SandboxProfile {
     grants: Vec<GrantRules>,
     working_dir: String,
+    executable_working_dir: bool,
     ipc_bin_dir: Option<String>,
     ipc_socket_dir: Option<String>,
     ipc_socket: Option<String>,
@@ -411,6 +412,7 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
     let template = SandboxProfile {
         grants,
         working_dir: sbpl_path(config.working_dir())?,
+        executable_working_dir: config.working_dir_is_executable(),
         ipc_bin_dir: config.ipc_bin_dir().map(sbpl_path).transpose()?,
         ipc_socket_dir: config
             .ipc_socket()
@@ -653,6 +655,33 @@ mod tests {
             "(deny process-exec (subpath \"{}\"))",
             dir.path().display()
         )));
+        assert!(profile.contains("(deny process-exec (subpath \"/private/tmp\"))"));
+    }
+
+    #[test]
+    fn an_executable_working_dir_is_allowed_exec_last() {
+        let (data, dir) = prepared_config(
+            SandboxConfig::builder()
+                .executable_working_dir(true)
+                .build(),
+        );
+        let profile = generate_profile(&data, None).unwrap();
+
+        assert!(
+            profile.contains(&format!(
+                "(allow process-exec (subpath \"{}\"))",
+                dir.path().display()
+            )),
+            "the executable working dir allows exec"
+        );
+        assert!(
+            !profile.contains(&format!(
+                "(deny process-exec (subpath \"{}\"))",
+                dir.path().display()
+            )),
+            "the executable working dir is not denied"
+        );
+        // Shared temp stays denied — only the working dir opted in.
         assert!(profile.contains("(deny process-exec (subpath \"/private/tmp\"))"));
     }
 

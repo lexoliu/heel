@@ -330,6 +330,7 @@ pub struct SandboxConfigData {
     python: Option<PythonConfig>,
     working_dir: PathBuf,
     working_dir_auto: bool,
+    executable_working_dir: bool,
     filesystem_strict: bool,
     writable_file_system: bool,
     read_denylist: Option<ReadDenylist>,
@@ -426,6 +427,15 @@ impl SandboxConfigData {
     /// Whether the working directory path was generated rather than supplied.
     pub fn working_dir_is_auto(&self) -> bool {
         self.working_dir_auto
+    }
+
+    /// Whether the working directory executes what it holds.
+    ///
+    /// Off by default: a writable directory cannot be staged and run. On, a
+    /// sandboxed process can execute files inside the working directory —
+    /// what a build needs to run its own outputs.
+    pub fn working_dir_is_executable(&self) -> bool {
+        self.executable_working_dir
     }
 
     /// Whether reads outside the working directory and allow list are denied.
@@ -635,6 +645,7 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 // sandbox creates it.
                 working_dir: PathBuf::new(),
                 working_dir_auto: true,
+                executable_working_dir: false,
                 filesystem_strict: true,
                 writable_file_system: false,
                 read_denylist: None,
@@ -823,6 +834,17 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     pub fn working_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.data.working_dir = path.as_ref().to_path_buf();
         self.data.working_dir_auto = false;
+        self
+    }
+
+    /// Make the working directory executable, so builds can run their own
+    /// outputs. Anything written there can already be run through an
+    /// interpreter, so this lifts no real boundary for callers that run
+    /// untrusted scripts anyway.
+    ///
+    /// Off by default.
+    pub fn executable_working_dir(mut self, executable: bool) -> Self {
+        self.data.executable_working_dir = executable;
         self
     }
 

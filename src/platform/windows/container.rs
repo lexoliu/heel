@@ -258,7 +258,12 @@ impl Container {
             self.grant_path(&temp, Access::READ)?;
         }
         self.grant_ancestors(config.working_dir())?;
-        self.grant_path(config.working_dir(), Access::WRITE)?;
+        let workdir_access = if config.working_dir_is_executable() {
+            Access::WRITE | Access::EXEC
+        } else {
+            Access::WRITE
+        };
+        self.grant_path(config.working_dir(), workdir_access)?;
 
         for grant in config.grants() {
             self.grant_ancestors(grant.path())?;

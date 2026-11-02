@@ -535,9 +535,16 @@ fn landlock_access(access: Access, abi: ABI) -> BitFlags<AccessFs> {
 
 /// Plan the rules for the paths the caller configured.
 fn configured_rules(config: &SandboxConfigData, abi: ABI) -> Vec<ConfiguredRule> {
+    // An executable working dir also runs what it holds — a build's own
+    // outputs; see `SandboxConfigBuilder::executable_working_dir`.
+    let workdir_access = if config.working_dir_is_executable() {
+        writable_access(abi) | AccessFs::Execute
+    } else {
+        writable_access(abi)
+    };
     let mut rules = vec![ConfiguredRule {
         path: config.working_dir().to_path_buf(),
-        access: writable_access(abi),
+        access: workdir_access,
     }];
 
     // The generated IPC shims live in a private directory and are written
@@ -748,6 +755,33 @@ mod tests {
         let dir = crate::workdir::WorkingDir::create(data.working_dir(), true).expect("creates");
         data.set_working_dir(dir.path().to_path_buf());
         (data, dir)
+    }
+
+    /// The working dir runs what it holds only when the caller opted in.
+    #[test]
+    fn the_working_dir_executes_only_when_configured() {
+        let access_of = |executable: bool| {
+            let (data, dir) = prepared(
+                SandboxConfig::builder()
+                    .executable_working_dir(executable)
+                    .build(),
+            );
+            let rule = configured_rules(&data, ABI::V4)
+                .into_iter()
+                .find(|rule| rule.path == dir.path())
+                .expect("a working-dir rule");
+            (rule.access, dir)
+        };
+        let (on, _dir) = access_of(true);
+        assert!(
+            on.contains(AccessFs::Execute),
+            "an executable working dir carries Execute"
+        );
+        let (off, _dir) = access_of(false);
+        assert!(
+            !off.contains(AccessFs::Execute),
+            "the default working dir stays non-executable"
+        );
     }
 
     #[test]
