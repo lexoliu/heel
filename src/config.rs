@@ -346,6 +346,10 @@ pub struct SandboxConfigData {
     heel_binary: Option<PathBuf>,
     external_ipc: Option<crate::ipc::TcpIpcEndpoint>,
     allow_tty_write: bool,
+    /// The paths every macOS profile of the sandbox carries to attribute its
+    /// processes; set once the sandbox has created the files.
+    #[cfg(target_os = "macos")]
+    attribution: Option<crate::platform::macos::attribution::MarkerPaths>,
 }
 
 impl SandboxConfigData {
@@ -500,6 +504,21 @@ impl SandboxConfigData {
         self.working_dir = path;
     }
 
+    /// Record the files that attribute processes to the sandbox.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_attribution(
+        &mut self,
+        paths: crate::platform::macos::attribution::MarkerPaths,
+    ) {
+        self.attribution = Some(paths);
+    }
+
+    /// The files that attribute processes to the sandbox, once created.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn attribution(&self) -> Option<&crate::platform::macos::attribution::MarkerPaths> {
+        self.attribution.as_ref()
+    }
+
     /// Record the IPC socket the server bound.
     pub(crate) fn set_ipc_socket(&mut self, path: Option<PathBuf>) {
         self.ipc_socket = path;
@@ -624,6 +643,8 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 external_ipc: None,
                 // Deny /dev/tty writes by default so all output is captured.
                 allow_tty_write: false,
+                #[cfg(target_os = "macos")]
+                attribution: None,
             },
             ipc: None,
             ipc_state: std::marker::PhantomData,

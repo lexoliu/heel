@@ -15,6 +15,8 @@ use crate::error::{Error, Result};
 use crate::grant::Access;
 use crate::ipc::{IpcLayout, IpcServer};
 use crate::network::{DenyAll, NetworkPolicy, NetworkProxy};
+#[cfg(target_os = "macos")]
+use crate::platform::macos::attribution::{AttributionError, Membership};
 use crate::platform::{self, NativeBackend};
 use crate::resolve::ResolvedPath;
 use crate::workdir::WorkingDir;
@@ -202,6 +204,9 @@ pub struct Sandbox<N: NetworkPolicy = DenyAll> {
     )]
     ipc_socket_dir: Option<WorkingDir>,
     working_dir: WorkingDir,
+    /// The files that attribute processes to this sandbox, removed with it.
+    #[cfg(target_os = "macos")]
+    attribution: crate::platform::macos::attribution::MarkerFiles,
 }
 
 impl Sandbox<DenyAll> {
@@ -249,6 +254,12 @@ impl<N: NetworkPolicy> Sandbox<N> {
         let auto = config_data.working_dir_is_auto();
         let working_dir = unblock(move || WorkingDir::create(&requested_dir, auto)).await?;
         config_data.set_working_dir(working_dir.path().to_path_buf());
+
+        // Before the backend, whose profile names the files.
+        #[cfg(target_os = "macos")]
+        let attribution = unblock(crate::platform::macos::attribution::MarkerFiles::create).await?;
+        #[cfg(target_os = "macos")]
+        config_data.set_attribution(attribution.paths().clone());
 
         // DenyAll needs no proxy: the backend denies outbound traffic outright,
         // which is a stronger guarantee than a userspace rejection.
@@ -321,6 +332,8 @@ impl<N: NetworkPolicy> Sandbox<N> {
             process_tracker: ProcessTracker::new(),
             ipc_socket_dir,
             working_dir,
+            #[cfg(target_os = "macos")]
+            attribution,
         })
     }
 
@@ -425,6 +438,28 @@ impl<N: NetworkPolicy> Sandbox<N> {
     /// The sandbox working directory.
     pub fn working_dir(&self) -> &std::path::Path {
         self.working_dir.path()
+    }
+
+    /// Whether the process with `pid` runs under this sandbox.
+    ///
+    /// Every process started by the sandbox's commands does, and so does every
+    /// descendant of theirs: a descendant that daemonizes, calls `setsid`, is
+    /// reparented to launchd and executes another program keeps the sandbox
+    /// profile the kernel attached, and the answer follows it. The root of a
+    /// command need not be alive. A process of another sandbox, or none, is
+    /// [`Membership::NotMember`], and a pid nothing runs under is
+    /// [`Membership::Gone`].
+    ///
+    /// The answer comes from an Apple SPI. When the system cannot give it the
+    /// result is an [`AttributionError`], never `NotMember`.
+    ///
+    /// # Errors
+    ///
+    /// [`AttributionError`] when the SPI is missing or fails, or a marker file
+    /// was removed from under the sandbox.
+    #[cfg(target_os = "macos")]
+    pub fn membership(&self, pid: u32) -> std::result::Result<Membership, AttributionError> {
+        crate::platform::macos::attribution::membership(self.attribution.paths(), pid)
     }
 
     /// Start recording the accesses this sandbox denies.

@@ -175,6 +175,9 @@ struct SandboxProfile {
     deny_keychain_services: bool,
     read_rules: Option<HostRules>,
     write_rules: Option<HostRules>,
+    // Process attribution
+    marker: String,
+    control: String,
 }
 
 /// Generate an SBPL profile from a sandbox configuration.
@@ -183,6 +186,11 @@ struct SandboxProfile {
 /// is `None` the profile denies all outbound connections in the kernel.
 pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<String> {
     let security = config.security();
+    let attribution = config.attribution().ok_or_else(|| {
+        Error::InitFailed(
+            "a sandbox profile needs the attribution files its sandbox creates".to_string(),
+        )
+    })?;
 
     let mut template = SandboxProfile {
         grants: grant_rules(config.grants())?,
@@ -242,6 +250,8 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
             .map(|denylist| HostRules::new(&denylist.resolve()?))
             .transpose()?,
         traversal_paths: Vec::new(),
+        marker: sbpl_path(attribution.marker())?,
+        control: sbpl_path(attribution.control())?,
     };
     template.traversal_paths = traversal_paths(&template);
 
@@ -376,6 +386,8 @@ mod tests {
         let dir = WorkingDir::create(data.working_dir(), data.working_dir_is_auto())
             .expect("working directory is created");
         data.set_working_dir(dir.path().to_path_buf());
+        let paths = crate::platform::macos::attribution::MarkerPaths::for_test(dir.path());
+        data.set_attribution(paths);
         (data, dir)
     }
 
