@@ -69,6 +69,8 @@ pub struct PrioritySection {
 pub struct WorkdirSection {
     pub path: Option<PathBuf>,
     pub keep: bool,
+    /// Execute files inside the working directory.
+    pub executable: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -104,6 +106,7 @@ pub struct MergedConfig {
     pub priority: ProcessPriority,
     pub working_dir: Option<PathBuf>,
     pub keep_working_dir: bool,
+    pub executable_working_dir: bool,
     pub env_passthroughs: Vec<String>,
     pub env_set: BTreeMap<String, String>,
     pub python: MergedPythonConfig,
@@ -190,6 +193,7 @@ pub fn merge_config(file: FileConfig, cli: &CommonArgs) -> CliResult<MergedConfi
         priority: merge_priority(&file.priority, cli)?,
         working_dir: cli.working_dir.clone().or(file.workdir.path),
         keep_working_dir: cli.keep_working_dir || file.workdir.keep,
+        executable_working_dir: cli.executable_working_dir || file.workdir.executable,
         env_passthroughs: concat(file.env.passthrough, &cli.env_passthroughs),
         env_set,
         python: MergedPythonConfig {

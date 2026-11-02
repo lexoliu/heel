@@ -301,6 +301,11 @@ pub struct CommonArgs {
     #[arg(long)]
     pub keep_working_dir: bool,
 
+    /// Execute files inside the working directory, so builds can run their
+    /// own outputs.
+    #[arg(long)]
+    pub executable_working_dir: bool,
+
     /// Host environment variable to forward; may be repeated.
     #[arg(long = "env-passthrough")]
     pub env_passthroughs: Vec<String>,
