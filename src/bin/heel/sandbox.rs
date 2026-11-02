@@ -135,7 +135,8 @@ fn build<N: NetworkPolicy, I>(
         .grants(paths.grants.iter().cloned())
         .env_passthroughs(config.env_passthroughs.iter().cloned())
         .filesystem_strict(config.isolation.filesystem_strict())
-        .writable_file_system(config.isolation.writable_file_system());
+        .writable_file_system(config.isolation.writable_file_system())
+        .executable_working_dir(config.executable_working_dir);
 
     if let Some(dir) = &paths.working_dir {
         builder = builder.working_dir(dir.as_path());

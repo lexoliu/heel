@@ -203,6 +203,8 @@ impl<'a> Command<'a> {
             stdin,
             stdout,
             stderr,
+            #[cfg(target_os = "linux")]
+            inherit_fd: None,
         }
     }
 
@@ -261,6 +263,75 @@ impl<'a> Command<'a> {
 
         self.process_tracker.register(child.id());
         Ok(child.with_tracker(self.process_tracker.clone()))
+    }
+
+    /// Spawn the command under a supervisor that owns its whole process tree.
+    ///
+    /// The sandbox must have been built with
+    /// [`supervised_spawn(true)`](crate::SandboxConfigBuilder::supervised_spawn).
+    /// The standard streams are inherited unless configured otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the sandbox was not built for supervised spawns, or if the
+    /// supervisor cannot be started.
+    #[cfg(target_os = "linux")]
+    pub async fn spawn_supervised<M: crate::supervisor::Supervision>(
+        self,
+        mode: M,
+    ) -> Result<crate::supervisor::SupervisedChild<M>> {
+        use std::os::fd::AsRawFd;
+
+        let binary = self
+            .config
+            .supervisor_binary()
+            .ok_or(crate::error::Error::SupervisorNotConfigured)?;
+        let binary = binary.to_str().ok_or_else(|| {
+            crate::error::Error::InitFailed(format!(
+                "the heel binary path is not UTF-8: {}",
+                binary.display()
+            ))
+        })?;
+        let (host, supervisor_end) = std::os::unix::net::UnixStream::pair()?;
+        // Above the standard streams: `std` installs those over the child's
+        // descriptors 0-2 before `exec`, which would replace the socket if it
+        // had landed on one of them (a host started with a stream closed).
+        let inherited =
+            rustix::io::fcntl_dupfd_cloexec(&supervisor_end, 3).map_err(std::io::Error::from)?;
+        // Our only other copy of it, closed so the host sees the supervisor's
+        // exit as the end of the stream.
+        drop(supervisor_end);
+        let shared = crate::supervisor::Shared::new(host, mode.reap_timeout())?;
+        let arguments = crate::supervisor::arguments(
+            mode.mode(),
+            inherited.as_raw_fd(),
+            mode.reap_timeout(),
+            &self.program,
+            &self.args,
+        );
+        let envs = self.build_envs();
+        let request = SpawnRequest {
+            config: self.config,
+            proxy_port: self.proxy.as_ref().map(|proxy| proxy.port),
+            program: binary,
+            args: &arguments,
+            envs: &envs,
+            current_dir: self.current_dir.as_deref(),
+            stdin: self.stdio(self.stdin),
+            stdout: self.stdio(self.stdout),
+            stderr: self.stdio(self.stderr),
+            inherit_fd: Some(inherited.as_raw_fd()),
+        };
+        let child = self.backend.spawn(request).await?;
+        // The supervisor holds its end now; keeping ours would hide its exit.
+        drop(inherited);
+
+        // Dropping the sandbox ends the tree through the supervisor, not by
+        // signalling its process group.
+        self.process_tracker
+            .register_supervisor(child.id(), std::sync::Arc::downgrade(&shared));
+        let child = child.with_tracker(self.process_tracker.clone());
+        Ok(crate::supervisor::SupervisedChild::new(child, shared))
     }
 }
 

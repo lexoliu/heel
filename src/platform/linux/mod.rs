@@ -157,6 +157,21 @@ impl LinuxBackend {
         let mut ruleset = Some(ruleset);
         let mut filter = Some(filter);
 
+        if let Some(fd) = request.inherit_fd {
+            // SAFETY: `fcntl` is async-signal-safe and allocates nothing; the
+            // descriptor is open in the parent for the whole spawn, so it is
+            // open here too. Rust marks every descriptor close-on-exec, which
+            // is what this one is exempted from.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
         // SAFETY: the closure only applies pre-built rulesets and filters and
         // installs resource limits and scheduling priority, all of which are
         // plain syscalls. Nothing here allocates or takes a lock, as

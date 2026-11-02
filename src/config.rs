@@ -330,6 +330,7 @@ pub struct SandboxConfigData {
     python: Option<PythonConfig>,
     working_dir: PathBuf,
     working_dir_auto: bool,
+    executable_working_dir: bool,
     filesystem_strict: bool,
     writable_file_system: bool,
     read_denylist: Option<ReadDenylist>,
@@ -350,6 +351,13 @@ pub struct SandboxConfigData {
     /// processes; set once the sandbox has created the files.
     #[cfg(target_os = "macos")]
     attribution: Option<crate::platform::macos::attribution::MarkerPaths>,
+    /// Whether commands may be spawned under a per-command supervisor.
+    #[cfg(target_os = "linux")]
+    supervised_spawn: bool,
+    /// The `heel` binary the supervisor runs as, resolved when the sandbox is
+    /// created and executable inside it. `None` unless `supervised_spawn`.
+    #[cfg(target_os = "linux")]
+    supervisor_binary: Option<PathBuf>,
 }
 
 impl SandboxConfigData {
@@ -425,6 +433,15 @@ impl SandboxConfigData {
         self.working_dir_auto
     }
 
+    /// Whether the working directory executes what it holds.
+    ///
+    /// Off by default: a writable directory cannot be staged and run. On, a
+    /// sandboxed process can execute files inside the working directory —
+    /// what a build needs to run its own outputs.
+    pub fn working_dir_is_executable(&self) -> bool {
+        self.executable_working_dir
+    }
+
     /// Whether reads outside the working directory and allow list are denied.
     pub fn filesystem_strict(&self) -> bool {
         self.filesystem_strict
@@ -497,6 +514,25 @@ impl SandboxConfigData {
     /// Whether the sandboxed process may write to the controlling terminal.
     pub fn allow_tty_write(&self) -> bool {
         self.allow_tty_write
+    }
+
+    /// Whether commands may be spawned under a per-command supervisor.
+    #[cfg(target_os = "linux")]
+    pub fn supervised_spawn(&self) -> bool {
+        self.supervised_spawn
+    }
+
+    /// The `heel` binary a supervised command runs under, once the sandbox
+    /// has resolved it.
+    #[cfg(target_os = "linux")]
+    pub fn supervisor_binary(&self) -> Option<&Path> {
+        self.supervisor_binary.as_deref()
+    }
+
+    /// Record the `heel` binary the supervisor runs as.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_supervisor_binary(&mut self, path: PathBuf) {
+        self.supervisor_binary = Some(path);
     }
 
     /// Replace the working directory with its canonical, created form.
@@ -628,6 +664,7 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 // sandbox creates it.
                 working_dir: PathBuf::new(),
                 working_dir_auto: true,
+                executable_working_dir: false,
                 filesystem_strict: true,
                 writable_file_system: false,
                 read_denylist: None,
@@ -644,7 +681,11 @@ impl Default for SandboxConfigBuilder<DenyAll> {
                 // Deny /dev/tty writes by default so all output is captured.
                 allow_tty_write: false,
                 #[cfg(target_os = "macos")]
-                attribution: None,
+                attribution: Option::None,
+                #[cfg(target_os = "linux")]
+                supervised_spawn: false,
+                #[cfg(target_os = "linux")]
+                supervisor_binary: None,
             },
             ipc: None,
             ipc_state: std::marker::PhantomData,
@@ -817,6 +858,17 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
         self
     }
 
+    /// Make the working directory executable, so builds can run their own
+    /// outputs. Anything written there can already be run through an
+    /// interpreter, so this lifts no real boundary for callers that run
+    /// untrusted scripts anyway.
+    ///
+    /// Off by default.
+    pub fn executable_working_dir(mut self, executable: bool) -> Self {
+        self.data.executable_working_dir = executable;
+        self
+    }
+
     /// Forward one host environment variable into the sandbox.
     pub fn env_passthrough(mut self, var: impl Into<String>) -> Self {
         self.data.env_passthrough.push(var.into());
@@ -898,6 +950,18 @@ impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// ships its own copy.
     pub fn heel_binary(mut self, path: impl AsRef<Path>) -> Self {
         self.data.heel_binary = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Allow [`Command::spawn_supervised`](crate::Command::spawn_supervised).
+    ///
+    /// A supervised command runs under `heel supervise` inside the sandbox, so
+    /// the sandbox has to be able to execute the `heel` binary (found as for
+    /// [`heel_binary`](Self::heel_binary)). Creating the sandbox fails if that
+    /// binary cannot be found.
+    #[cfg(target_os = "linux")]
+    pub fn supervised_spawn(mut self, enabled: bool) -> Self {
+        self.data.supervised_spawn = enabled;
         self
     }
 
