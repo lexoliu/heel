@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4](https://github.com/lexoliu/heel/compare/heel-v0.7.3...heel-v0.7.4) - 2026-11-02
+
+### Other
+
+- Allow file-map-executable for the executable working directory
+- Add opt-in executable working directory
+- float the macOS test job on macos-latest
+- drop the x86_64-apple-darwin lane and float macOS jobs on latest
+- run every macOS job on macOS 26
+- build the arm64 macOS release asset on macos-15 from the release tag
+
 ## [0.7.3](https://github.com/lexoliu/heel/compare/heel-v0.7.2...heel-v0.7.3) - 2026-11-01
 
 ### Fixed
