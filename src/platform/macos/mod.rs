@@ -1,5 +1,6 @@
 //! macOS sandbox backend, built on `sandbox-exec` and SBPL profiles.
 
+pub(crate) mod attribution;
 mod profile;
 
 pub use profile::generate_profile;

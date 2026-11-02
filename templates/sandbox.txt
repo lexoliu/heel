@@ -372,3 +372,16 @@
 ; configured network policy to every request.
 (allow network-outbound (remote ip "localhost:{{ port }}"))
 {% endif %}
+
+; =============================================================================
+; Process attribution
+;
+; Last, so nothing above can undo it. The host asks the kernel whether a
+; process's profile denies the marker and allows the control, which tells a
+; descendant of this sandbox from every other process after it has left the
+; process group, been reparented and executed another program. The control is
+; what keeps another sandbox, which may deny any path, from matching. Both are
+; empty files of the host and open nothing else.
+; =============================================================================
+(deny file-read-data (literal "{{ marker }}") {{ audit }})
+(allow file-read-data (literal "{{ control }}"))
