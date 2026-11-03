@@ -35,13 +35,13 @@ jobs:
         if: runner.os == 'macOS'
         continue-on-error: true
         run: |
-          ./target/debug/heel run --network allow --isolation default -- /usr/bin/curl -sS -v -o /dev/null https://example.com 2>&1 | tail -25 || true
-          echo "--- sandbox denials"
-          /usr/bin/log show --last 3m --style compact --predicate 'eventMessage CONTAINS "deny(" AND (eventMessage CONTAINS "curl" OR eventMessage CONTAINS "trustd" OR eventMessage CONTAINS "heel")' 2>&1 | tail -60
-          echo "--- keychains and trust settings"
-          ls -la /Library/Keychains ~/Library/Keychains 2>&1 | head -30
-          security dump-trust-settings -d 2>&1 | head -10
-          security dump-trust-settings 2>&1 | head -10
+          sw_vers
+          curl --version
+          curl -sS -v -o /dev/null https://example.com 2>&1 | tail -30
+          echo | openssl s_client -connect example.com:443 -servername example.com -showcerts 2>/dev/null | grep -E '^ *[0-9] s:|^   i:|Verify return'
+          ls -la /etc/ssl /etc/ssl/cert.pem 2>&1 | head
+          security find-certificate -a -c "SSL.com TLS ECC Root CA 2022" /System/Library/Keychains/SystemRootCertificates.keychain | head -3
+          security find-certificate -a -c "AAA Certificate Services" /System/Library/Keychains/SystemRootCertificates.keychain | head -3
 
       - name: Native Windows sandbox launch
         if: runner.os == 'Windows'
