@@ -31,6 +31,18 @@ jobs:
       - name: Build
         run: cargo build --verbose --all-features
 
+      - name: Diagnose macOS TLS trust (temporary, heel#166)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          sw_vers
+          curl --version
+          curl -sS -v -o /dev/null https://example.com 2>&1 | tail -30
+          echo | openssl s_client -connect example.com:443 -servername example.com -showcerts 2>/dev/null | grep -E '^ *[0-9] s:|^   i:|Verify return'
+          ls -la /etc/ssl /etc/ssl/cert.pem 2>&1 | head
+          security find-certificate -a -c "SSL.com TLS ECC Root CA 2022" /System/Library/Keychains/SystemRootCertificates.keychain | head -3
+          security find-certificate -a -c "AAA Certificate Services" /System/Library/Keychains/SystemRootCertificates.keychain | head -3
+
       - name: Native Windows sandbox launch
         if: runner.os == 'Windows'
         shell: pwsh
