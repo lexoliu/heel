@@ -42,6 +42,7 @@
 {% endif %}
 (allow mach-lookup (global-name "com.apple.trustd"))                          ; Certificate validation
 (allow mach-lookup (global-name "com.apple.trustd.agent"))                    ; Trust agent
+(allow mach-lookup (global-name "com.apple.TrustEvaluationAgent"))            ; Trust evaluation for SecureTransport clients
 
 ; Launch Services and Core Services
 (allow mach-lookup (global-name "com.apple.lsd.mapdb"))                       ; Launch Services database
