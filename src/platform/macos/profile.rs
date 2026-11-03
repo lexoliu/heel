@@ -1232,6 +1232,11 @@ mod tests {
                 .unwrap()
                 .contains("(allow mach-lookup (global-name \"com.apple.trustd\"))")
         );
+        assert!(
+            generate_profile(&strict, None)
+                .unwrap()
+                .contains("(allow mach-lookup (global-name \"com.apple.TrustEvaluationAgent\"))")
+        );
     }
 
     #[test]
