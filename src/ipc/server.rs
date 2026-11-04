@@ -23,6 +23,7 @@ use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use interprocess::local_socket::{ListenerOptions, Stream};
 
 use crate::accept::ShutdownSignal;
+use crate::ipc::command::IpcContext;
 use crate::ipc::endpoint;
 use crate::ipc::protocol::{IpcError, IpcRequest, IpcResponse, MAX_FRAME_BYTES};
 use crate::ipc::router::IpcRouter;
@@ -39,13 +40,19 @@ pub(crate) trait IpcDispatcher: Send + Sync + 'static {
     fn handle(
         &self,
         method: &str,
+        context: IpcContext,
         params: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, IpcError>> + Send;
 }
 
 impl IpcDispatcher for IpcRouter {
-    async fn handle(&self, method: &str, params: Vec<u8>) -> Result<Vec<u8>, IpcError> {
-        IpcRouter::handle(self, method, params).await
+    async fn handle(
+        &self,
+        method: &str,
+        context: IpcContext,
+        params: Vec<u8>,
+    ) -> Result<Vec<u8>, IpcError> {
+        IpcRouter::handle(self, method, context, params).await
     }
 }
 
@@ -247,7 +254,11 @@ async fn handle_connection<D: IpcDispatcher>(stream: Stream, router: Arc<D>) {
         let response = match IpcRequest::decode(&body) {
             Ok(request) => {
                 tracing::debug!(method = %request.method, "handling IPC request");
-                match router.handle(&request.method, request.params).await {
+                let context = IpcContext::new(request.working_dir);
+                match router
+                    .handle(&request.method, context, request.params)
+                    .await
+                {
                     Ok(payload) => IpcResponse::success(payload),
                     Err(error) => {
                         tracing::warn!(%error, "IPC handler error");
@@ -299,7 +310,7 @@ mod tests {
         type Args = EchoArgs;
         type Response = String;
 
-        async fn handle(&self, args: EchoArgs) -> Result<String, IpcError> {
+        async fn handle(&self, args: EchoArgs, _context: IpcContext) -> Result<String, IpcError> {
             Ok(args.message)
         }
     }
@@ -307,7 +318,7 @@ mod tests {
     /// Issue one request over a fresh connection, synchronously.
     fn round_trip(socket: &Path, method: &str, params: &[u8]) -> IpcResponse {
         let mut stream = Stream::connect(endpoint::name(socket).expect("names")).expect("connects");
-        let frame = IpcRequest::encode(method, params).expect("encodes");
+        let frame = IpcRequest::encode(method, Path::new("/"), params).expect("encodes");
         stream.write_all(&frame).expect("writes");
         stream.flush().expect("flushes");
 

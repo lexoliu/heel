@@ -172,7 +172,7 @@ fn write_script(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcCommand, NoArgs};
+    use crate::ipc::{IpcCommand, IpcContext, NoArgs};
     use serde::Deserialize;
 
     struct Search;
@@ -197,7 +197,11 @@ mod tests {
         type Args = SearchArgs;
         type Response = ();
 
-        async fn handle(&self, _args: SearchArgs) -> std::result::Result<(), crate::ipc::IpcError> {
+        async fn handle(
+            &self,
+            _args: SearchArgs,
+            _context: IpcContext,
+        ) -> std::result::Result<(), crate::ipc::IpcError> {
             Ok(())
         }
     }
@@ -212,7 +216,11 @@ mod tests {
         type Args = NoArgs;
         type Response = ();
 
-        async fn handle(&self, _args: NoArgs) -> std::result::Result<(), crate::ipc::IpcError> {
+        async fn handle(
+            &self,
+            _args: NoArgs,
+            _context: IpcContext,
+        ) -> std::result::Result<(), crate::ipc::IpcError> {
             Ok(())
         }
     }

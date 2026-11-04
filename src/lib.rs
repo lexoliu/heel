@@ -140,7 +140,7 @@ pub use denial::{Denial, DenialRecorder};
 pub use error::{Error, Redirection, Result};
 pub use grant::{Access, Grant, ParseAccessError};
 pub use identity::Identity;
-pub use ipc::{CommandMeta, IpcClient, IpcCommand, IpcError, IpcRouter, NoArgs};
+pub use ipc::{CommandMeta, IpcClient, IpcCommand, IpcContext, IpcError, IpcRouter, NoArgs};
 pub use network::{
     AllowAll, AllowList, Audited, CustomPolicy, DenyAll, DomainRequest, NetworkAuditLog,
     NetworkPolicy,
