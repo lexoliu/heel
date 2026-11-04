@@ -100,6 +100,10 @@ jobs:
     needs: resolve-release
     if: ${{ always() && needs.resolve-release.outputs.upload_assets == 'true' }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -140,6 +144,11 @@ jobs:
           fi
           cp "${binary_path}" "${asset_name}"
           echo "asset_name=${asset_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.asset.outputs.asset_name }}
 
       - name: Upload asset to GitHub release
         env:

@@ -3,7 +3,8 @@
 //! Both directions are length-prefixed frames carrying MessagePack:
 //!
 //! ```text
-//! Request:  [u32 BE body length][u8 method length][method UTF-8][params MessagePack]
+//! Request:  [u32 BE body length][u8 method length][method UTF-8]
+//!           [u16 BE directory length][working directory UTF-8][params MessagePack]
 //! Response: [u32 BE body length][u8 success flag][payload MessagePack]
 //! ```
 //!
@@ -11,6 +12,7 @@
 //! MessagePack string describing the error.
 
 use std::io;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -58,6 +60,9 @@ impl IpcError {
 pub struct IpcRequest {
     /// Method name.
     pub method: String,
+    /// The working directory of the process that sent the request, read when
+    /// the request was made.
+    pub working_dir: PathBuf,
     /// MessagePack-encoded arguments.
     pub params: Vec<u8>,
 }
@@ -73,25 +78,47 @@ impl IpcRequest {
         if rest.len() < method_len {
             return Err(IpcError::InvalidProtocol("truncated method".to_string()));
         }
-        let (method, params) = rest.split_at(method_len);
+        let (method, rest) = rest.split_at(method_len);
 
         let method = std::str::from_utf8(method)
             .map_err(|e| IpcError::InvalidProtocol(format!("invalid method UTF-8: {e}")))?
             .to_string();
 
+        let (dir_len, rest) = rest
+            .split_first_chunk::<2>()
+            .ok_or_else(|| IpcError::InvalidProtocol("missing working directory".to_string()))?;
+        let dir_len = usize::from(u16::from_be_bytes(*dir_len));
+        if rest.len() < dir_len {
+            return Err(IpcError::InvalidProtocol(
+                "truncated working directory".to_string(),
+            ));
+        }
+        let (working_dir, params) = rest.split_at(dir_len);
+        let working_dir = std::str::from_utf8(working_dir)
+            .map_err(|e| IpcError::InvalidProtocol(format!("invalid directory UTF-8: {e}")))?;
+
         Ok(Self {
             method,
+            working_dir: PathBuf::from(working_dir),
             params: params.to_vec(),
         })
     }
 
     /// Encode a request frame, including the length prefix.
-    pub fn encode(method: &str, params: &[u8]) -> Result<Vec<u8>, IpcError> {
+    pub fn encode(method: &str, working_dir: &Path, params: &[u8]) -> Result<Vec<u8>, IpcError> {
         let method = method.as_bytes();
         let method_len = u8::try_from(method.len())
             .map_err(|_| IpcError::InvalidProtocol("method name too long".to_string()))?;
+        let working_dir = working_dir
+            .to_str()
+            .ok_or_else(|| {
+                IpcError::InvalidProtocol("working directory is not valid UTF-8".to_string())
+            })?
+            .as_bytes();
+        let dir_len = u16::try_from(working_dir.len())
+            .map_err(|_| IpcError::InvalidProtocol("working directory too long".to_string()))?;
 
-        let body_len = 1 + method.len() + params.len();
+        let body_len = 1 + method.len() + 2 + working_dir.len() + params.len();
         if body_len > MAX_FRAME_BYTES {
             return Err(IpcError::InvalidProtocol(format!(
                 "request of {body_len} bytes exceeds the {MAX_FRAME_BYTES} byte limit"
@@ -102,6 +129,8 @@ impl IpcRequest {
         frame.extend_from_slice(&(body_len as u32).to_be_bytes());
         frame.push(method_len);
         frame.extend_from_slice(method);
+        frame.extend_from_slice(&dir_len.to_be_bytes());
+        frame.extend_from_slice(working_dir);
         frame.extend_from_slice(params);
         Ok(frame)
     }
@@ -175,12 +204,13 @@ mod tests {
         })
         .unwrap();
 
-        let frame = IpcRequest::encode("search", &params).unwrap();
+        let frame = IpcRequest::encode("search", Path::new("/work/sub"), &params).unwrap();
         let body_len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
         assert_eq!(body_len, frame.len() - 4);
 
         let request = IpcRequest::decode(&frame[4..]).unwrap();
         assert_eq!(request.method, "search");
+        assert_eq!(request.working_dir, Path::new("/work/sub"));
         assert_eq!(
             rmp_serde::from_slice::<Params>(&request.params).unwrap(),
             Params {
@@ -225,13 +255,32 @@ mod tests {
             IpcRequest::decode(&[9, b'a', b'b', b'c']),
             Err(IpcError::InvalidProtocol(_))
         ));
+        // A method with no directory field after it.
+        assert!(matches!(
+            IpcRequest::decode(&[1, b'a']),
+            Err(IpcError::InvalidProtocol(_))
+        ));
+        // Claims a 5-byte directory but carries 1 byte.
+        assert!(matches!(
+            IpcRequest::decode(&[1, b'a', 0, 5, b'/']),
+            Err(IpcError::InvalidProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn overlong_working_directories_are_rejected() {
+        let dir = "d".repeat(usize::from(u16::MAX) + 1);
+        assert!(matches!(
+            IpcRequest::encode("m", Path::new(&dir), &[]),
+            Err(IpcError::InvalidProtocol(_))
+        ));
     }
 
     #[test]
     fn overlong_method_names_are_rejected() {
         let method = "a".repeat(256);
         assert!(matches!(
-            IpcRequest::encode(&method, &[]),
+            IpcRequest::encode(&method, Path::new("/"), &[]),
             Err(IpcError::InvalidProtocol(_))
         ));
     }
@@ -240,7 +289,7 @@ mod tests {
     fn oversized_requests_are_rejected() {
         let params = vec![0u8; MAX_FRAME_BYTES];
         assert!(matches!(
-            IpcRequest::encode("big", &params),
+            IpcRequest::encode("big", Path::new("/"), &params),
             Err(IpcError::InvalidProtocol(_))
         ));
     }

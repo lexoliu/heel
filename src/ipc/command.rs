@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -18,6 +19,30 @@ use crate::ipc::IpcError;
 #[serde(deny_unknown_fields)]
 pub struct NoArgs {}
 
+/// Facts about one request that are not part of its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcContext {
+    working_dir: PathBuf,
+}
+
+impl IpcContext {
+    /// A context for a caller whose working directory is `working_dir`.
+    pub fn new(working_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            working_dir: working_dir.into(),
+        }
+    }
+
+    /// The working directory of the calling process when it made the request.
+    ///
+    /// It is the caller's own view of the path: a relative argument such as
+    /// `./brief.md` resolves against it, so a command invoked after `cd` sees
+    /// the directory the shell changed to.
+    pub fn working_dir(&self) -> &Path {
+        &self.working_dir
+    }
+}
+
 /// A command a sandboxed process can invoke on the host.
 ///
 /// The command value itself holds whatever state the handler needs (API
@@ -30,7 +55,7 @@ pub struct NoArgs {}
 ///
 /// ```rust,ignore
 /// use serde::Deserialize;
-/// use heel::ipc::{IpcCommand, IpcError};
+/// use heel::ipc::{IpcCommand, IpcContext, IpcError};
 ///
 /// struct Search {
 ///     client: SearchClient,
@@ -54,8 +79,13 @@ pub struct NoArgs {}
 ///     type Args = SearchArgs;
 ///     type Response = Vec<String>;
 ///
-///     async fn handle(&self, args: SearchArgs) -> Result<Self::Response, IpcError> {
-///         self.client.search(&args.query).await.map_err(IpcError::remote)
+///     async fn handle(
+///         &self,
+///         args: SearchArgs,
+///         context: IpcContext,
+///     ) -> Result<Self::Response, IpcError> {
+///         let scope = context.working_dir();
+///         self.client.search(&args.query, scope).await.map_err(IpcError::remote)
 ///     }
 /// }
 /// ```
@@ -114,8 +144,12 @@ pub trait IpcCommand: Send + Sync + 'static {
     /// An error becomes the failure half of the wire response, so `heel ipc`
     /// prints it on standard error and exits non-zero instead of reporting a
     /// successful call that happened to serialize a failure.
+    ///
+    /// `context` carries the caller's working directory, read when the request
+    /// was made.
     fn handle(
         &self,
         args: Self::Args,
+        context: IpcContext,
     ) -> impl Future<Output = Result<Self::Response, IpcError>> + Send;
 }

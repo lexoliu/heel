@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use heel::ipc::{IpcCommand, IpcError, IpcRouter, NoArgs};
+use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter, NoArgs};
 use heel::{Access, Grant, Identity, Sandbox, SandboxConfig, SandboxConfigBuilder};
 
 #[path = "fixtures/mod.rs"]
@@ -530,7 +530,7 @@ impl IpcCommand for Probe {
     type Args = NoArgs;
     type Response = ();
 
-    async fn handle(&self, _args: NoArgs) -> Result<(), IpcError> {
+    async fn handle(&self, _args: NoArgs, _context: IpcContext) -> Result<(), IpcError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

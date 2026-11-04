@@ -347,6 +347,9 @@ struct SandboxProfile {
     guarded: Vec<String>,
     read_rules: Option<HostRules>,
     write_rules: Option<HostRules>,
+    // Process attribution
+    marker: String,
+    control: String,
 }
 
 /// Generate an SBPL profile from a sandbox configuration.
@@ -355,6 +358,11 @@ struct SandboxProfile {
 /// is `None` the profile denies all outbound connections in the kernel.
 pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> Result<String> {
     let security = config.security();
+    let attribution = config.attribution().ok_or_else(|| {
+        Error::InitFailed(
+            "a sandbox profile needs the attribution files its sandbox creates".to_string(),
+        )
+    })?;
     let grants = grant_rules(config.grants())?;
     let openings = openings(config, &grants)?;
 
@@ -462,6 +470,8 @@ pub fn generate_profile(config: &SandboxConfigData, proxy_port: Option<u16>) -> 
             .iter()
             .map(|ancestor| ancestor.escaped.clone())
             .collect(),
+        marker: sbpl_path(attribution.marker())?,
+        control: sbpl_path(attribution.control())?,
     };
 
     let profile = template.render()?;
@@ -605,6 +615,8 @@ mod tests {
         let dir = WorkingDir::create(data.working_dir(), data.working_dir_is_auto())
             .expect("working directory is created");
         data.set_working_dir(dir.path().to_path_buf());
+        let paths = crate::platform::macos::attribution::MarkerPaths::for_test(dir.path());
+        data.set_attribution(paths);
         (data, dir)
     }
 
@@ -1219,6 +1231,11 @@ mod tests {
             generate_profile(&strict, None)
                 .unwrap()
                 .contains("(allow mach-lookup (global-name \"com.apple.trustd\"))")
+        );
+        assert!(
+            generate_profile(&strict, None)
+                .unwrap()
+                .contains("(allow mach-lookup (global-name \"com.apple.TrustEvaluationAgent\"))")
         );
     }
 

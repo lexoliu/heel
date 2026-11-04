@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::command::IpcContext;
 use super::protocol::{IpcError, IpcRequest, IpcResponse, MAX_FRAME_BYTES};
 use super::server::IpcDispatcher;
 
@@ -69,12 +70,17 @@ impl TcpIpcEndpoint {
         self.timeout
     }
 
-    async fn request(&self, method: &str, params: &[u8]) -> Result<Vec<u8>, IpcError> {
+    async fn request(
+        &self,
+        method: &str,
+        context: &IpcContext,
+        params: &[u8],
+    ) -> Result<Vec<u8>, IpcError> {
         let operation = async {
             let mut stream = async_net::TcpStream::connect(self.address).await?;
             stream.set_nodelay(true)?;
             stream
-                .write_all(&IpcRequest::encode(method, params)?)
+                .write_all(&IpcRequest::encode(method, context.working_dir(), params)?)
                 .await?;
             let mut length = [0; 4];
             stream.read_exact(&mut length).await?;
@@ -106,8 +112,13 @@ impl TcpIpcEndpoint {
 }
 
 impl IpcDispatcher for TcpIpcEndpoint {
-    async fn handle(&self, method: &str, params: Vec<u8>) -> Result<Vec<u8>, IpcError> {
-        self.request(method, &params).await
+    async fn handle(
+        &self,
+        method: &str,
+        context: IpcContext,
+        params: Vec<u8>,
+    ) -> Result<Vec<u8>, IpcError> {
+        self.request(method, &context, &params).await
     }
 }
 
@@ -158,7 +169,9 @@ mod tests {
             let (_stream, _) = listener.accept().await.expect("accepts");
             smol::Timer::after(Duration::from_millis(100)).await;
         };
-        let (_, result) = futures_lite::future::zip(peer, endpoint.request("probe", &[])).await;
+        let (_, result) =
+            futures_lite::future::zip(peer, endpoint.request("probe", &IpcContext::new("/"), &[]))
+                .await;
         assert!(
             matches!(result, Err(IpcError::Io(ref error)) if error.kind() == std::io::ErrorKind::TimedOut)
         );

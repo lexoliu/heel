@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use heel::ipc::{IpcCommand, IpcError, IpcRouter};
+use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter};
 use heel::{Sandbox, SandboxConfigBuilder};
 use serde::Deserialize;
 
@@ -29,6 +29,7 @@ impl IpcCommand for Echo {
     fn handle(
         &self,
         args: EchoArgs,
+        _context: IpcContext,
     ) -> impl std::future::Future<Output = Result<String, IpcError>> {
         std::future::ready(Ok(args.message))
     }

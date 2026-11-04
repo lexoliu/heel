@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use heel::ipc::{IpcCommand, IpcError, IpcRouter};
+use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter};
 use heel::{Sandbox, SandboxConfig};
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +46,11 @@ impl IpcCommand for WebSearch {
     type Args = WebSearchArgs;
     type Response = WebSearchResult;
 
-    async fn handle(&self, args: WebSearchArgs) -> Result<WebSearchResult, IpcError> {
+    async fn handle(
+        &self,
+        args: WebSearchArgs,
+        _context: IpcContext,
+    ) -> Result<WebSearchResult, IpcError> {
         let call_number = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(WebSearchResult {
             items: vec![format!("result for {}", args.query)],
@@ -75,7 +79,7 @@ impl IpcCommand for Summarize {
     type Args = SummarizeArgs;
     type Response = String;
 
-    async fn handle(&self, args: SummarizeArgs) -> Result<String, IpcError> {
+    async fn handle(&self, args: SummarizeArgs, _context: IpcContext) -> Result<String, IpcError> {
         Ok(format!("{} characters of input", args.text.len()))
     }
 }

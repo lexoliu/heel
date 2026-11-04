@@ -140,12 +140,14 @@ pub use denial::{Denial, DenialRecorder};
 pub use error::{Error, Redirection, Result};
 pub use grant::{Access, Grant, ParseAccessError};
 pub use identity::Identity;
-pub use ipc::{CommandMeta, IpcClient, IpcCommand, IpcError, IpcRouter, NoArgs};
+pub use ipc::{CommandMeta, IpcClient, IpcCommand, IpcContext, IpcError, IpcRouter, NoArgs};
 pub use network::{
     AllowAll, AllowList, Audited, CustomPolicy, DenyAll, DomainRequest, NetworkAuditLog,
     NetworkPolicy,
 };
 pub use platform::Child;
+#[cfg(target_os = "macos")]
+pub use platform::macos::attribution::{AttributionError, Membership};
 pub use policy::{ReadDenylist, WriteDenylist};
 pub use priority::{CpuPriority, InvalidNiceLevel, IoPriority, NiceLevel, ProcessPriority};
 pub use python::VenvManager;
