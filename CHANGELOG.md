@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/May-Agent/heel/compare/heel-v0.7.4...heel-v0.8.0) - 2026-11-04
+
+### Added
+
+- [**breaking**] IPC requests carry the caller's working directory
+
+### Fixed
+
+- *(macos)* allow the trust evaluation agent in the sandbox profile
+
+### Other
+
+- drop the typos check
+- Revert "ci: temporarily print macOS TLS trust state"
+- Revert "ci: temporarily print sandbox denials for macOS TLS"
+- temporarily print sandbox denials for macOS TLS
+- temporarily print macOS TLS trust state
+- attest release artifacts with build provenance
+- point repository links at May-Agent/heel
+- Merge origin/dev into feat/134-sandbox-attribution
+- attribute processes to their sandbox on macOS
+
 ## [0.7.4](https://github.com/lexoliu/heel/compare/heel-v0.7.3...heel-v0.7.4) - 2026-11-02
 
 ### Other
