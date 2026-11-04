@@ -52,10 +52,13 @@ impl IpcClient<std::net::TcpStream> {
 impl<S: Read + Write> IpcClient<S> {
     /// Call `method` with already-encoded MessagePack arguments.
     ///
+    /// The request carries this process's current working directory, read now.
+    ///
     /// Returns the encoded response payload, or the error the handler reported.
     pub fn call_raw(&mut self, method: &str, params: &[u8]) -> Result<Vec<u8>, IpcError> {
+        let working_dir = std::env::current_dir()?;
         self.stream
-            .write_all(&IpcRequest::encode(method, params)?)?;
+            .write_all(&IpcRequest::encode(method, &working_dir, params)?)?;
 
         let mut len_buf = [0u8; 4];
         self.stream.read_exact(&mut len_buf)?;
@@ -97,7 +100,7 @@ impl<S: Read + Write> IpcClient<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcCommand, IpcRouter, IpcServer};
+    use crate::ipc::{IpcCommand, IpcContext, IpcRouter, IpcServer};
     use serde::Deserialize;
     use std::borrow::Cow;
 
@@ -117,7 +120,7 @@ mod tests {
         type Args = SumArgs;
         type Response = i64;
 
-        async fn handle(&self, args: SumArgs) -> Result<i64, IpcError> {
+        async fn handle(&self, args: SumArgs, _context: IpcContext) -> Result<i64, IpcError> {
             Ok(args.a + args.b)
         }
     }
@@ -132,7 +135,7 @@ mod tests {
         type Args = i64;
         type Response = ();
 
-        async fn handle(&self, _args: i64) -> Result<(), IpcError> {
+        async fn handle(&self, _args: i64, _context: IpcContext) -> Result<(), IpcError> {
             Err(IpcError::remote("the handler gave up"))
         }
     }

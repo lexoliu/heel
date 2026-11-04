@@ -13,7 +13,7 @@
 //!
 //! ```rust,ignore
 //! use serde::Deserialize;
-//! use heel::ipc::{IpcCommand, IpcRouter};
+//! use heel::ipc::{IpcCommand, IpcContext, IpcRouter};
 //!
 //! struct WebSearch {
 //!     client: SearchClient,
@@ -36,7 +36,11 @@
 //!     type Args = WebSearchArgs;
 //!     type Response = Vec<String>;
 //!
-//!     async fn handle(&self, args: WebSearchArgs) -> Result<Vec<String>, IpcError> {
+//!     async fn handle(
+//!         &self,
+//!         args: WebSearchArgs,
+//!         _context: IpcContext,
+//!     ) -> Result<Vec<String>, IpcError> {
 //!         self.client.search(&args.query).await.map_err(IpcError::remote)
 //!     }
 //! }
@@ -57,7 +61,7 @@ mod tcp;
 mod wrappers;
 
 pub use client::IpcClient;
-pub use command::{IpcCommand, NoArgs};
+pub use command::{IpcCommand, IpcContext, NoArgs};
 pub use protocol::{IpcError, IpcRequest, IpcResponse};
 pub use router::{CommandMeta, IpcRouter};
 pub use tcp::TcpIpcEndpoint;

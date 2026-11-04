@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod fixtures;
 
-use heel::ipc::{IpcCommand, IpcError, IpcRouter, NoArgs};
+use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter, NoArgs};
 use heel::{Sandbox, SandboxConfigBuilder};
 use serde::Deserialize;
 
@@ -47,7 +47,7 @@ impl IpcCommand for Echo {
     type Args = EchoArgs;
     type Response = String;
 
-    async fn handle(&self, args: EchoArgs) -> Result<String, IpcError> {
+    async fn handle(&self, args: EchoArgs, _context: IpcContext) -> Result<String, IpcError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(format!(
             "first={} second={} flag={} piped={}",
@@ -70,7 +70,7 @@ impl IpcCommand for Structured {
     type Args = NoArgs;
     type Response = Vec<u32>;
 
-    async fn handle(&self, _args: NoArgs) -> Result<Vec<u32>, IpcError> {
+    async fn handle(&self, _args: NoArgs, _context: IpcContext) -> Result<Vec<u32>, IpcError> {
         Ok(vec![1, 2, 3])
     }
 }
@@ -333,4 +333,64 @@ async fn a_heel_binary_link_the_sandbox_could_plant_is_refused() {
         matches!(&error, heel::Error::GrantRedirected { path, .. } if *path == link),
         "{error:?}"
     );
+}
+
+/// Reports the working directory the host handler received with the call.
+struct WorkingDir;
+
+impl IpcCommand for WorkingDir {
+    fn name(&self) -> Cow<'static, str> {
+        "where-am-i".into()
+    }
+
+    type Args = NoArgs;
+    type Response = String;
+
+    async fn handle(&self, _args: NoArgs, context: IpcContext) -> Result<String, IpcError> {
+        Ok(context.working_dir().display().to_string())
+    }
+}
+
+#[tokio::test]
+async fn a_command_after_cd_sees_the_new_directory() {
+    let sandbox = sandbox_with(IpcRouter::new().register(WorkingDir)).await;
+
+    let output = sh(
+        &sandbox,
+        "mkdir -p skills/slide && where-am-i && cd skills/slide && where-am-i && pwd -P",
+    )
+    .await;
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let lines: Vec<_> = stdout(&output).lines().map(str::to_string).collect();
+    let [start, moved, shell_view] = lines.as_slice() else {
+        panic!("expected three lines, got {lines:?}");
+    };
+    assert_eq!(moved, shell_view, "the handler sees the shell's directory");
+    assert_eq!(
+        std::path::Path::new(moved),
+        std::path::Path::new(start).join("skills/slide")
+    );
+}
+
+#[tokio::test]
+async fn concurrent_callers_in_different_directories_each_see_their_own() {
+    let sandbox = sandbox_with(IpcRouter::new().register(WorkingDir)).await;
+    let made = sh(&sandbox, "mkdir -p one two").await;
+    assert!(made.status.success(), "{}", stderr(&made));
+
+    // Many calls per shell, so the two callers overlap on the server.
+    let script = |dir: &str| format!("cd {dir} && for _ in 1 2 3 4 5 6 7 8; do where-am-i; done");
+    let (script_one, script_two) = (script("one"), script("two"));
+    let (one, two) = tokio::join!(sh(&sandbox, &script_one), sh(&sandbox, &script_two));
+
+    for (output, dir) in [(&one, "one"), (&two, "two")] {
+        assert!(output.status.success(), "{}", stderr(output));
+        let lines: Vec<_> = stdout(output).lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 8);
+        for line in lines {
+            let name = std::path::Path::new(&line).file_name().expect("a name");
+            assert_eq!(name, dir);
+        }
+    }
 }

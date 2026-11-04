@@ -175,7 +175,7 @@ let config = SandboxConfig::builder().security(security).build();
 Registered commands appear inside the sandbox as ordinary executables on `PATH`. The command value holds host-side state; each request carries typed arguments.
 
 ```rust
-use heel::ipc::{IpcCommand, IpcError, IpcRouter};
+use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter};
 use heel::{Sandbox, SandboxConfig};
 use serde::Deserialize;
 
@@ -196,7 +196,12 @@ impl IpcCommand for WebSearch {
     type Args = WebSearchArgs;
     type Response = Vec<String>;
 
-    async fn handle(&self, args: WebSearchArgs) -> Result<Vec<String>, IpcError> {
+    // `context.working_dir()` is the caller's directory when it ran the command.
+    async fn handle(
+        &self,
+        args: WebSearchArgs,
+        context: IpcContext,
+    ) -> Result<Vec<String>, IpcError> {
         self.client
             .search(&args.query)
             .await

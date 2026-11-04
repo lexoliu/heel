@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use heel::ipc::{IpcCommand, IpcError, IpcRouter, TcpIpcEndpoint};
+use heel::ipc::{IpcCommand, IpcContext, IpcError, IpcRouter, TcpIpcEndpoint};
 use heel::{Sandbox, SandboxConfigBuilder};
 use serde::Deserialize;
 
@@ -29,6 +29,7 @@ impl IpcCommand for Echo {
     fn handle(
         &self,
         args: EchoArgs,
+        _context: IpcContext,
     ) -> impl std::future::Future<Output = Result<String, IpcError>> {
         std::future::ready(Ok(args.message))
     }
@@ -70,8 +71,17 @@ async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
         let mut body = vec![0; u32::from_be_bytes(length) as usize];
         stream.read_exact(&mut body).await.expect("reads request");
         let request = heel::ipc::IpcRequest::decode(&body).expect("decodes request");
+        assert!(
+            request.working_dir.is_absolute(),
+            "the relayed request carries the caller's directory: {:?}",
+            request.working_dir
+        );
         let payload = router
-            .handle(&request.method, request.params)
+            .handle(
+                &request.method,
+                IpcContext::new(request.working_dir),
+                request.params,
+            )
             .await
             .expect("dispatches");
         stream

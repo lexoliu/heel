@@ -6,13 +6,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::ipc::command::IpcCommand;
+use crate::ipc::command::{IpcCommand, IpcContext};
 use crate::ipc::protocol::IpcError;
 
 /// A registered handler, erased so that commands of different types can share
 /// one dispatch table.
 type ErasedHandler = Arc<
-    dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, IpcError>> + Send>>
+    dyn Fn(IpcContext, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, IpcError>> + Send>>
         + Send
         + Sync,
 >;
@@ -102,11 +102,11 @@ impl IpcRouter {
         );
 
         let command = Arc::new(command);
-        let handler: ErasedHandler = Arc::new(move |params: Vec<u8>| {
+        let handler: ErasedHandler = Arc::new(move |context: IpcContext, params: Vec<u8>| {
             let command = Arc::clone(&command);
             Box::pin(async move {
                 let args = rmp_serde::from_slice::<C::Args>(&params)?;
-                let response = command.handle(args).await?;
+                let response = command.handle(args, context).await?;
                 Ok(rmp_serde::to_vec_named(&response)?)
             })
         });
@@ -124,13 +124,18 @@ impl IpcRouter {
     }
 
     /// Dispatch one request. Called by the IPC server.
-    pub async fn handle(&self, method: &str, params: Vec<u8>) -> Result<Vec<u8>, IpcError> {
+    pub async fn handle(
+        &self,
+        method: &str,
+        context: IpcContext,
+        params: Vec<u8>,
+    ) -> Result<Vec<u8>, IpcError> {
         let handler = self
             .handlers
             .get(method)
             .ok_or_else(|| IpcError::UnknownMethod(method.to_string()))?;
 
-        handler(params).await
+        handler(context, params).await
     }
 
     /// The registered commands and how their arguments may be written.
@@ -178,7 +183,11 @@ mod tests {
         type Args = DoublerArgs;
         type Response = DoublerResponse;
 
-        async fn handle(&self, args: DoublerArgs) -> Result<DoublerResponse, IpcError> {
+        async fn handle(
+            &self,
+            args: DoublerArgs,
+            _context: IpcContext,
+        ) -> Result<DoublerResponse, IpcError> {
             Ok(DoublerResponse {
                 doubled: args.value * 2,
             })
@@ -203,7 +212,11 @@ mod tests {
         type Args = CounterArgs;
         type Response = String;
 
-        async fn handle(&self, args: CounterArgs) -> Result<String, IpcError> {
+        async fn handle(
+            &self,
+            args: CounterArgs,
+            _context: IpcContext,
+        ) -> Result<String, IpcError> {
             Ok(format!("{}, {}!", self.greeting, args.name))
         }
     }
@@ -214,7 +227,10 @@ mod tests {
             let router = IpcRouter::new().register(Doubler);
             let params = rmp_serde::to_vec_named(&serde_json::json!({ "value": 21 })).unwrap();
 
-            let response = router.handle("double", params).await.unwrap();
+            let response = router
+                .handle("double", IpcContext::new("/"), params)
+                .await
+                .unwrap();
             let response: DoublerResponse = rmp_serde::from_slice(&response).unwrap();
 
             assert_eq!(response, DoublerResponse { doubled: 42 });
@@ -241,7 +257,11 @@ mod tests {
         type Args = ToolArgs;
         type Response = Vec<String>;
 
-        async fn handle(&self, args: ToolArgs) -> Result<Vec<String>, IpcError> {
+        async fn handle(
+            &self,
+            args: ToolArgs,
+            _context: IpcContext,
+        ) -> Result<Vec<String>, IpcError> {
             Ok(args.args)
         }
     }
@@ -255,7 +275,10 @@ mod tests {
             )
             .unwrap();
 
-            let response = router.handle("tool", params).await.unwrap();
+            let response = router
+                .handle("tool", IpcContext::new("/"), params)
+                .await
+                .unwrap();
             let response: Vec<String> = rmp_serde::from_slice(&response).unwrap();
 
             assert_eq!(response, ["open", "--detail", "full"]);
@@ -280,7 +303,7 @@ mod tests {
         type Args = NoArgs;
         type Response = ();
 
-        async fn handle(&self, _args: NoArgs) -> Result<(), IpcError> {
+        async fn handle(&self, _args: NoArgs, _context: IpcContext) -> Result<(), IpcError> {
             Ok(())
         }
     }
@@ -300,7 +323,10 @@ mod tests {
 
             for name in ["ada", "grace"] {
                 let params = rmp_serde::to_vec_named(&serde_json::json!({ "name": name })).unwrap();
-                let response = router.handle("greet", params).await.unwrap();
+                let response = router
+                    .handle("greet", IpcContext::new("/"), params)
+                    .await
+                    .unwrap();
                 let response: String = rmp_serde::from_slice(&response).unwrap();
                 assert_eq!(response, format!("Hello, {name}!"));
             }
@@ -311,7 +337,9 @@ mod tests {
     fn unknown_methods_are_reported() {
         smol::block_on(async {
             let router = IpcRouter::new();
-            let result = router.handle("unknown", Vec::new()).await;
+            let result = router
+                .handle("unknown", IpcContext::new("/"), Vec::new())
+                .await;
             assert!(matches!(result, Err(IpcError::UnknownMethod(_))));
         });
     }
@@ -321,7 +349,7 @@ mod tests {
         smol::block_on(async {
             let router = IpcRouter::new().register(Doubler);
             let params = rmp_serde::to_vec_named(&serde_json::json!({ "wrong": 1 })).unwrap();
-            let result = router.handle("double", params).await;
+            let result = router.handle("double", IpcContext::new("/"), params).await;
             assert!(matches!(result, Err(IpcError::Deserialization(_))));
         });
     }
@@ -349,7 +377,7 @@ mod tests {
         type Args = NoArgs;
         type Response = ();
 
-        async fn handle(&self, _args: NoArgs) -> Result<(), IpcError> {
+        async fn handle(&self, _args: NoArgs, _context: IpcContext) -> Result<(), IpcError> {
             Ok(())
         }
     }
