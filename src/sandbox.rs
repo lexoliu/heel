@@ -1,6 +1,6 @@
 //! The sandbox itself: setup, command execution and teardown.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Output;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -8,6 +8,7 @@ use blocking::unblock;
 use executor_core::smol::SmolGlobal;
 use executor_core::{DefaultExecutor, Executor, try_init_global_executor};
 
+use crate::binary::HeelBinary;
 use crate::command::{Command, ProxyEndpoint};
 use crate::config::{SandboxConfig, SandboxConfigData};
 use crate::denial::DenialRecorder;
@@ -34,114 +35,24 @@ fn create_ipc_socket_dir() -> Result<(WorkingDir, PathBuf)> {
 
 /// Locate the `heel` binary that IPC wrappers execute.
 ///
-/// Resolution is explicit and never builds anything: the configured path, then
-/// `HEEL_BIN`, then this process if it is itself `heel`, then `PATH`. The
-/// chosen path is resolved once, here, because the host picks the binary and it
-/// is often reached through a link (a package manager's shim): the link is
+/// A configured [`HeelBinary`] is already verified and is used as is; without
+/// one the binary is located and verified ([`HeelBinary::locate`]), which runs
+/// it once. The path is then resolved, because the host picks the binary and
+/// it is often reached through a link (a package manager's shim): the link is
 /// followed unless it lies at or below a path the sandbox may write, where the
 /// sandbox could have planted it.
 async fn resolve_heel_binary(
-    configured: Option<PathBuf>,
+    configured: Option<HeelBinary>,
     writable: Vec<PathBuf>,
 ) -> Result<ResolvedPath> {
     unblock(move || {
-        let chosen = choose_heel_binary(configured.as_deref())?;
-        crate::resolve::resolve_outside(&chosen, &writable)
+        let chosen = match configured {
+            Some(binary) => binary,
+            None => HeelBinary::locate()?,
+        };
+        crate::resolve::resolve_outside(chosen.as_path(), &writable)
     })
     .await
-}
-
-/// Refuse a `heel` binary whose version differs from this library's.
-///
-/// The binary is the IPC client inside the sandbox and speaks the request
-/// frame of its own release, so a stale one fails every IPC command. It runs
-/// once per binary choice, which is once per sandbox creation. The CLI prints
-/// `heel <version>` for `--version`.
-fn check_heel_version(path: &Path) -> Result<()> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| {
-            Error::InitFailed(format!(
-                "cannot run `{} --version` to check the heel binary: {error}",
-                path.display()
-            ))
-        })?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let binary = output
-        .status
-        .success()
-        .then(|| stdout.lines().next()?.split_whitespace().last())
-        .flatten()
-        .ok_or_else(|| {
-            Error::InitFailed(format!(
-                "`{} --version` did not print a version; it is not a heel binary",
-                path.display()
-            ))
-        })?;
-    let library = env!("CARGO_PKG_VERSION");
-    if binary != library {
-        return Err(Error::InitFailed(format!(
-            "the heel binary {} is version {binary}, but the library is version {library}; \
-             install the matching version or point HEEL_BIN at it",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn choose_heel_binary(configured: Option<&std::path::Path>) -> Result<PathBuf> {
-    if let Some(path) = configured {
-        if !path.is_file() {
-            return Err(Error::InitFailed(format!(
-                "the configured heel binary is missing: {}",
-                path.display()
-            )));
-        }
-        check_heel_version(path)?;
-        return Ok(path.to_path_buf());
-    }
-
-    if let Some(path) = std::env::var_os("HEEL_BIN") {
-        let path = PathBuf::from(path);
-        if !path.is_file() {
-            return Err(Error::InitFailed(format!(
-                "HEEL_BIN points to a missing file: {}",
-                path.display()
-            )));
-        }
-        check_heel_version(&path)?;
-        return Ok(path);
-    }
-
-    let binary_name = format!("heel{}", std::env::consts::EXE_SUFFIX);
-
-    // A sandbox created by the CLI can reuse the running binary directly.
-    if let Ok(current) = std::env::current_exe()
-        && current
-            .file_name()
-            .is_some_and(|name| name == binary_name.as_str())
-    {
-        return Ok(current);
-    }
-
-    let found = search_path_for_binary(&binary_name).ok_or_else(|| {
-        Error::InitFailed(format!(
-            "cannot find the '{binary_name}' binary, which sandboxed IPC commands execute; \
-             install it with `cargo install heel` or point HEEL_BIN at it"
-        ))
-    })?;
-    check_heel_version(&found)?;
-    Ok(found)
-}
-
-/// Find an executable by name on `PATH`.
-fn search_path_for_binary(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 /// Tracks the processes spawned inside a sandbox so they can be killed on drop.
@@ -383,7 +294,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
             // The supervisor is `heel supervise`, started inside the sandbox, so
             // the binary must be executable under the sandbox's own ruleset.
             let heel_binary = resolve_heel_binary(
-                config_data.heel_binary().map(Path::to_path_buf),
+                config_data.heel_binary().cloned(),
                 config_data.writable_paths(),
             )
             .await?;
@@ -400,7 +311,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
             (None, Some(endpoint)) => {
                 let (socket_dir, socket) = unblock(create_ipc_socket_dir).await?;
                 let heel_binary = resolve_heel_binary(
-                    config_data.heel_binary().map(Path::to_path_buf),
+                    config_data.heel_binary().cloned(),
                     config_data.writable_paths(),
                 )
                 .await?;
@@ -469,7 +380,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
         executor: E,
     ) -> Result<(IpcServer, WorkingDir)> {
         let heel_binary = resolve_heel_binary(
-            config_data.heel_binary().map(Path::to_path_buf),
+            config_data.heel_binary().cloned(),
             config_data.writable_paths(),
         )
         .await?;
@@ -656,58 +567,6 @@ impl<N: NetworkPolicy> Drop for Sandbox<N> {
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    /// A script that prints `--version` like a heel binary of `version`.
-    #[cfg(unix)]
-    fn fake_heel(dir: &Path, version: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let path = dir.join("heel");
-        std::fs::write(&path, format!("#!/bin/sh\necho 'heel {version}'\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_heel_binary_of_another_version_is_refused_naming_both() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fake_heel(dir.path(), "0.0.1");
-
-        let Err(Error::InitFailed(message)) = choose_heel_binary(Some(&path)) else {
-            panic!("a mismatched binary must be refused");
-        };
-        assert!(message.contains("version 0.0.1"), "{message}");
-        assert!(
-            message.contains(&format!("version {}", env!("CARGO_PKG_VERSION"))),
-            "{message}"
-        );
-        assert!(message.contains(&path.display().to_string()), "{message}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_heel_binary_of_the_library_version_is_accepted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fake_heel(dir.path(), env!("CARGO_PKG_VERSION"));
-
-        assert_eq!(choose_heel_binary(Some(&path)).unwrap(), path);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_binary_that_prints_no_version_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("heel");
-        std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-
-        assert!(matches!(
-            choose_heel_binary(Some(&path)),
-            Err(Error::InitFailed(_))
-        ));
-    }
 
     /// A stand-in for a supervisor whose teardown takes `seconds`: it starts
     /// the teardown when the host's request arrives on the control socket.

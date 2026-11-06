@@ -21,7 +21,7 @@ const REAP: Duration = Duration::from_secs(10);
 
 async fn sandbox() -> Sandbox {
     let config = SandboxConfigBuilder::default()
-        .heel_binary(env!("CARGO_BIN_EXE_heel"))
+        .heel_binary(heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"))
         .supervised_spawn(true)
         .build();
     Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)

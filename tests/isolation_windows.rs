@@ -549,7 +549,7 @@ async fn the_ipc_endpoint_reaches_the_host_from_inside_the_container() {
     // connecting to the pipe, the request, dispatch, and the response.
     let calls = Arc::new(AtomicUsize::new(0));
     let config = SandboxConfigBuilder::default()
-        .heel_binary(env!("CARGO_BIN_EXE_heel"))
+        .heel_binary(heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"))
         .ipc(IpcRouter::new().register(Probe {
             calls: Arc::clone(&calls),
         }))
