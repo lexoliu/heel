@@ -3,18 +3,32 @@
 //! Both directions are length-prefixed frames carrying MessagePack:
 //!
 //! ```text
-//! Request:  [u32 BE body length][u8 method length][method UTF-8]
+//! Request:  [u32 BE body length][u8 0x00][u8 protocol version]
+//!           [u8 method length][method UTF-8]
 //!           [u16 BE directory length][working directory UTF-8][params MessagePack]
 //! Response: [u32 BE body length][u8 success flag][payload MessagePack]
 //! ```
 //!
 //! On success the payload is the command's response; on failure it is a
 //! MessagePack string describing the error.
+//!
+//! A request body starts with a zero byte and the protocol version
+//! ([`PROTOCOL_VERSION`], bumped whenever the request frame changes). Frames
+//! from before versioning began with the method length, which is never zero,
+//! so a leading non-zero byte identifies a client older than the version
+//! byte. The response frame is unchanged, so every client can read the host's
+//! refusal.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+
+/// The version of the request frame this build speaks.
+pub const PROTOCOL_VERSION: u8 = 1;
+
+/// The byte that opens a versioned request body.
+const VERSIONED_MARKER: u8 = 0;
 
 /// Largest frame either side will read, to bound the memory one request can
 /// make the peer allocate.
@@ -70,9 +84,29 @@ pub struct IpcRequest {
 impl IpcRequest {
     /// Decode a request body, excluding the length prefix.
     pub fn decode(body: &[u8]) -> Result<Self, IpcError> {
-        let (&method_len, rest) = body
+        let (&marker, rest) = body
             .split_first()
             .ok_or_else(|| IpcError::InvalidProtocol("empty request".to_string()))?;
+        if marker != VERSIONED_MARKER {
+            return Err(IpcError::InvalidProtocol(format!(
+                "the client speaks an unversioned protocol older than version 1, \
+                 the host speaks protocol version {PROTOCOL_VERSION}; \
+                 the heel binary the sandbox runs is out of date"
+            )));
+        }
+        let (&version, rest) = rest
+            .split_first()
+            .ok_or_else(|| IpcError::InvalidProtocol("missing protocol version".to_string()))?;
+        if version != PROTOCOL_VERSION {
+            return Err(IpcError::InvalidProtocol(format!(
+                "the client speaks protocol version {version}, \
+                 the host speaks protocol version {PROTOCOL_VERSION}; \
+                 the heel binary the sandbox runs does not match the library"
+            )));
+        }
+        let (&method_len, rest) = rest
+            .split_first()
+            .ok_or_else(|| IpcError::InvalidProtocol("missing method".to_string()))?;
         let method_len = usize::from(method_len);
 
         if rest.len() < method_len {
@@ -118,7 +152,7 @@ impl IpcRequest {
         let dir_len = u16::try_from(working_dir.len())
             .map_err(|_| IpcError::InvalidProtocol("working directory too long".to_string()))?;
 
-        let body_len = 1 + method.len() + 2 + working_dir.len() + params.len();
+        let body_len = 2 + 1 + method.len() + 2 + working_dir.len() + params.len();
         if body_len > MAX_FRAME_BYTES {
             return Err(IpcError::InvalidProtocol(format!(
                 "request of {body_len} bytes exceeds the {MAX_FRAME_BYTES} byte limit"
@@ -127,6 +161,8 @@ impl IpcRequest {
 
         let mut frame = Vec::with_capacity(4 + body_len);
         frame.extend_from_slice(&(body_len as u32).to_be_bytes());
+        frame.push(VERSIONED_MARKER);
+        frame.push(PROTOCOL_VERSION);
         frame.push(method_len);
         frame.extend_from_slice(method);
         frame.extend_from_slice(&dir_len.to_be_bytes());
@@ -251,20 +287,51 @@ mod tests {
             Err(IpcError::InvalidProtocol(_))
         ));
         // Claims a 9-byte method but carries 3 bytes.
+        let v = PROTOCOL_VERSION;
         assert!(matches!(
-            IpcRequest::decode(&[9, b'a', b'b', b'c']),
+            IpcRequest::decode(&[0, v, 9, b'a', b'b', b'c']),
             Err(IpcError::InvalidProtocol(_))
         ));
         // A method with no directory field after it.
         assert!(matches!(
-            IpcRequest::decode(&[1, b'a']),
+            IpcRequest::decode(&[0, v, 1, b'a']),
             Err(IpcError::InvalidProtocol(_))
         ));
         // Claims a 5-byte directory but carries 1 byte.
         assert!(matches!(
-            IpcRequest::decode(&[1, b'a', 0, 5, b'/']),
+            IpcRequest::decode(&[0, v, 1, b'a', 0, 5, b'/']),
             Err(IpcError::InvalidProtocol(_))
         ));
+    }
+
+    fn protocol_error(body: &[u8]) -> String {
+        match IpcRequest::decode(body) {
+            Err(IpcError::InvalidProtocol(message)) => message,
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_protocol_versions_are_refused_naming_both() {
+        let mut frame = IpcRequest::encode("search", Path::new("/"), &[]).unwrap();
+        let other = PROTOCOL_VERSION + 1;
+        frame[5] = other;
+
+        let message = protocol_error(&frame[4..]);
+        assert!(
+            message.contains(&format!("client speaks protocol version {other}"))
+                && message.contains(&format!("host speaks protocol version {PROTOCOL_VERSION}")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn unversioned_clients_are_told_they_are_out_of_date() {
+        // The frame an older client sends: the method length leads, and the
+        // working directory field may be absent altogether.
+        let message = protocol_error(&[6, b's', b'e', b'a', b'r', b'c', b'h']);
+        assert!(message.contains("unversioned"), "{message}");
+        assert!(!message.contains("truncated"), "{message}");
     }
 
     #[test]
