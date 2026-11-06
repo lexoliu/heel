@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/May-Agent/heel/compare/heel-v0.8.0...heel-v0.9.0) - 2026-11-06
+
+### Fixed
+
+- keep the PATH constant re-export unix-only
+- *(sandbox)* [**breaking**] carry a verified heel binary in the configuration
+- *(sandbox)* refuse a heel binary of another version
+- *(ipc)* lead the request frame with a protocol version
+
 ## [0.8.0](https://github.com/May-Agent/heel/compare/heel-v0.7.4...heel-v0.8.0) - 2026-11-04
 
 ### Added
