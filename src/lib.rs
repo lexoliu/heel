@@ -129,8 +129,8 @@ mod security;
 pub mod supervisor;
 mod workdir;
 
-#[cfg(unix)]
 pub use binary::HeelBinary;
+#[cfg(unix)]
 pub use command::DEFAULT_SANDBOX_PATH;
 pub use command::{Command, StdioConfig, default_sandbox_path};
 pub use config::{
