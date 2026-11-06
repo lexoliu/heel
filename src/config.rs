@@ -344,7 +344,7 @@ pub struct SandboxConfigData {
     ipc_socket: Option<PathBuf>,
     ipc_bin_dir: Option<PathBuf>,
     /// Explicit path to the `heel` binary that IPC shims execute.
-    heel_binary: Option<PathBuf>,
+    heel_binary: Option<crate::binary::HeelBinary>,
     external_ipc: Option<crate::ipc::TcpIpcEndpoint>,
     allow_tty_write: bool,
     /// The paths every macOS profile of the sandbox carries to attribute its
@@ -502,8 +502,8 @@ impl SandboxConfigData {
     }
 
     /// The configured `heel` binary that IPC shims execute, if one was set.
-    pub fn heel_binary(&self) -> Option<&Path> {
-        self.heel_binary.as_deref()
+    pub fn heel_binary(&self) -> Option<&crate::binary::HeelBinary> {
+        self.heel_binary.as_ref()
     }
 
     /// Trusted peer served through a protected local relay without child TCP access.
@@ -945,11 +945,15 @@ impl<N: NetworkPolicy> SandboxConfigBuilder<N, IpcUnconfigured> {
 impl<N: NetworkPolicy, I> SandboxConfigBuilder<N, I> {
     /// Use a specific `heel` binary for the generated IPC command shims.
     ///
-    /// Without this the binary is found through `HEEL_BIN`, the running
-    /// executable, or `PATH`. Set it when embedding heel in an application that
-    /// ships its own copy.
-    pub fn heel_binary(mut self, path: impl AsRef<Path>) -> Self {
-        self.data.heel_binary = Some(path.as_ref().to_path_buf());
+    /// The binary is already verified to match the library's version
+    /// ([`HeelBinary::verify`](crate::HeelBinary::verify)), so creating a
+    /// sandbox neither looks it up nor runs it. Without this the binary is
+    /// found through `HEEL_BIN`, the running executable, or `PATH`, and
+    /// verified on every sandbox creation; verify one binary once and share it
+    /// when sandboxes are created often. Set it when embedding heel in an
+    /// application that ships its own copy.
+    pub fn heel_binary(mut self, binary: crate::binary::HeelBinary) -> Self {
+        self.data.heel_binary = Some(binary);
         self
     }
 

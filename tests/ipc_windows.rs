@@ -42,7 +42,9 @@ async fn sandbox() -> Sandbox {
     Sandbox::with_config_and_executor(
         SandboxConfigBuilder::default()
             .ipc(IpcRouter::new().register(Echo))
-            .heel_binary(env!("CARGO_BIN_EXE_heel"))
+            .heel_binary(
+                heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"),
+            )
             .build(),
         executor_core::tokio::TokioGlobal,
     )

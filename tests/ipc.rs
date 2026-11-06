@@ -79,7 +79,7 @@ impl IpcCommand for Structured {
 async fn sandbox_with(router: IpcRouter) -> Sandbox {
     let config = SandboxConfigBuilder::default()
         .ipc(router)
-        .heel_binary(env!("CARGO_BIN_EXE_heel"))
+        .heel_binary(heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"))
         .build();
 
     Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
@@ -302,7 +302,7 @@ async fn a_heel_binary_reached_through_a_link_is_used() {
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_heel"), &link).expect("links");
     let config = SandboxConfigBuilder::default()
         .ipc(IpcRouter::new().register(Structured))
-        .heel_binary(&link)
+        .heel_binary(heel::HeelBinary::verify(&link).expect("matching binary"))
         .build();
     let sandbox = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
         .await
@@ -321,7 +321,7 @@ async fn a_heel_binary_link_the_sandbox_could_plant_is_refused() {
     let config = SandboxConfigBuilder::default()
         .ipc(IpcRouter::new().register(Structured))
         .writable(fixtures::resolved(dir.path()))
-        .heel_binary(&link)
+        .heel_binary(heel::HeelBinary::verify(&link).expect("matching binary"))
         .build();
 
     let error = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)

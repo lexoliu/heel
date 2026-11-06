@@ -107,6 +107,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub(crate) mod accept;
+mod binary;
 mod command;
 mod config;
 mod denial;
@@ -128,6 +129,7 @@ mod security;
 pub mod supervisor;
 mod workdir;
 
+pub use binary::HeelBinary;
 #[cfg(unix)]
 pub use command::DEFAULT_SANDBOX_PATH;
 pub use command::{Command, StdioConfig, default_sandbox_path};

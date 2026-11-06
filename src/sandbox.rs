@@ -1,6 +1,6 @@
 //! The sandbox itself: setup, command execution and teardown.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Output;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -8,6 +8,7 @@ use blocking::unblock;
 use executor_core::smol::SmolGlobal;
 use executor_core::{DefaultExecutor, Executor, try_init_global_executor};
 
+use crate::binary::HeelBinary;
 use crate::command::{Command, ProxyEndpoint};
 use crate::config::{SandboxConfig, SandboxConfigData};
 use crate::denial::DenialRecorder;
@@ -34,70 +35,24 @@ fn create_ipc_socket_dir() -> Result<(WorkingDir, PathBuf)> {
 
 /// Locate the `heel` binary that IPC wrappers execute.
 ///
-/// Resolution is explicit and never builds anything: the configured path, then
-/// `HEEL_BIN`, then this process if it is itself `heel`, then `PATH`. The
-/// chosen path is resolved once, here, because the host picks the binary and it
-/// is often reached through a link (a package manager's shim): the link is
+/// A configured [`HeelBinary`] is already verified and is used as is; without
+/// one the binary is located and verified ([`HeelBinary::locate`]), which runs
+/// it once. The path is then resolved, because the host picks the binary and
+/// it is often reached through a link (a package manager's shim): the link is
 /// followed unless it lies at or below a path the sandbox may write, where the
 /// sandbox could have planted it.
 async fn resolve_heel_binary(
-    configured: Option<PathBuf>,
+    configured: Option<HeelBinary>,
     writable: Vec<PathBuf>,
 ) -> Result<ResolvedPath> {
     unblock(move || {
-        let chosen = choose_heel_binary(configured.as_deref())?;
-        crate::resolve::resolve_outside(&chosen, &writable)
+        let chosen = match configured {
+            Some(binary) => binary,
+            None => HeelBinary::locate()?,
+        };
+        crate::resolve::resolve_outside(chosen.as_path(), &writable)
     })
     .await
-}
-
-fn choose_heel_binary(configured: Option<&std::path::Path>) -> Result<PathBuf> {
-    if let Some(path) = configured {
-        if !path.is_file() {
-            return Err(Error::InitFailed(format!(
-                "the configured heel binary is missing: {}",
-                path.display()
-            )));
-        }
-        return Ok(path.to_path_buf());
-    }
-
-    if let Some(path) = std::env::var_os("HEEL_BIN") {
-        let path = PathBuf::from(path);
-        if !path.is_file() {
-            return Err(Error::InitFailed(format!(
-                "HEEL_BIN points to a missing file: {}",
-                path.display()
-            )));
-        }
-        return Ok(path);
-    }
-
-    let binary_name = format!("heel{}", std::env::consts::EXE_SUFFIX);
-
-    // A sandbox created by the CLI can reuse the running binary directly.
-    if let Ok(current) = std::env::current_exe()
-        && current
-            .file_name()
-            .is_some_and(|name| name == binary_name.as_str())
-    {
-        return Ok(current);
-    }
-
-    search_path_for_binary(&binary_name).ok_or_else(|| {
-        Error::InitFailed(format!(
-            "cannot find the '{binary_name}' binary, which sandboxed IPC commands execute; \
-             install it with `cargo install heel` or point HEEL_BIN at it"
-        ))
-    })
-}
-
-/// Find an executable by name on `PATH`.
-fn search_path_for_binary(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 /// Tracks the processes spawned inside a sandbox so they can be killed on drop.
@@ -339,7 +294,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
             // The supervisor is `heel supervise`, started inside the sandbox, so
             // the binary must be executable under the sandbox's own ruleset.
             let heel_binary = resolve_heel_binary(
-                config_data.heel_binary().map(Path::to_path_buf),
+                config_data.heel_binary().cloned(),
                 config_data.writable_paths(),
             )
             .await?;
@@ -356,7 +311,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
             (None, Some(endpoint)) => {
                 let (socket_dir, socket) = unblock(create_ipc_socket_dir).await?;
                 let heel_binary = resolve_heel_binary(
-                    config_data.heel_binary().map(Path::to_path_buf),
+                    config_data.heel_binary().cloned(),
                     config_data.writable_paths(),
                 )
                 .await?;
@@ -425,7 +380,7 @@ impl<N: NetworkPolicy> Sandbox<N> {
         executor: E,
     ) -> Result<(IpcServer, WorkingDir)> {
         let heel_binary = resolve_heel_binary(
-            config_data.heel_binary().map(Path::to_path_buf),
+            config_data.heel_binary().cloned(),
             config_data.writable_paths(),
         )
         .await?;

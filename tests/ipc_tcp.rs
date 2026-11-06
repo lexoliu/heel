@@ -58,7 +58,9 @@ async fn external_ipc_reaches_the_live_handler_without_opening_child_tcp() {
         SandboxConfigBuilder::default()
             .executable(fixtures::resolved(&probe))
             .external_ipc(TcpIpcEndpoint::new(address, Duration::from_secs(5)))
-            .heel_binary(env!("CARGO_BIN_EXE_heel"))
+            .heel_binary(
+                heel::HeelBinary::verify(env!("CARGO_BIN_EXE_heel")).expect("matching binary"),
+            )
             .build(),
         executor_core::tokio::TokioGlobal,
     )
