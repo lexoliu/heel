@@ -314,6 +314,31 @@ async fn a_heel_binary_reached_through_a_link_is_used() {
 }
 
 #[tokio::test]
+async fn a_heel_binary_of_another_version_fails_sandbox_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fixtures::tempdir();
+    let stale = dir.path().join("heel");
+    std::fs::write(&stale, "#!/bin/sh\necho 'heel 0.0.1'\n").expect("writes");
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let config = SandboxConfigBuilder::default()
+        .ipc(IpcRouter::new().register(Structured))
+        .heel_binary(&stale)
+        .build();
+
+    let error = Sandbox::with_config_and_executor(config, executor_core::tokio::TokioGlobal)
+        .await
+        .err()
+        .expect("a mismatched binary is refused");
+
+    let heel::Error::InitFailed(message) = &error else {
+        panic!("{error:?}");
+    };
+    assert!(message.contains("0.0.1"), "{message}");
+    assert!(message.contains(env!("CARGO_PKG_VERSION")), "{message}");
+}
+
+#[tokio::test]
 async fn a_heel_binary_link_the_sandbox_could_plant_is_refused() {
     let dir = fixtures::tempdir();
     let link = dir.path().join("heel");
